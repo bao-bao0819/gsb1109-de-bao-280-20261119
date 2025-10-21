@@ -1,0 +1,11 @@
+{
+  "packages": {
+    ".": {
+      "package-name": "duckdb_engine",
+      "release-type": "python",
+      "draft": true,
+      "prerelease": false,
+      "versioning": "default"
+    }
+  }
+}

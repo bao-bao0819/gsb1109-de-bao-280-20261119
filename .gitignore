@@ -1,0 +1,16 @@
+.mypy_cache
+.pytest_cache
+*.log
+dist/
+*.egg-info
+__pycache__/
+.tox/
+htmlcov/
+.coverage
+coverage.xml
+.DS_Store
+.hypothesis/*
+.idea
+.vscode
+results.xml
+venv

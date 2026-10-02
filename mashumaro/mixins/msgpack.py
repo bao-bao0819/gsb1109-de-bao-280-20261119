@@ -1,0 +1,67 @@
+from collections.abc import Callable
+from types import MappingProxyType
+from typing import Any, final
+
+import msgpack
+from typing_extensions import Buffer, Self
+
+from mashumaro.dialect import Dialect
+from mashumaro.helper import pass_through
+from mashumaro.mixins.dict import DataClassDictMixin
+
+EncodedData = bytes
+Encoder = Callable[[Any], EncodedData]
+Decoder = Callable[[EncodedData], dict[Any, Any]]
+
+
+class MessagePackDialect(Dialect):
+    no_copy_collections = (list, dict)
+    serialization_strategy = MappingProxyType(
+        {
+            Buffer: pass_through,
+            bytes: pass_through,
+            bytearray: {"deserialize": bytearray, "serialize": pass_through},
+            memoryview: {"deserialize": memoryview, "serialize": pass_through},
+        }
+    )
+
+
+def default_encoder(data: Any) -> EncodedData:
+    return msgpack.packb(data, use_bin_type=True)
+
+
+def default_decoder(data: EncodedData) -> dict[Any, Any]:
+    return msgpack.unpackb(data, raw=False)
+
+
+class DataClassMessagePackMixin(DataClassDictMixin):
+    __slots__ = ()
+
+    __mashumaro_builder_params = MappingProxyType(
+        {
+            "packer": {
+                "format_name": "msgpack",
+                "dialect": MessagePackDialect,
+                "encoder": default_encoder,
+            },
+            "unpacker": {
+                "format_name": "msgpack",
+                "dialect": MessagePackDialect,
+                "decoder": default_decoder,
+            },
+        }
+    )
+
+    @final
+    def to_msgpack(
+        self, encoder: Encoder = default_encoder, **to_dict_kwargs: Any
+    ) -> EncodedData: ...
+
+    @classmethod
+    @final
+    def from_msgpack(
+        cls,
+        data: EncodedData,
+        decoder: Decoder = default_decoder,
+        **from_dict_kwargs: Any,
+    ) -> Self: ...

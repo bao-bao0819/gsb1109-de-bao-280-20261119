@@ -1,0 +1,863 @@
+import dataclasses
+import enum
+import inspect
+import types
+import typing
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from contextlib import suppress
+
+# noinspection PyProtectedMember
+from dataclasses import _FIELDS  # type: ignore
+from hashlib import md5
+from typing import Tuple  # noqa: UP035
+from typing import Any, ClassVar, ForwardRef, Union, cast
+
+try:
+    from typing import Unpack  # type: ignore[attr-defined]
+except ImportError:
+    from typing_extensions import Unpack
+
+import typing_extensions
+from typing_extensions import TypeForm
+
+from mashumaro.core.const import PY_311_MIN, PY_312_MIN, PY_314_MIN
+from mashumaro.dialect import Dialect
+
+if PY_314_MIN:
+    from annotationlib import get_annotations
+else:
+    from typing_extensions import get_annotations
+
+__all__ = [
+    "collect_type_params",
+    "get_args",
+    "get_class_that_defines_field",
+    "get_class_that_defines_method",
+    "get_function_arg_annotation",
+    "get_function_return_annotation",
+    "get_generic_name",
+    "get_literal_values",
+    "get_name_error_name",
+    "get_slice_type_args",
+    "get_type_annotations",
+    "get_type_origin",
+    "get_type_var_default",
+    "hash_type_args",
+    "is_annotated",
+    "is_bottom_type",
+    "is_class_var",
+    "is_dataclass_dict_mixin",
+    "is_dataclass_dict_mixin_subclass",
+    "is_dialect_subclass",
+    "is_final",
+    "is_generic",
+    "is_hashable",
+    "is_hashable_type",
+    "is_init_var",
+    "is_literal",
+    "is_local_type_name",
+    "is_named_tuple",
+    "is_new_type",
+    "is_not_required",
+    "is_optional",
+    "is_readonly",
+    "is_required",
+    "is_self",
+    "is_special_typing_primitive",
+    "is_type_alias_type",
+    "is_type_var",
+    "is_type_var_any",
+    "is_type_var_tuple",
+    "is_typed_dict",
+    "is_union",
+    "is_unpack",
+    "iter_all_subclasses",
+    "not_none_type_arg",
+    "resolve_type_alias_type",
+    "resolve_type_params",
+    "resolve_typed_dict_annotations",
+    "substitute_type_params",
+    "type_name",
+    "type_var_has_default",
+]
+
+
+NoneType = type(None)
+DataClassDictMixinPath = (
+    f"{__name__.rsplit('.', 3)[:-3][0]}.mixins.dict.DataClassDictMixin"
+)
+
+T = typing_extensions.TypeVar("T")
+
+
+# An origin can be a bare typing special form (for example, typing.Literal),
+# which is not necessarily a valid TypeForm on its own.
+def get_type_origin(typ: object) -> Any:
+    return getattr(typ, "__origin__", typ)
+
+
+def is_builtin_type(typ: object) -> bool:
+    return getattr(typ, "__module__", None) == "builtins"
+
+
+def get_generic_name(typ: object, short: bool = False) -> str:
+    name = getattr(typ, "_name", None)
+    if name is None:
+        origin = get_type_origin(typ)
+        if origin is typ:
+            return type_name(origin, short, is_type_origin=True)
+        else:
+            return get_generic_name(origin, short)
+    if short:
+        return name
+    else:
+        return f"{typ.__module__}.{name}"
+
+
+# Literal values, Annotated metadata, and Callable parameter lists can all
+# appear in __args__, so the elements are not necessarily TypeForm values.
+def get_args(typ: object) -> tuple[Any, ...]:
+    return getattr(typ, "__args__", ())
+
+
+def get_slice_type_args(typ: object) -> tuple[TypeForm, TypeForm, TypeForm]:
+    """Return slice type arguments with the typeshed defaults applied."""
+    args = get_args(typ)
+    if not args:
+        return Any, Any, Any
+    elif len(args) == 1:
+        start_type = args[0]
+        return start_type, start_type, start_type
+    elif len(args) == 2:
+        start_type, stop_type = args
+        step_type = cast(TypeForm, Union[args])  # noqa: UP007
+        return start_type, stop_type, step_type
+    elif len(args) == 3:
+        return cast(tuple[TypeForm, TypeForm, TypeForm], args)
+    else:
+        raise TypeError(
+            f"slice accepts at most 3 type arguments, got {len(args)}"
+        )
+
+
+def _get_args_str(
+    typ: object,
+    short: bool,
+    resolved_type_params: dict[Any, Any] | None = None,
+    limit: int | None = None,
+    none_type_as_none: bool = False,
+    sep: str = ", ",
+) -> str:
+    if typ == Tuple[()]:  # noqa: SIM114, UP006
+        return "()"
+    elif typ == tuple[()]:
+        return "()"
+    args = _flatten_type_args(get_args(typ)[:limit])
+    to_join = []
+    for arg in args:
+        to_join.append(
+            type_name(
+                typ=arg,
+                short=short,
+                resolved_type_params=resolved_type_params,
+                none_type_as_none=none_type_as_none,
+            )
+        )
+    if len(to_join) > 1:
+        return sep.join(s for s in to_join if s != "()")
+    else:
+        return sep.join(to_join)
+
+
+def get_literal_values(typ: TypeForm) -> tuple[Any, ...]:
+    values = typ.__args__
+    result: list[Any] = []
+    for value in values:
+        if is_literal(value):
+            result.extend(get_literal_values(value))
+        else:
+            result.append(value)
+    return tuple(result)
+
+
+def _get_literal_values_str(typ: TypeForm, short: bool) -> str:
+    values_str = []
+    for value in get_literal_values(typ):
+        if isinstance(value, enum.Enum):
+            values_str.append(f"{type_name(type(value), short)}.{value.name}")
+        elif isinstance(
+            value, (int, str, bytes, bool, NoneType)  # type: ignore
+        ):
+            values_str.append(repr(value))
+    return ", ".join(values_str)
+
+
+def _typing_name(
+    typ_name: str, short: bool = False, module_name: str = "typing"
+) -> str:
+    return typ_name if short else f"{module_name}.{typ_name}"
+
+
+def type_name(
+    typ: Any,
+    short: bool = False,
+    resolved_type_params: dict[Any, Any] | None = None,
+    is_type_origin: bool = False,
+    none_type_as_none: bool = False,
+) -> str:
+    if resolved_type_params is None:
+        resolved_type_params = {}
+    if typ is None:  # noqa: SIM114
+        return "None"
+    elif typ is NoneType and none_type_as_none:
+        return "None"
+    elif typ is Ellipsis:
+        return "..."
+    elif typ is Any:
+        return _typing_name("Any", short)
+    elif is_optional(typ, resolved_type_params):
+        args_str = type_name(
+            typ=not_none_type_arg(get_args(typ), resolved_type_params),
+            short=short,
+            resolved_type_params=resolved_type_params,
+        )
+        return f"{_typing_name('Optional', short)}[{args_str}]"
+    elif is_union(typ):
+        args_str = _get_args_str(
+            typ=typ,
+            short=short,
+            resolved_type_params=resolved_type_params,
+            none_type_as_none=True,
+        )
+        return f"{_typing_name('Union', short)}[{args_str}]"
+    elif is_annotated(typ):
+        return type_name(
+            typ=get_args(typ)[0],
+            short=short,
+            resolved_type_params=resolved_type_params,
+        )
+    elif not is_type_origin and is_literal(typ):
+        args_str = _get_literal_values_str(typ, short)
+        return f"{_typing_name('Literal', short, typ.__module__)}[{args_str}]"
+    elif not is_type_origin and is_unpack(typ):
+        if (
+            typ in resolved_type_params
+            and resolved_type_params[typ] is not typ
+        ):
+            return type_name(
+                typ=resolved_type_params[typ],
+                short=short,
+                resolved_type_params=resolved_type_params,
+            )
+        else:
+            unpacked_type_arg = get_args(typ)[0]
+            if not is_variable_length_tuple(
+                unpacked_type_arg
+            ) and not is_type_var_tuple(unpacked_type_arg):
+                return _get_args_str(
+                    typ=unpacked_type_arg,
+                    short=short,
+                    resolved_type_params=resolved_type_params,
+                )
+            unpacked_type_name = type_name(
+                typ=unpacked_type_arg,
+                short=short,
+                resolved_type_params=resolved_type_params,
+            )
+            if PY_311_MIN:
+                return f"*{unpacked_type_name}"
+            else:
+                _unpack = _typing_name("Unpack", short, typ.__module__)
+                return f"{_unpack}[{unpacked_type_name}]"
+    elif not is_type_origin and is_generic(typ):
+        args_str = _get_args_str(
+            typ=typ, short=short, resolved_type_params=resolved_type_params
+        )
+        if not args_str:
+            return get_generic_name(typ, short)
+        else:
+            return f"{get_generic_name(typ, short)}[{args_str}]"
+    elif is_builtin_type(typ):
+        return typ.__qualname__
+    elif is_type_var(typ):
+        if (
+            typ in resolved_type_params
+            and resolved_type_params[typ] is not typ
+        ):
+            return type_name(
+                typ=resolved_type_params[typ],
+                short=short,
+                resolved_type_params=resolved_type_params,
+            )
+        elif is_type_var_any(typ):
+            return _typing_name("Any", short)
+        if type_var_has_default(typ):
+            return type_name(
+                typ=get_type_var_default(typ),
+                short=short,
+                resolved_type_params=resolved_type_params,
+            )
+        constraints = typ.__constraints__
+        if constraints:
+            args_str = ", ".join(
+                type_name(
+                    typ=c,
+                    short=short,
+                    resolved_type_params=resolved_type_params,
+                )
+                for c in constraints
+            )
+            return f"{_typing_name('Union', short)}[{args_str}]"
+        else:
+            return type_name(
+                typ=typ.__bound__,
+                short=short,
+                resolved_type_params=resolved_type_params,
+            )
+    if is_type_alias_type(typ):
+        if short:
+            return typ.__name__
+        return f"{typ.__module__}.{typ.__name__}"
+    try:
+        if short:
+            return typ.__qualname__  # type: ignore
+        else:
+            return f"{typ.__module__}.{typ.__qualname__}"  # type: ignore
+    except AttributeError:
+        return str(typ)
+
+
+def is_special_typing_primitive(typ: Any) -> bool:
+    try:
+        issubclass(typ, object)
+        return PY_314_MIN and issubclass(typ, typing.Union)  # type: ignore[arg-type]
+    except TypeError:
+        return True
+
+
+def is_generic(typ: object) -> bool:
+    with suppress(Exception):
+        if hasattr(typ, "__class_getitem__"):
+            return True
+    # noinspection PyProtectedMember
+    # noinspection PyUnresolvedReferences
+    if (
+        issubclass(typ.__class__, typing._BaseGenericAlias)  # type: ignore
+        or type(typ) is types.GenericAlias
+    ):
+        return True
+    else:
+        return False
+    # else:  # for PEP 585 generics without args
+    #     try:
+    #         return (
+    #             hasattr(typ, "__class_getitem__")
+    #             and type(typ[str]) is types.GenericAlias  # type: ignore
+    #         )
+    #     except (TypeError, AttributeError):
+    #         return False
+
+
+def is_typed_dict(typ: object) -> bool:
+    for module in (typing, typing_extensions):
+        with suppress(AttributeError):
+            if type(typ) is module._TypedDictMeta:
+                return True
+    return False
+
+
+def is_readonly(typ: object) -> bool:
+    origin = get_type_origin(typ)
+    for module in (typing, typing_extensions):
+        with suppress(AttributeError):
+            if origin is module.ReadOnly:
+                return True
+    return False
+
+
+def is_named_tuple(typ: object) -> bool:
+    return (
+        isinstance(typ, type)
+        and issubclass(typ, tuple)
+        and hasattr(typ, "_fields")
+    )
+
+
+def is_new_type(typ: object) -> bool:
+    return hasattr(typ, "__supertype__")
+
+
+def is_union(typ: object) -> bool:
+    if isinstance(typ, types.UnionType):  # type: ignore
+        return True
+    return getattr(typ, "__origin__", None) is Union
+
+
+def is_optional(
+    typ: object, resolved_type_params: dict[Any, Any] | None = None
+) -> bool:
+    if resolved_type_params is None:
+        resolved_type_params = {}
+    if not is_union(typ):
+        return False
+    args = get_args(typ)
+    if len(args) != 2:
+        return False
+    for arg in args:
+        if resolved_type_params.get(arg, arg) is NoneType:
+            return True
+    return False
+
+
+def is_annotated(typ: object) -> bool:
+    for module in (typing, typing_extensions):
+        with suppress(AttributeError):
+            if type(typ) is module._AnnotatedAlias:
+                return True
+    return False
+
+
+def is_bottom_type(typ: Any) -> bool:
+    while True:
+        typ = resolve_type_alias_type(typ)
+        if is_readonly(typ) or is_annotated(typ):
+            typ = get_args(typ)[0]
+        else:
+            return typ is typing_extensions.Never or typ is typing.NoReturn
+
+
+def get_type_annotations(typ: TypeForm) -> Sequence[Any]:
+    return getattr(typ, "__metadata__", [])
+
+
+def is_literal(typ: object) -> bool:
+    with suppress(AttributeError):
+        # noinspection PyProtectedMember
+        # noinspection PyUnresolvedReferences
+        return type(typ) is typing._LiteralGenericAlias  # type: ignore
+    return False
+
+
+def is_local_type_name(typ_name: str) -> bool:
+    return "<locals>" in typ_name
+
+
+def not_none_type_arg(
+    type_args: tuple[TypeForm, ...],
+    resolved_type_params: dict[Any, Any] | None = None,
+) -> TypeForm[Any] | None:
+    if resolved_type_params is None:
+        resolved_type_params = {}
+    for type_arg in type_args:
+        if resolved_type_params.get(type_arg, type_arg) is not NoneType:
+            return type_arg
+    return None
+
+
+def is_type_var(typ: object) -> bool:
+    return hasattr(typ, "__constraints__")
+
+
+def is_type_var_any(typ: object) -> bool:
+    if not is_type_var(typ):  # noqa: SIM114
+        return False
+    elif getattr(typ, "__constraints__", ()) != ():  # noqa: SIM114
+        return False
+    elif getattr(typ, "__bound__", None) not in (None, Any):  # noqa: SIM114
+        return False
+    elif type_var_has_default(typ):
+        return False
+    else:
+        return True
+
+
+def is_class_var(typ: object) -> bool:
+    return get_type_origin(typ) is ClassVar
+
+
+def is_final(typ: object) -> bool:
+    return get_type_origin(typ) is typing_extensions.Final
+
+
+def is_init_var(typ: object) -> bool:
+    return isinstance(typ, dataclasses.InitVar)
+
+
+def get_class_that_defines_method(method_name: str, cls: type) -> type | None:
+    for c in cls.__mro__:
+        if method_name in c.__dict__:
+            return c
+    return None
+
+
+def get_class_that_defines_field(field_name: str, cls: type) -> type | None:
+    prev_cls = None
+    prev_field = None
+    for base in reversed(cls.__mro__):
+        if dataclasses.is_dataclass(base):
+            field = getattr(base, _FIELDS).get(field_name)
+            if field and field != prev_field:
+                prev_field = field
+                prev_cls = base
+    return prev_cls or cls
+
+
+def is_dataclass_dict_mixin(typ: type) -> bool:
+    return type_name(typ) == DataClassDictMixinPath
+
+
+def is_dataclass_dict_mixin_subclass(typ: type) -> bool:
+    with suppress(AttributeError):
+        for cls in typ.__mro__:
+            if is_dataclass_dict_mixin(cls):
+                return True
+    return False
+
+
+def get_orig_bases(typ: type) -> tuple[TypeForm, ...]:
+    return cast(tuple[TypeForm, ...], getattr(typ, "__orig_bases__", ()))
+
+
+def collect_type_params(typ: object) -> Sequence[Any]:
+    type_params = []
+    for type_arg in get_args(typ):
+        if type_arg in type_params:
+            continue
+        elif is_type_var(type_arg):  # noqa: SIM114
+            type_params.append(type_arg)
+        elif is_unpack(type_arg) and is_type_var_tuple(get_args(type_arg)[0]):
+            type_params.append(type_arg)
+        else:
+            for _type_param in collect_type_params(type_arg):
+                if _type_param not in type_params:
+                    type_params.append(_type_param)
+    return type_params
+
+
+def _check_generic(
+    typ: type, type_params: Sequence[Any], type_args: Sequence[Any]
+) -> None:
+    # https://github.com/python/cpython/issues/99382
+    unpacks = len(list(filter(is_unpack, type_params)))
+    if unpacks > 1:
+        raise TypeError(
+            "Multiple unpacks are disallowed within a single type parameter "
+            f"list for {type_name(typ)}"
+        )
+    elif unpacks == 1:
+        expected_count = len(type_params) - 1
+        expected_msg = f"at least {len(type_params) - 1}"
+    else:
+        expected_count = len(type_params)
+        expected_msg = f"{expected_count}"
+    args_len = len(type_args)
+    if 0 < args_len < expected_count:
+        raise TypeError(
+            f"Too few arguments for {type_name(typ)}; "
+            f"actual {args_len}, expected {expected_msg}"
+        )
+
+
+def _flatten_type_args(
+    type_args: Sequence[Any], allow_ellipsis_if_many_args: bool = False
+) -> list[Any]:
+    result = []
+    for type_arg in type_args:
+        if is_unpack(type_arg):
+            unpacked_type = get_args(type_arg)[0]
+            if is_type_var_tuple(unpacked_type):
+                result.append(type_arg)
+            elif is_variable_length_tuple(unpacked_type):
+                if len(type_args) == 1:  # noqa: SIM114
+                    result.extend(_flatten_type_args(get_args(unpacked_type)))
+                elif allow_ellipsis_if_many_args:
+                    result.extend(_flatten_type_args(get_args(unpacked_type)))
+                else:
+                    result.append(type_arg)
+            elif unpacked_type == Tuple[()]:  # noqa: SIM114, UP006
+                if len(type_args) == 1:
+                    result.append(())  # type: ignore
+            elif unpacked_type == tuple[()]:  # type: ignore
+                if len(type_args) == 1:
+                    result.append(())  # type: ignore
+            else:
+                result.extend(_flatten_type_args(get_args(unpacked_type)))
+        else:
+            result.append(type_arg)
+    return result
+
+
+def resolve_type_params(
+    typ: type, type_args: Sequence[Any] = (), include_bases: bool = True
+) -> dict[Any, dict[Any, Any]]:
+    resolved_type_params: dict[Any, Any] = {}
+    result = {typ: resolved_type_params}
+    type_params = []
+
+    # According to the docs, if Generic[...] is present, then the order
+    # of variables is always determined by their order in Generic[...]
+    for base in get_orig_bases(typ):
+        if get_type_origin(base) is typing.Generic:
+            type_params = list(collect_type_params(base))
+    if not type_params:
+        for base in get_orig_bases(typ):
+            base_type_params = collect_type_params(base)
+            for type_param in base_type_params:
+                if type_param not in type_params:
+                    type_params.append(type_param)
+
+    _check_generic(typ, type_params, type_args)
+
+    type_args = _flatten_type_args(type_args, allow_ellipsis_if_many_args=True)
+    param_idx = 0
+    unpack_param_idx = -1
+    arg_idx = 0
+    while param_idx < len(type_params):
+        type_param = type_params[param_idx]
+        if not is_unpack(type_param):
+            if type_param not in resolved_type_params:
+                try:
+                    next_type_arg = type_args[arg_idx]
+                    if next_type_arg is Ellipsis:
+                        next_type_arg = type_args[arg_idx - 1]
+                    else:
+                        if unpack_param_idx < 0:
+                            arg_idx += 1
+                        else:
+                            arg_idx -= 1
+                except IndexError:
+                    next_type_arg = type_param
+                resolved_type_params[type_param] = next_type_arg
+                if unpack_param_idx < 0:
+                    param_idx += 1
+                else:
+                    param_idx -= 1
+        elif unpack_param_idx < 0:
+            unpack_param_idx = param_idx
+            param_idx = -1
+            arg_idx = -1
+            unpacked_param = get_args(type_param)[0]
+            for y in reversed(get_args(unpacked_param)):  # pragma: no cover
+                # We turn Tuple[x,y] to x, y, but leave this here just in case
+                type_params.insert(param_idx, y)
+        else:
+            if not type_args and is_type_var_tuple(get_args(type_param)[0]):
+                resolved_type_params[type_param] = Unpack[
+                    Tuple[Any, ...]  # noqa: UP006
+                ]
+                break
+            t_args = type_args[unpack_param_idx : len(type_args) + arg_idx + 1]
+            if len(t_args) == 1 and t_args[0] == ():
+                x: Any = ()
+            elif len(t_args) > 2 and t_args[-1] is Ellipsis:
+                x = (
+                    *t_args[:-2],
+                    Unpack[Tuple[t_args[-2], ...]],  # noqa: UP006
+                )
+            else:
+                x = tuple(t_args)
+            resolved_type_params[type_param] = Unpack[Tuple[x]]  # noqa: UP006
+            break
+
+    if include_bases:
+        orig_bases = {
+            get_type_origin(orig_base): orig_base
+            for orig_base in get_orig_bases(typ)
+        }
+        bases = list(getattr(typ, "__bases__", ()))
+        if is_typed_dict(typ):
+            for logical_base in get_orig_bases(typ):
+                base = get_type_origin(logical_base)
+                if is_typed_dict(base) and base not in bases:
+                    bases.append(base)
+        for base in bases:
+            parameterized_base = orig_bases.get(get_type_origin(base))
+            base_type_params = get_args(parameterized_base)
+            base_type_args = tuple(
+                substitute_type_params(a, resolved_type_params)
+                for a in base_type_params
+            )
+            result.update(resolve_type_params(base, base_type_args))
+
+    return result
+
+
+def substitute_type_params(typ: Any, substitutions: dict[Any, Any]) -> Any:
+    if is_annotated(typ):
+        origin = get_type_origin(typ)
+        subst = substitutions.get(origin, origin)
+        annotated_args = (subst, *get_type_annotations(typ))
+        return typing_extensions.Annotated[annotated_args]
+    else:
+        new_type_args = []
+        for type_param in collect_type_params(typ):
+            new_type_args.append(substitutions.get(type_param, type_param))
+        if new_type_args:
+            with suppress(TypeError, KeyError):
+                return typ[tuple(new_type_args)]
+        if is_hashable(typ):
+            return substitutions.get(typ, typ)
+        else:
+            return typ
+
+
+def resolve_typed_dict_annotations(typ: Any) -> dict[str, Any]:
+    origin = get_type_origin(typ)
+    resolved_type_params = resolve_type_params(origin, get_args(typ))
+
+    def resolve_annotations(current: type) -> dict[str, Any]:
+        inherited_annotations: dict[str, Any] = {}
+        resolved_annotations: dict[str, Any] = {}
+        for orig_base in get_orig_bases(current):
+            base = get_type_origin(orig_base)
+            if is_typed_dict(base):
+                inherited_annotations.update(
+                    get_annotations(base, eval_str=True)
+                )
+                resolved_annotations.update(resolve_annotations(base))
+        annotations = get_annotations(current, eval_str=True)
+        resolved = resolved_type_params[current]
+        # TypedDict exposes a flattened annotations mapping. Keep an inherited
+        # annotation resolved in the context of its declaring base unless the
+        # subclass changed the raw annotation.
+        return {
+            key: (
+                resolved_annotations[key]
+                if key in inherited_annotations
+                and annotation == inherited_annotations[key]
+                else substitute_type_params(annotation, resolved)
+            )
+            for key, annotation in annotations.items()
+        }
+
+    return resolve_annotations(origin)
+
+
+def get_name_error_name(e: NameError) -> str:
+    return e.name  # type: ignore
+
+
+def is_dialect_subclass(typ: object) -> bool:
+    return isinstance(typ, type) and issubclass(typ, Dialect)
+
+
+def is_self(typ: object) -> bool:
+    return typ is typing_extensions.Self
+
+
+def is_required(typ: object) -> bool:
+    return get_type_origin(typ) is typing_extensions.Required
+
+
+def is_not_required(typ: object) -> bool:
+    return get_type_origin(typ) is typing_extensions.NotRequired
+
+
+def get_function_arg_annotation(
+    function: Callable[..., Any],
+    arg_name: str | None = None,
+    arg_pos: int | None = None,
+) -> Any:
+    parameters = inspect.signature(function).parameters
+    if arg_name is not None:
+        parameter = parameters[arg_name]
+    elif arg_pos is not None:
+        parameter = parameters[list(parameters.keys())[arg_pos]]
+    else:
+        raise ValueError("arg_name or arg_pos must be passed")
+    annotation = parameter.annotation
+    if annotation is inspect.Signature.empty:
+        raise ValueError(f"Argument {arg_name} doesn't have annotation")
+    if isinstance(annotation, str):
+        annotation = str_to_forward_ref(
+            annotation, inspect.getmodule(function)
+        )
+    return annotation
+
+
+def get_function_return_annotation(function: Callable[[Any], Any]) -> Any:
+    annotation = inspect.signature(function).return_annotation
+    if annotation is inspect.Signature.empty:
+        raise ValueError("Function doesn't have return annotation")
+    if isinstance(annotation, str):
+        annotation = str_to_forward_ref(
+            annotation, inspect.getmodule(function)
+        )
+    return annotation
+
+
+def is_unpack(typ: object) -> bool:
+    for module in (typing, typing_extensions):
+        with suppress(AttributeError):
+            if get_type_origin(typ) is module.Unpack:
+                return True
+    return False
+
+
+def is_type_var_tuple(typ: object) -> bool:
+    for module in (typing, typing_extensions):
+        with suppress(AttributeError):
+            if type(typ) is module.TypeVarTuple:
+                return True
+    return False
+
+
+def is_variable_length_tuple(typ: TypeForm) -> bool:
+    type_args = get_args(typ)
+    return len(type_args) == 2 and type_args[1] is Ellipsis
+
+
+def hash_type_args(type_args: Iterable[Any]) -> str:
+    return md5(",".join(map(type_name, type_args)).encode()).hexdigest()
+
+
+def iter_all_subclasses(cls: type[T]) -> Iterator[type[T]]:
+    for subclass in cls.__subclasses__():
+        yield subclass
+        yield from iter_all_subclasses(subclass)
+
+
+def is_hashable(value: Any) -> bool:
+    try:
+        hash(value)
+        return True
+    except TypeError:
+        return False
+
+
+def is_hashable_type(typ: Any) -> bool:
+    try:
+        return issubclass(typ, Hashable)
+    except TypeError:
+        return True
+
+
+def str_to_forward_ref(
+    annotation: str, module: types.ModuleType | None = None
+) -> ForwardRef:
+    module_name = module.__name__ if module else None
+    return ForwardRef(annotation, module=module_name)
+
+
+def is_type_alias_type(typ: object) -> bool:
+    if PY_312_MIN:
+        return isinstance(typ, typing.TypeAliasType)  # type: ignore
+    else:
+        return False
+
+
+def resolve_type_alias_type(typ: TypeForm) -> TypeForm:
+    while is_type_alias_type(typ):
+        typ = cast(TypeForm, cast(Any, typ).__value__)
+    return typ
+
+
+def type_var_has_default(typ: object) -> bool:
+    has_default = getattr(typ, "has_default", None)
+    if has_default is not None:
+        return bool(has_default())
+    return getattr(typ, "__default__", None) is not None
+
+
+def get_type_var_default(typ: object) -> TypeForm:
+    return cast(TypeForm, cast(Any, typ).__default__)

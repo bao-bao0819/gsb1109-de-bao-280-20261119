@@ -1,0 +1,79 @@
+from typing import Generic, TypeVar, final
+
+import tomli_w
+from typing_extensions import TypeForm
+
+from mashumaro.codecs._builder import CodecCodeBuilder
+from mashumaro.core.meta.helpers import get_args
+from mashumaro.dialect import Dialect
+from mashumaro.mixins.toml import TOMLDialect
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore
+
+T = TypeVar("T")
+EncodedData = str
+
+
+class TOMLDecoder(Generic[T]):
+    def __init__(
+        self,
+        shape_type: TypeForm[T],
+        *,
+        default_dialect: type[Dialect] | None = None,
+    ):
+        if default_dialect is not None:
+            default_dialect = TOMLDialect.merge(default_dialect)
+        else:
+            default_dialect = TOMLDialect
+        code_builder = CodecCodeBuilder.new(
+            type_args=get_args(shape_type), default_dialect=default_dialect
+        )
+        code_builder.add_decode_method(shape_type, self, tomllib.loads)
+
+    @final
+    def decode(self, data: EncodedData) -> T: ...
+
+
+class TOMLEncoder(Generic[T]):
+    def __init__(
+        self,
+        shape_type: TypeForm[T],
+        *,
+        default_dialect: type[Dialect] | None = None,
+    ):
+        if default_dialect is not None:
+            default_dialect = TOMLDialect.merge(default_dialect)
+        else:
+            default_dialect = TOMLDialect
+        code_builder = CodecCodeBuilder.new(
+            type_args=get_args(shape_type), default_dialect=default_dialect
+        )
+        code_builder.add_encode_method(shape_type, self, tomli_w.dumps)
+
+    @final
+    def encode(self, obj: T) -> str: ...
+
+
+def toml_decode(data: EncodedData, shape_type: TypeForm[T]) -> T:
+    return TOMLDecoder(shape_type).decode(data)
+
+
+def toml_encode(obj: T, shape_type: TypeForm[T]) -> str:
+    return TOMLEncoder(shape_type).encode(obj)
+
+
+decode = toml_decode
+encode = toml_encode
+
+
+__all__ = [
+    "TOMLDecoder",
+    "TOMLEncoder",
+    "decode",
+    "encode",
+    "toml_decode",
+    "toml_encode",
+]

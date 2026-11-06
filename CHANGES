@@ -1,0 +1,208 @@
+Changelog
+=========
+
+
+Version 4.2.0
+-------------
+
+- Drop py3.9 compat, run tests on py3.15.
+- More robust sqlite writing and reading. Thanks @antonsoo
+
+
+Version 4.1.1
+-------------
+
+Fixed bug whereby decimals in scientific notation were handled incorrectly.
+Thanks @Rajvira10 https://github.com/cldf/csvw/pull/84
+
+
+Version 4.1.0
+-------------
+
+Support "lax" validation, i.e. validation allowing for null-valued foreign keys.
+
+
+Version 4.0.0
+-------------
+
+- removed dependency on `attrs`
+
+Backwards incompatibility
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Since formerly `@attr.s` decorated classes are now dataclasses, any class inheriting from these
+  will be broken.
+- Some functions have been moved to different modules, so imports may be broken.
+
+
+Version 3.7.0
+-------------
+
+- fixed expanding of URLs to account for QNames used as URI template.
+- adapted `metadata.NAMESPACES` to contain the prefixes defined in the RDFa
+  core initial context (https://www.w3.org/2011/rdfa-context/rdfa-1.1).
+
+
+
+Version 3.6.0
+-------------
+
+- Switch dependency from colorama to termcolor, which seems to be better maintained.
+- Enhanced `dsv.UnicodeWriter.writerows` to allow simpler writing of CSV rows from `dict` objects.
+
+
+Version 3.5.1
+-------------
+
+Re-instate support for py3.8, since it's still supported on Ubuntu 20.04 lts.
+
+
+Version 3.5.0
+-------------
+
+- Added csvw2markdown command.
+- Added support for py3.13, dropped support for py3.8.
+
+
+Version 3.4.0
+-------------
+
+- Improve compatibility with frictionless framework.
+- Added experimental csvw2sqlite command.
+- Test on python 3.13.
+
+
+Version 3.3.1
+-------------
+
+- Made sure the `_parent` attribute is excluded for equality comparisons of `Description` objects
+  in order to stay compatible with attrs >= 24.1.
+
+
+Version 3.3.0
+-------------
+
+- Fixed handling of null values for list-valued columns when reading from sqlite db.
+- Added flag to force writing CSVW data in "strict" mode, see https://github.com/cldf/csvw/issues/57
+
+
+Version 3.2.2
+-------------
+
+- Support list-valued column data of non-string datatypes (as long as they can be
+  JSON serialized) in `db`.
+
+
+Version 3.2.1
+-------------
+
+- Fixed bug whereby NULL values list-valued fields couldn't be written to sqlite.
+
+
+
+Version 3.2.0
+-------------
+
+- Fixed bug whereby it was impossible to set `Column.null` to the empty list.
+- Dropped py3.7 compatibility.
+- Fixed bug whereby decimals were serialised in scientific notation which is
+  against the spec.
+- Add Python 3.12 to tested and supported versions.
+- Replace `lazyproperty` with `functools.cached_property`, since we don't support
+  py < 3.8 anymore.
+
+
+Version 3.1.3
+-------------
+
+- Fixed support for writing tables to zipped files.
+
+
+Version 3.1.2
+-------------
+
+- DB creation will now drop self-referential foreign-keys by default
+
+
+Version 3.1.1
+-------------
+
+- Fixed the ranges of positiveInteger and nonNegativeInteger
+
+
+Version 3.1
+-----------
+
+- Support [JSON Schema](https://json-schema.org/) documents as `format`
+  annotation for datatype `json`.
+
+
+Version 3.0
+-----------
+
+- Better CSVW spec conformance:
+  - `csvw.CSVW.to_json` implements https://w3c.github.io/csvw/csv2json/
+  - `csvw.CSVW.is_valid`
+  - Completed datatype support
+- CLI
+- Docs
+
+Backwards incompatibility:
+- `commentPrefix=None` for default CSV dialect for Table and TableGroup (instead of `#`)
+- duplicate column names in CSVW metadata now raise `ValueError` rather than just issuing a warning
+- Dropped Python 3.6 compatibility
+
+
+Version 2.0
+-----------
+
+- Fix CSVW spec compatibility: Stop doing blackslash escaping/doubling with
+  (default) Dialect(doubleQuote=True) (https://github.com/cldf/csvw/issues/7).
+- Fix doubling of backslashes  with csv.QUOTE_NONE
+  (https://github.com/cldf/csvw/issues/4).
+- Python 3.10 support.
+
+
+Version 1.11.0
+--------------
+
+- Dropped py35 compat.
+- Enhanced foreign key validation.
+
+
+Version 1.10.1
+--------------
+
+- fixed bug where the line number was not correctly reported by
+  UnicodeReaderWithLineNumber when multi-line cell content was read.
+- extended tests to python 3.9
+
+
+Version 1.10
+------------
+
+- Allow reading of data and metadata from URLs.
+
+
+Version 1.4
+-----------
+
+- Read all data with encoding specified as UTF-8 using utf-8-sig encoding.
+
+
+Version 1.0
+-----------
+
+- Integrate cllutils.dsv functionality, drop clldutils and six dependencies.
+
+
+Version 0.1.1
+-------------
+
+- Update clldutils to 1.14.0
+
+
+Version 0.1
+-----------
+
+- First release as package taken out from clldutils.

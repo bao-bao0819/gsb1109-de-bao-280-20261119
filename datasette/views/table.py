@@ -1,0 +1,2870 @@
+import hashlib
+import itertools
+import json
+import math
+import time
+import urllib
+import urllib.parse
+from dataclasses import dataclass, field
+
+import markupsafe
+import sqlite_utils
+from jinja2.filters import do_filesizeformat
+
+from datasette import tracer
+from datasette.column_types import SQLiteType
+from datasette.database import QueryInterrupted
+from datasette.events import (
+    AlterTableEvent,
+    DropTableEvent,
+    InsertRowsEvent,
+    UpsertRowsEvent,
+)
+from datasette.extras import ExtraScope, extra_names_from_request
+from datasette.filters import Filters
+from datasette.plugins import pm
+from datasette.renderer import apply_column_type_transforms
+from datasette.resources import DatabaseResource, TableResource
+from datasette.utils import (
+    CustomJSONEncoder,
+    CustomRow,
+    InvalidSql,
+    WriteJsonValueError,
+    add_cors_headers,
+    await_me_maybe,
+    compound_keys_after_sql,
+    compound_keys_at_or_before_sql,
+    decode_write_json_rows,
+    escape_sqlite,
+    filters_should_redirect,
+    is_url,
+    make_slot_function,
+    path_from_row_pks,
+    request_route_path,
+    sqlite3,
+    tilde_decode,
+    tilde_encode,
+    to_css_class,
+    truncate_url,
+    urlsafe_components,
+    value_as_boolean,
+)
+from datasette.utils.asgi import (
+    BadRequest,
+    Forbidden,
+    NotFound,
+    PayloadTooLarge,
+    Request,
+    Response,
+)
+from datasette.utils.sqlite import check_structured_write_table
+
+from . import Context, from_extra
+from .base import (
+    BaseView,
+    DatasetteError,
+    render_with_output_renderer,
+    stream_requested,
+    tsv_export_path,
+)
+from .database import QueryView
+from .table_create_alter import (
+    ALTER_TABLE_COLUMN_TYPES,
+    ALTER_TABLE_TYPE_FOR_SQLITE_TYPE,
+    _custom_column_type_options_for_create_table,
+    default_expr_for_sql,
+    default_expression_options,
+)
+from .table_extras import (
+    TABLE_EXTRA_BUNDLES,
+    TableExtraContext,
+    count_is_truncated,
+    precompute_database_action_permissions,
+    precompute_table_action_permissions,
+    resolve_table_extras,
+    table_extra_registry,
+)
+
+
+@dataclass
+class TableContext(Context):
+    "The page showing the rows in a table or SQL view, e.g. /fixtures/facetable."
+
+    documented_template = "table.html"
+    extras_scope = ExtraScope.TABLE
+
+    # Fields resolved by registered extras - their documentation comes
+    # from the description on each Extra class in table_extras.py
+    actions: callable = from_extra()
+    all_columns: list = from_extra()
+    columns: list = from_extra()
+    count: int = from_extra()
+    count_sql: str = from_extra()
+    custom_table_templates: list = from_extra()
+    database: str = from_extra()
+    database_color: str = from_extra()
+    display_columns: list = from_extra()
+    display_rows: list = from_extra()
+    expandable_columns: list = from_extra()
+    facet_results: dict = from_extra()
+    facets_timed_out: list = from_extra()
+    filters: Filters = from_extra()
+    form_hidden_args: list = from_extra()
+    human_description_en: str = from_extra()
+    is_view: bool = from_extra()
+    metadata: dict = from_extra()
+    primary_keys: list = from_extra()
+    private: bool = from_extra()
+    query: dict = from_extra()
+    renderers: dict = from_extra()
+    renderer_options: dict = field(
+        metadata={
+            "help": "Dictionary mapping output format names to the ``label``, ``description``, ``is_binary`` and ``is_webpage`` options their :ref:`plugin_register_output_renderer` plugin hook set, used by the export dialog."
+        }
+    )
+    set_column_type_ui: dict = from_extra()
+    sorted_facet_results: list = from_extra()
+    suggested_facets: list = from_extra()
+    table: str = from_extra()
+    table_definition: str = from_extra()
+    view_definition: str = from_extra()
+
+    # Fields added by the view code
+    ok: bool = field(
+        metadata={"help": "True if the data for this page was retrieved without errors"}
+    )
+    next: str = field(metadata={"help": "Pagination token for the next page, or None"})
+    next_url: str = field(
+        metadata={
+            "help": "Full URL for the next page of results, or None if there are no more pages. See :ref:`json_api_pagination`."
+        }
+    )
+    count_truncated: bool = field(
+        metadata={
+            "help": "True if ``count`` is a capped lower bound rather than an exact total, because Datasette stopped counting after its configured row-count limit."
+        }
+    )
+    rows: list = field(
+        metadata={
+            "help": "The rows for this page, as a list of dictionaries mapping column name to raw value."
+        }
+    )
+    filter_columns: list = field(
+        metadata={
+            "help": "List of column names offered by the filter interface, including currently displayed columns and any hidden columns that can still be filtered."
+        }
+    )
+    supports_search: bool = field(
+        metadata={"help": "True if this table has full-text search configured"}
+    )
+    search: str = field(
+        metadata={
+            "help": "The current full-text search from ``?_search=``, or an empty string"
+        }
+    )
+    extra_wheres_for_ui: list = field(
+        metadata={
+            "help": "Extra where clauses from ``?_where=`` for display in the UI. Each item has ``text`` for the SQL fragment and ``remove_url`` for a URL that removes that fragment."
+        }
+    )
+    clear_filters_url: str = field(
+        metadata={
+            "help": "URL for this page with all column filters removed, or None if no column filters are applied. Other arguments such as ``?_search=``, ``?_where=`` and ``?_facet=`` are preserved."
+        }
+    )
+    page_position: dict = field(
+        metadata={
+            "help": "On pages after the first (``?_next=`` is set) a dictionary with ``first_url`` (this page without ``?_next=``), ``count_before_url`` (POST to count the rows before this page), ``after_column`` and ``after_value`` (a description of the pagination cursor). ``None`` on the first page."
+        }
+    )
+    filter_description_en: str = field(
+        metadata={
+            "help": 'Human readable description of the filters, search and ``?_where=`` clauses applied to the table, for example ``where state = "CA"``, or an empty string if there are none.'
+        }
+    )
+    sort_description_en: str = field(
+        metadata={
+            "help": "Human readable description of the sort order, for example ``sorted by name descending``, or an empty string if no sort order was specified."
+        }
+    )
+    url_csv: str = field(metadata={"help": "URL for the CSV export of this page"})
+    url_csv_path: str = field(metadata={"help": "Path portion of the CSV export URL"})
+    url_csv_hidden_args: list = field(
+        metadata={
+            "help": "List of ``(name, value)`` pairs for hidden form fields used by the CSV export form, preserving current filters and any ``?_next=`` pagination cursor while forcing ``_size=max``."
+        }
+    )
+    url_tsv_path: str = field(
+        metadata={
+            "help": "Path portion of the TSV export URL, which takes the same arguments as CSV, or None if a plugin provides the ``tsv`` format"
+        }
+    )
+    sort: str = field(metadata={"help": "Column the page is sorted by, or None"})
+    sort_desc: str = field(
+        metadata={"help": "Column the page is sorted by in descending order, or None"}
+    )
+    settings: dict = field(
+        metadata={
+            "help": "Dictionary of Datasette's current settings, keyed by setting name."
+        }
+    )
+    alternate_url_json: str = field(
+        metadata={"help": "URL for the JSON version of this page"}
+    )
+    is_sortable: bool = field(
+        metadata={"help": "True if any of the displayed columns can be used to sort"}
+    )
+    allow_execute_sql: bool = field(
+        metadata={
+            "help": "True if the current actor can execute custom SQL against this database"
+        }
+    )
+    query_ms: float = field(
+        metadata={
+            "help": "Time taken by the SQL queries for this page, in milliseconds"
+        }
+    )
+    select_templates: list = field(
+        metadata={
+            "help": "List of template names that were considered for this page, with the selected template prefixed by ``*``."
+        }
+    )
+    top_table: callable = field(
+        metadata={
+            "help": "Async callable that renders the ``top_table`` plugin slot for this table or view and returns HTML."
+        }
+    )
+    table_page_data: dict = field(
+        metadata={
+            "help": "JSON data used by JavaScript on the table page. Includes ``database``, ``table`` and ``tableUrl``, plus optional ``foreignKeys`` mapping column names to autocomplete URLs, optional ``insertRow`` data, optional ``alterTable`` data and optional ``executeSql`` data with ``queryUrl`` and ``editorUrl`` keys, present if the current actor can execute custom SQL against this database. ``executeSql`` also has a ``columns`` list of every column in the table with its ``name`` and declared ``type``, and an optional ``filter`` key with the ``where`` clause, ``params`` and human readable ``description`` of the filters currently applied to the table."
+        }
+    )
+    table_insert_ui: dict = field(
+        metadata={
+            "help": "Information needed to enable the row insertion UI, or ``None`` if row insertion is not available to the current actor. When present it has ``path``, ``tableName``, ``columns``, ``bulkColumns``, ``primaryKeys`` and ``maxInsertRows`` keys, plus optional ``upsertPath`` if the current actor has permission to update rows. ``columns`` lists columns for the single-row insert form, while ``bulkColumns`` lists columns for the bulk insert form. Each column includes ``name``, ``sqlite_type``, ``notnull``, ``default``, ``has_default``, ``is_pk``, ``is_auto_pk``, ``value_kind`` and ``column_type`` keys."
+        }
+    )
+    row_mutation_ui: bool = field(
+        metadata={
+            "help": "True if the current actor can edit or delete rows in this table, which enables the row edit/delete JavaScript UI"
+        }
+    )
+    table_alter_ui: dict = field(
+        metadata={
+            "help": "Information needed to enable the alter table UI, or ``None`` if altering this table is not available to the current actor. When present it has ``path``, ``tableName``, ``columns``, ``primaryKeys``, ``columnTypes``, ``defaultExpressions`` and ``foreignKeyTargetsPath`` keys, plus optional ``customColumnTypes`` and ``dropPath`` keys."
+        }
+    )
+
+
+LINK_WITH_LABEL = (
+    '<a href="{base_url}{database}/{table}/{link_id}">{label}</a>&nbsp;<em>{id}</em>'
+)
+LINK_WITH_VALUE = '<a href="{base_url}{database}/{table}/{link_id}">{id}</a>'
+
+
+class Row:
+    def __init__(
+        self,
+        cells,
+        pk_path=None,
+        row_path=None,
+        row_label=None,
+    ):
+        self.cells = cells
+        self.pk_path = pk_path
+        self.row_path = row_path
+        self.row_label = row_label
+
+    def __iter__(self):
+        return iter(self.cells)
+
+    def __getitem__(self, key):
+        for cell in self.cells:
+            if cell["column"] == key:
+                return cell["raw"]
+        raise KeyError
+
+    def display(self, key):
+        for cell in self.cells:
+            if cell["column"] == key:
+                return cell["value"]
+        return None
+
+    def __str__(self):
+        d = {
+            key: self[key]
+            for key in [
+                c["column"] for c in self.cells if not c.get("is_special_link_column")
+            ]
+        }
+        return json.dumps(d, default=repr, indent=2)
+
+
+def row_label_from_label_column(row, label_column):
+    if not label_column:
+        return None
+    try:
+        value = row[label_column]
+    except (KeyError, IndexError):
+        return None
+    if isinstance(value, dict):
+        value = value.get("label")
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+async def run_sequential(*args):
+    # This used to be swappable for asyncio.gather() to run things in
+    # parallel, but this lead to hard-to-debug locking issues with
+    # in-memory databases: https://github.com/simonw/datasette/issues/2189
+    results = []
+    for fn in args:
+        results.append(await fn)
+    return results
+
+
+def _exact_filter_key(column):
+    if column.startswith("_"):
+        return f"{column}__exact"
+    return column
+
+
+def _request_with_query_string(request, query_string):
+    scope = dict(request.scope)
+    scope["query_string"] = query_string.encode("latin-1")
+    return Request(scope, request.receive)
+
+
+async def _fragment_request_for_row(request, resolved):
+    row_path = request.args.get("_row")
+    if not row_path:
+        return request
+    if resolved.is_view:
+        raise BadRequest("_row is not supported for views")
+
+    pks = await resolved.db.primary_keys(resolved.table)
+    row_pks = pks or ["rowid"]
+    pk_values = urlsafe_components(row_path)
+    if len(pk_values) != len(row_pks):
+        raise BadRequest("_row does not match the primary key for this table")
+
+    row_pk_filter_keys = {
+        key
+        for pk in row_pks
+        for key in {
+            _exact_filter_key(pk),
+            f"{pk}__exact",
+        }
+    }
+    args = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(
+            request.query_string, keep_blank_values=True
+        )
+        if key
+        not in {
+            "_row",
+            "_next",
+            "_nocount",
+            "_nofacet",
+            "_nosuggest",
+        }.union(row_pk_filter_keys)
+    ]
+    args.extend(
+        [(_exact_filter_key(pk), value) for pk, value in zip(row_pks, pk_values)]
+    )
+    args.extend(
+        [
+            ("_nocount", "1"),
+            ("_nofacet", "1"),
+            ("_nosuggest", "1"),
+        ]
+    )
+    return _request_with_query_string(request, urllib.parse.urlencode(args))
+
+
+def _redirect(datasette, request, path, forward_querystring=True):
+    if request.query_string and "?" not in path and forward_querystring:
+        path = f"{path}?{request.query_string}"
+    r = Response.redirect(path)
+    r.headers["Link"] = f"<{path}>; rel=preload"
+    if datasette.cors:
+        add_cors_headers(r.headers)
+    return r
+
+
+async def _redirect_if_needed(datasette, request, resolved):
+    # Handle ?_filter_column
+    redirect_params = filters_should_redirect(request.args)
+    if redirect_params:
+        return _redirect(
+            datasette,
+            request,
+            datasette.urls.modify(
+                request,
+                add=[
+                    (key, value) for key, value in redirect_params if value is not None
+                ],
+                # The filter form also submits a blank ?_search= when unused
+                remove=[key for key, value in redirect_params if value is None]
+                + [("_search", "")],
+            ),
+            forward_querystring=False,
+        )
+
+    # If ?_sort_by_desc=on (from checkbox) redirect to _sort_desc=(_sort)
+    if "_sort_by_desc" in request.args:
+        return _redirect(
+            datasette,
+            request,
+            datasette.urls.modify(
+                request,
+                add={"_sort_desc": request.args.get("_sort")},
+                remove=["_sort_by_desc", "_sort"],
+            ),
+            forward_querystring=False,
+        )
+
+
+async def _validate_column_types(datasette, database_name, table_name, rows):
+    """Validate row values against assigned column types. Returns list of error strings."""
+    ct_map = await datasette.get_column_types(database_name, table_name)
+    if not ct_map:
+        return []
+    errors = []
+    for row in rows:
+        for col_name, ct in ct_map.items():
+            if col_name not in row:
+                continue
+            error = await ct.validate(row[col_name], datasette)
+            if error:
+                errors.append(f"{col_name}: {error}")
+    return errors
+
+
+def _column_value_kind_for_insert_form(column_detail):
+    sqlite_type = SQLiteType.from_declared_type(column_detail.type)
+    if sqlite_type in (SQLiteType.INTEGER, SQLiteType.REAL):
+        return "number"
+    return "string"
+
+
+def _column_sqlite_type_for_insert_form(column_detail):
+    sqlite_type = SQLiteType.from_declared_type(column_detail.type)
+    return sqlite_type.value if sqlite_type is not None else None
+
+
+async def _foreign_key_autocomplete_urls(
+    datasette, request, db, database_name, table_name
+):
+    autocomplete_urls = {}
+    for fk in await db.foreign_keys_for_table(table_name):
+        if not await db.table_exists(fk["other_table"]):
+            continue
+        other_pks = await db.primary_keys(fk["other_table"])
+        other_column = fk["other_column"]
+        if other_column is None and len(other_pks) == 1:
+            other_column = other_pks[0]
+        if len(other_pks) != 1 or other_column != other_pks[0]:
+            continue
+        visible, _ = await datasette.check_visibility(
+            request.actor,
+            action="view-table",
+            resource=TableResource(database=database_name, table=fk["other_table"]),
+        )
+        if not visible:
+            continue
+        autocomplete_urls[fk["column"]] = "{}/-/autocomplete".format(
+            datasette.urls.table(database_name, fk["other_table"])
+        )
+    return autocomplete_urls
+
+
+async def _table_page_data(
+    datasette,
+    request,
+    db,
+    database_name,
+    table_name,
+    is_view,
+    table_insert_ui,
+    table_alter_ui,
+    execute_sql_ui=None,
+):
+    data = {
+        "database": database_name,
+        "table": table_name,
+        "tableUrl": datasette.urls.table(database_name, table_name),
+    }
+    if table_insert_ui:
+        data["insertRow"] = table_insert_ui
+    if table_alter_ui:
+        data["alterTable"] = table_alter_ui
+    if execute_sql_ui:
+        data["executeSql"] = execute_sql_ui
+    if not is_view:
+        foreign_keys = await _foreign_key_autocomplete_urls(
+            datasette, request, db, database_name, table_name
+        )
+        if foreign_keys:
+            data["foreignKeys"] = foreign_keys
+    return data
+
+
+async def _table_insert_ui(
+    datasette, request, db, database_name, table_name, is_view, pks
+):
+    if is_view or not db.is_mutable:
+        return None
+
+    if not await datasette.allowed(
+        action="insert-row",
+        resource=TableResource(database=database_name, table=table_name),
+        actor=request.actor,
+    ):
+        return None
+
+    can_update = await datasette.allowed(
+        action="update-row",
+        resource=TableResource(database=database_name, table=table_name),
+        actor=request.actor,
+    )
+
+    column_types_map = await datasette.get_column_types(database_name, table_name)
+    columns = []
+    bulk_columns = []
+    column_details = await db.table_column_details(table_name)
+    for column in column_details:
+        if column.hidden:
+            continue
+        is_pk = column.name in pks
+        is_auto_pk = (
+            is_pk
+            and len(pks) == 1
+            and SQLiteType.from_declared_type(column.type) == SQLiteType.INTEGER
+        )
+        column_type = column_types_map.get(column.name)
+        column_data = {
+            "name": column.name,
+            "sqlite_type": _column_sqlite_type_for_insert_form(column),
+            "notnull": column.notnull,
+            "default": column.default_value,
+            "has_default": column.default_value is not None,
+            "is_pk": is_pk,
+            "is_auto_pk": is_auto_pk,
+            "value_kind": _column_value_kind_for_insert_form(column),
+            "column_type": (
+                {"type": column_type.name, "config": column_type.config}
+                if column_type is not None
+                else None
+            ),
+        }
+        bulk_columns.append(column_data)
+        if is_auto_pk:
+            continue
+        columns.append(column_data)
+
+    data = {
+        "path": f"{datasette.urls.table(database_name, table_name)}/-/insert",
+        "tableName": table_name,
+        "columns": columns,
+        "bulkColumns": bulk_columns,
+        "primaryKeys": pks,
+        "maxInsertRows": datasette.setting("max_insert_rows"),
+    }
+    if can_update:
+        data["upsertPath"] = (
+            f"{datasette.urls.table(database_name, table_name)}/-/upsert"
+        )
+    return data
+
+
+async def _execute_sql_ui(
+    datasette,
+    request,
+    database_name,
+    filter_where=None,
+    filter_params=None,
+    filter_description=None,
+    db=None,
+    table_name=None,
+    use_rowid=False,
+):
+    # URLs JavaScript can use to run read-only SQL against this database, used
+    # by the column statistics dialog. Only provided if the actor is allowed
+    # to execute arbitrary SQL.
+    if not await datasette.allowed(
+        action="execute-sql",
+        resource=DatabaseResource(database=database_name),
+        actor=request.actor,
+    ):
+        return None
+    query_path = f"{datasette.urls.database(database_name)}/-/query"
+    data = {
+        "queryUrl": query_path + ".json",
+        "editorUrl": query_path,
+    }
+    if db is not None and table_name is not None:
+        # Every column with its declared type, including any hidden from the
+        # current page, so the column statistics dialog can switch between them
+        columns = [{"name": "rowid", "type": "integer"}] if use_rowid else []
+        columns.extend(
+            {"name": column.name, "type": (column.type or "").lower()}
+            for column in await db.table_column_details(table_name)
+            # hidden == 1 is a hidden virtual table column, 2 and 3 are
+            # generated columns which can be queried
+            if column.hidden != 1
+        )
+        data["columns"] = columns
+    if filter_where:
+        # The where clause for the filters currently applied to the table,
+        # without pagination. Parameters keep their types (numeric filters
+        # such as __gt use numbers) so JavaScript can inline them as literals.
+        # Statistics can't faithfully reproduce a filter whose parameters
+        # can't be expressed in JSON, so the feature is disabled instead.
+        if not all(
+            value is None or isinstance(value, (str, int, float))
+            for value in (filter_params or {}).values()
+        ):
+            return None
+        data["filter"] = {
+            "where": filter_where,
+            "params": dict(filter_params or {}),
+            "description": filter_description or "",
+        }
+    return data
+
+
+async def _table_alter_ui(
+    datasette, request, db, database_name, table_name, is_view, pks
+):
+    if is_view or not db.is_mutable:
+        return None
+
+    if not await datasette.allowed(
+        action="alter-table",
+        resource=TableResource(database=database_name, table=table_name),
+        actor=request.actor,
+    ):
+        return None
+
+    column_types_map = await datasette.get_column_types(database_name, table_name)
+    foreign_keys_by_column = {}
+    for fk in await db.foreign_keys_for_table(table_name):
+        other_column = fk["other_column"]
+        if other_column is None and await db.table_exists(fk["other_table"]):
+            other_pks = await db.primary_keys(fk["other_table"])
+            if len(other_pks) == 1:
+                other_column = other_pks[0]
+        if other_column is None:
+            continue
+        foreign_keys_by_column[fk["column"]] = {
+            "fk_table": fk["other_table"],
+            "fk_column": other_column,
+        }
+    columns = []
+    for column in await db.table_column_details(table_name):
+        if column.hidden:
+            continue
+        sqlite_type = SQLiteType.from_declared_type(column.type)
+        column_type = column_types_map.get(column.name)
+        default_expr = default_expr_for_sql(column.default_value)
+        column_data = {
+            "name": column.name,
+            "type": ALTER_TABLE_TYPE_FOR_SQLITE_TYPE.get(sqlite_type, "text"),
+            "sqlite_type": sqlite_type.value,
+            "notnull": column.notnull,
+            "default": None if default_expr else column.default_value,
+            "has_default": column.default_value is not None,
+            "is_pk": column.name in pks,
+            "foreign_key": foreign_keys_by_column.get(column.name),
+            "column_type": (
+                {"type": column_type.name, "config": column_type.config}
+                if column_type is not None
+                else None
+            ),
+        }
+        if default_expr:
+            column_data["default_expr"] = default_expr
+        columns.append(column_data)
+
+    data = {
+        "path": f"{datasette.urls.table(database_name, table_name)}/-/alter",
+        "tableName": table_name,
+        "columns": columns,
+        "primaryKeys": pks,
+        "columnTypes": ALTER_TABLE_COLUMN_TYPES,
+        "defaultExpressions": default_expression_options(),
+        "foreignKeyTargetsPath": "{}/-/foreign-key-targets?table={}".format(
+            datasette.urls.database(database_name),
+            urllib.parse.quote(table_name, safe=""),
+        ),
+    }
+    can_set_column_type = await datasette.allowed(
+        action="set-column-type",
+        resource=TableResource(database=database_name, table=table_name),
+        actor=request.actor,
+    )
+    if can_set_column_type:
+        data["customColumnTypes"] = _custom_column_type_options_for_create_table(
+            datasette
+        )
+    can_drop_table = await datasette.allowed(
+        action="drop-table",
+        resource=TableResource(database=database_name, table=table_name),
+        actor=request.actor,
+    )
+    if can_drop_table:
+        data["dropPath"] = f"{datasette.urls.table(database_name, table_name)}/-/drop"
+    return data
+
+
+async def display_columns_and_rows(
+    datasette,
+    database_name,
+    table_name,
+    description,
+    rows,
+    link_column=False,
+    truncate_cells=0,
+    sortable_columns=None,
+    request=None,
+):
+    """Returns columns, rows for specified table - including fancy foreign key treatment"""
+    sortable_columns = sortable_columns or set()
+    db = datasette.databases[database_name]
+    column_descriptions = dict(
+        await datasette.get_internal_database().execute(
+            """
+          SELECT
+            column_name,
+            value
+          FROM metadata_columns
+          WHERE database_name = ?
+            AND resource_name = ?
+            AND key = 'description'
+        """,
+            [database_name, table_name],
+        )
+    )
+
+    # Look up column types for this table
+    column_types_map = await datasette.get_column_types(database_name, table_name)
+
+    column_details = {
+        col.name: col for col in await db.table_column_details(table_name)
+    }
+    pks = await db.primary_keys(table_name)
+    has_rowid_column = any(d[0] == "rowid" for d in description)
+    pks_for_display = pks
+    if not pks_for_display and not await db.view_exists(table_name):
+        pks_for_display = ["rowid"]
+    label_column = None
+    if link_column:
+        label_column = await db.label_column_for_table(table_name)
+    row_action_permissions = {}
+    if link_column and request is not None and db.is_mutable:
+        row_action_permissions = await datasette.allowed_many(
+            actions=["update-row", "delete-row"],
+            resource=TableResource(database=database_name, table=table_name),
+            actor=request.actor,
+        )
+
+    columns = []
+    for r in description:
+        if r[0] == "rowid" and "rowid" not in column_details:
+            type_ = "integer"
+            notnull = 0
+        else:
+            type_ = column_details[r[0]].type
+            notnull = column_details[r[0]].notnull
+        col_dict = {
+            "name": r[0],
+            "sortable": r[0] in sortable_columns,
+            "is_pk": r[0] in pks_for_display,
+            "type": type_,
+            "notnull": notnull,
+            "description": column_descriptions.get(r[0]),
+            "column_type": None,
+            "column_type_config": None,
+        }
+        ct = column_types_map.get(r[0])
+        if ct:
+            col_dict["column_type"] = ct.name
+            col_dict["column_type_config"] = ct.config
+        columns.append(col_dict)
+
+    column_to_foreign_key_table = {
+        fk["column"]: fk["other_table"]
+        for fk in await db.foreign_keys_for_table(table_name)
+    }
+
+    cell_rows = []
+    # Columns with at least one cell displayed as a link to a foreign key row
+    fk_link_columns = set()
+    base_url = datasette.setting("base_url")
+    for row in rows:
+        cells = []
+        # Unless we are a view, the first column is a link - either to the rowid
+        # or to the simple or compound primary key
+        if link_column:
+            is_special_link_column = len(pks) != 1
+            pk_path = path_from_row_pks(row, pks, not pks, False)
+            row_path = path_from_row_pks(row, pks, not pks)
+            row_label = row_label_from_label_column(row, label_column)
+            row_action_label = pk_path
+            if row_label and row_label != pk_path:
+                row_action_label = f"{pk_path} {row_label}"
+            table_path = datasette.urls.table(database_name, table_name)
+            row_link = (
+                f'<a href="{table_path}/{row_path}">{markupsafe.escape(pk_path)!s}</a>'
+            )
+            edit_icon = (
+                '<svg class="row-inline-action-icon" aria-hidden="true" '
+                'xmlns="http://www.w3.org/2000/svg" width="14" height="14" '
+                'viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>'
+                '<path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>'
+                "</svg>"
+            )
+            delete_icon = (
+                '<svg class="row-inline-action-icon" aria-hidden="true" '
+                'xmlns="http://www.w3.org/2000/svg" width="14" height="14" '
+                'viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                '<path d="M3 6h18"></path>'
+                '<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>'
+                '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>'
+                '<path d="M10 11v6"></path>'
+                '<path d="M14 11v6"></path>'
+                "</svg>"
+            )
+            row_actions = []
+            if row_action_permissions.get("update-row"):
+                row_actions.append(
+                    '<button type="button" class="row-inline-action row-inline-action-edit" '
+                    f'aria-label="Edit row {markupsafe.escape(row_action_label)}" title="Edit row" '
+                    'data-row-action="edit">'
+                    f"{edit_icon}</button>"
+                )
+            if row_action_permissions.get("delete-row"):
+                row_actions.append(
+                    '<button type="button" class="row-inline-action row-inline-action-delete" '
+                    f'aria-label="Delete row {markupsafe.escape(row_action_label)}" title="Delete row" '
+                    'data-row-action="delete">'
+                    f"{delete_icon}</button>"
+                )
+            if row_actions:
+                row_link = (
+                    '<span class="row-link-with-actions">{row_link}'
+                    '<span class="row-inline-actions" aria-label="Row actions">'
+                    "{row_actions}</span></span>"
+                ).format(row_link=row_link, row_actions="".join(row_actions))
+            cells.append(
+                {
+                    "column": pks[0] if len(pks) == 1 else "Link",
+                    "value_type": "pk",
+                    "is_special_link_column": is_special_link_column,
+                    "raw": pk_path,
+                    "value": markupsafe.Markup(row_link),
+                }
+            )
+
+        for value, column_dict in zip(row, columns):
+            column = column_dict["name"]
+            if link_column and len(pks) == 1 and column == pks[0]:
+                # If there's a simple primary key, don't repeat the value as it's
+                # already shown in the link column.
+                continue
+
+            # First try column type render_cell, then plugins
+            # pylint: disable=no-member
+            plugin_display_value = None
+            ct = column_types_map.get(column)
+            if ct:
+                candidate = await ct.render_cell(
+                    value=value,
+                    column=column,
+                    table=table_name,
+                    database=database_name,
+                    datasette=datasette,
+                    request=request,
+                )
+                if candidate is not None:
+                    plugin_display_value = candidate
+            if plugin_display_value is None:
+                for candidate in pm.hook.render_cell(
+                    row=row,
+                    value=value,
+                    column=column,
+                    table=table_name,
+                    pks=pks_for_display,
+                    database=database_name,
+                    datasette=datasette,
+                    request=request,
+                    column_type=ct,
+                ):
+                    candidate = await await_me_maybe(candidate)
+                    if candidate is not None:
+                        plugin_display_value = candidate
+                        break
+            if plugin_display_value:
+                display_value = plugin_display_value
+            elif isinstance(value, bytes):
+                formatted = do_filesizeformat(len(value))
+                if pks or has_rowid_column or request is None:
+                    blob_url = datasette.urls.row_blob(
+                        database_name,
+                        table_name,
+                        path_from_row_pks(row, pks, not pks),
+                        column,
+                    )
+                else:
+                    # Views usually have no rowid to link to a row by,
+                    # so find the blob by its content hash instead
+                    blob_url = datasette.urls.modify(
+                        request,
+                        format="blob",
+                        add={
+                            "_blob_column": column,
+                            "_blob_hash": hashlib.sha256(value).hexdigest(),
+                        },
+                    )
+                display_value = markupsafe.Markup(
+                    '<a class="blob-download" href="{}"{}>&lt;Binary:&nbsp;{:,}&nbsp;byte{}&gt;</a>'.format(
+                        blob_url,
+                        (f' title="{formatted}"' if len(value) >= 1000 else ""),
+                        len(value),
+                        "" if len(value) == 1 else "s",
+                    )
+                )
+            elif isinstance(value, dict):
+                # It's an expanded foreign key - display link to other row
+                fk_link_columns.add(column)
+                label = value["label"]
+                value = value["value"]
+                # The table we link to depends on the column
+                other_table = column_to_foreign_key_table[column]
+                link_template = LINK_WITH_LABEL if (label != value) else LINK_WITH_VALUE
+                display_value = markupsafe.Markup(
+                    link_template.format(
+                        database=tilde_encode(database_name),
+                        base_url=base_url,
+                        table=tilde_encode(other_table),
+                        link_id=tilde_encode(str(value)),
+                        id=str(markupsafe.escape(value)),
+                        label=str(markupsafe.escape(label)) or "-",
+                    )
+                )
+            elif value in ("", None):
+                display_value = markupsafe.Markup("&nbsp;")
+            elif is_url(str(value).strip()):
+                display_value = markupsafe.Markup(
+                    '<a href="{url}">{truncated_url}</a>'.format(
+                        url=markupsafe.escape(value.strip()),
+                        truncated_url=markupsafe.escape(
+                            truncate_url(value.strip(), truncate_cells)
+                        ),
+                    )
+                )
+            else:
+                display_value = str(value)
+                if truncate_cells and len(display_value) > truncate_cells:
+                    display_value = display_value[:truncate_cells] + "\u2026"
+
+            cells.append(
+                {
+                    "column": column,
+                    "value": display_value,
+                    "raw": value,
+                    "value_type": (
+                        "none" if value is None else str(type(value).__name__)
+                    ),
+                }
+            )
+        if link_column:
+            cell_rows.append(
+                Row(
+                    cells,
+                    pk_path=pk_path,
+                    row_path=row_path,
+                    row_label=row_label,
+                )
+            )
+        else:
+            cell_rows.append(Row(cells))
+
+    for col_dict in columns:
+        col_dict["has_fks"] = col_dict["name"] in fk_link_columns
+
+    if link_column:
+        # Add the link column header.
+        # If it's a simple primary key, we have to remove and re-add that column name at
+        # the beginning of the header row.
+        first_column = None
+        if len(pks) == 1:
+            columns = [col for col in columns if col["name"] != pks[0]]
+            first_column = {
+                "name": pks[0],
+                "sortable": pks[0] in sortable_columns,
+                "is_pk": True,
+                "type": column_details[pks[0]].type,
+                "notnull": column_details[pks[0]].notnull,
+            }
+        else:
+            first_column = {
+                "name": "Link",
+                "sortable": False,
+                "is_pk": False,
+                "type": "",
+                "notnull": 0,
+                "is_special_link_column": True,
+            }
+        columns = [first_column] + columns
+    return columns, cell_rows
+
+
+class TableInsertView(BaseView):
+    name = "table-insert"
+
+    def __init__(self, datasette):
+        self.ds = datasette
+
+    async def _validate_data(self, request, db, table_name, pks, upsert):
+        errors = []
+
+        pks_list = []
+        if isinstance(pks, str):
+            pks_list = [pks]
+        else:
+            pks_list = list(pks)
+
+        if not pks_list:
+            pks_list = ["rowid"]
+
+        def _errors(errors):
+            return None, errors, {}
+
+        # The body is parsed as JSON regardless of the Content-Type header
+        try:
+            data = await request.json()
+        except json.JSONDecodeError as e:
+            return _errors([f"Invalid JSON: {e}"])
+        if not isinstance(data, dict):
+            return _errors(["JSON must be a dictionary"])
+        keys = data.keys()
+
+        # keys must contain "row" or "rows"
+        if "row" not in keys and "rows" not in keys:
+            return _errors(['JSON must have one or other of "row" or "rows"'])
+        rows = []
+        if "row" in keys:
+            if "rows" in keys:
+                return _errors(['Cannot use "row" and "rows" at the same time'])
+            row = data["row"]
+            if not isinstance(row, dict):
+                return _errors(['"row" must be a dictionary'])
+            rows = [row]
+            data["return"] = True
+        else:
+            rows = data["rows"]
+        if not isinstance(rows, list):
+            return _errors(['"rows" must be a list'])
+        for row in rows:
+            if not isinstance(row, dict):
+                return _errors(['"rows" must be a list of dictionaries'])
+
+        # Does this exceed max_insert_rows?
+        max_insert_rows = self.ds.setting("max_insert_rows")
+        if len(rows) > max_insert_rows:
+            return _errors([f"Too many rows, maximum allowed is {max_insert_rows}"])
+
+        # Validate other parameters
+        extras = {
+            key: value for key, value in data.items() if key not in ("row", "rows")
+        }
+        valid_extras = {"return", "ignore", "replace", "alter"}
+        invalid_extras = extras.keys() - valid_extras
+        if invalid_extras:
+            return _errors(
+                ['Invalid parameter: "{}"'.format('", "'.join(sorted(invalid_extras)))]
+            )
+        if extras.get("ignore") and extras.get("replace"):
+            return _errors(['Cannot use "ignore" and "replace" at the same time'])
+
+        columns = set(await db.table_columns(table_name))
+        columns.update(pks_list)
+
+        for i, row in enumerate(rows):
+            if upsert:
+                # It MUST have the primary key
+                missing_pks = [pk for pk in pks_list if pk not in row]
+                if missing_pks:
+                    errors.append(
+                        'Row {} is missing primary key column(s): "{}"'.format(
+                            i, '", "'.join(missing_pks)
+                        )
+                    )
+                null_pks = [pk for pk in pks_list if pk in row and row[pk] is None]
+                if null_pks:
+                    errors.append(
+                        'Row {} has null primary key column(s): "{}"'.format(
+                            i, '", "'.join(null_pks)
+                        )
+                    )
+            invalid_columns = set(row.keys()) - columns
+            if invalid_columns and not extras.get("alter"):
+                errors.append(
+                    "Row {} has invalid columns: {}".format(
+                        i, ", ".join(sorted(invalid_columns))
+                    )
+                )
+        if errors:
+            return _errors(errors)
+        return rows, errors, extras
+
+    async def post(self, request, upsert=False):
+        try:
+            resolved = await self.ds.resolve_table(request)
+        except NotFound as e:
+            return Response.error([e.args[0]], 404)
+        db = resolved.db
+        database_name = db.name
+        table_name = resolved.table
+
+        # Table must exist (may handle table creation in the future)
+        db = self.ds.get_database(database_name)
+        if not await db.table_exists(table_name):
+            return Response.error([f"Table not found: {table_name}"], 404)
+
+        if upsert:
+            # Must have insert-row AND upsert-row permissions
+            if not (
+                await self.ds.allowed(
+                    action="insert-row",
+                    resource=TableResource(database=database_name, table=table_name),
+                    actor=request.actor,
+                )
+                and await self.ds.allowed(
+                    action="update-row",
+                    resource=TableResource(database=database_name, table=table_name),
+                    actor=request.actor,
+                )
+            ):
+                return Response.error(
+                    ["Permission denied: need both insert-row and update-row"], 403
+                )
+        else:
+            # Must have insert-row permission
+            if not await self.ds.allowed(
+                action="insert-row",
+                resource=TableResource(database=database_name, table=table_name),
+                actor=request.actor,
+            ):
+                return Response.error(["Permission denied"], 403)
+
+        if not db.is_mutable:
+            return Response.error(["Database is immutable"], 403)
+
+        pks = await db.primary_keys(table_name)
+
+        try:
+            rows, errors, extras = await self._validate_data(
+                request, db, table_name, pks, upsert
+            )
+        except PayloadTooLarge as e:
+            return Response.error([str(e)], 413)
+        if errors:
+            return Response.error(errors, 400)
+        try:
+            rows = decode_write_json_rows(rows)
+        except WriteJsonValueError as e:
+            return Response.error([str(e)], 400)
+
+        # Validate column types
+        ct_errors = await _validate_column_types(
+            self.ds, database_name, table_name, rows
+        )
+        if ct_errors:
+            return Response.error(ct_errors, 400)
+
+        num_rows = len(rows)
+
+        # No that we've passed pks to _validate_data it's safe to
+        # fix the rowids case:
+        if not pks:
+            pks = ["rowid"]
+
+        ignore = extras.get("ignore")
+        replace = extras.get("replace")
+        alter = extras.get("alter")
+
+        if upsert and (ignore or replace):
+            return Response.error(["Upsert does not support ignore or replace"], 400)
+
+        if replace and not await self.ds.allowed(
+            action="update-row",
+            resource=TableResource(database=database_name, table=table_name),
+            actor=request.actor,
+        ):
+            return Response.error(
+                ['Permission denied: need update-row to use "replace"'], 403
+            )
+
+        initial_schema = None
+        if alter:
+            # Must have alter-table permission
+            if not await self.ds.allowed(
+                action="alter-table",
+                resource=TableResource(database=database_name, table=table_name),
+                actor=request.actor,
+            ):
+                return Response.error(["Permission denied for alter-table"], 403)
+            # Track initial schema to check if it changed later
+            initial_schema = await db.execute_fn(
+                lambda conn: sqlite_utils.Database(conn)[table_name].schema
+            )
+
+        should_return = bool(extras.get("return", False))
+        row_pk_values_for_later = []
+        if should_return and upsert:
+            row_pk_values_for_later = [tuple(row[pk] for pk in pks) for row in rows]
+
+        def insert_or_upsert_rows(conn):
+            check_structured_write_table(conn, table_name)
+            table = sqlite_utils.Database(conn)[table_name]
+            kwargs = {}
+            if upsert:
+                kwargs = {
+                    "pk": pks[0] if len(pks) == 1 else pks,
+                    "alter": alter,
+                }
+            else:
+                # Insert
+                kwargs = {"ignore": ignore, "replace": replace, "alter": alter}
+            if should_return and not upsert:
+                rowids = []
+                method = table.upsert if upsert else table.insert
+                for row in rows:
+                    rowids.append(method(row, **kwargs).last_rowid)
+                return list(
+                    table.rows_where(
+                        "rowid in ({})".format(",".join("?" for _ in rowids)),
+                        rowids,
+                    )
+                )
+            else:
+                method_all = table.upsert_all if upsert else table.insert_all
+                method_all(rows, **kwargs)
+
+        try:
+            rows = await db.execute_write_fn(insert_or_upsert_rows, request=request)
+        except Exception as e:  # noqa: BLE001
+            # TODO: narrow to expected write errors so Datasette bugs surface as 500s
+            return Response.error([str(e)])
+        result = {"ok": True}
+        # Only read back and disclose stored rows if the actor is also
+        # allowed to view this table - insert-row/update-row alone must
+        # not be usable to read data the actor cannot otherwise see.
+        if should_return and not await self.ds.allowed(
+            action="view-table",
+            resource=TableResource(database=database_name, table=table_name),
+            actor=request.actor,
+        ):
+            should_return = False
+        if should_return:
+            if upsert:
+                # Fetch based on initial input IDs
+                where_clause = " OR ".join(
+                    [
+                        "({})".format(
+                            " AND ".join(f"{escape_sqlite(pk)} = ?" for pk in pks)
+                        )
+                    ]
+                    * len(row_pk_values_for_later)
+                )
+                args = list(itertools.chain.from_iterable(row_pk_values_for_later))
+                fetched_rows = await db.execute(
+                    "select {}* from {} where {}".format(
+                        "rowid, " if pks == ["rowid"] else "",
+                        escape_sqlite(table_name),
+                        where_clause,
+                    ),
+                    args,
+                )
+                result["rows"] = fetched_rows.dicts()
+            else:
+                result["rows"] = rows
+        # We track the number of rows requested, but do not attempt to show which were actually
+        # inserted or upserted v.s. ignored
+        if upsert:
+            await self.ds.track_event(
+                UpsertRowsEvent(
+                    actor=request.actor,
+                    database=database_name,
+                    table=table_name,
+                    num_rows=num_rows,
+                )
+            )
+        else:
+            await self.ds.track_event(
+                InsertRowsEvent(
+                    actor=request.actor,
+                    database=database_name,
+                    table=table_name,
+                    num_rows=num_rows,
+                    ignore=bool(ignore),
+                    replace=bool(replace),
+                )
+            )
+
+        if initial_schema is not None:
+            after_schema = await db.execute_fn(
+                lambda conn: sqlite_utils.Database(conn)[table_name].schema
+            )
+            if initial_schema != after_schema:
+                await self.ds.track_event(
+                    AlterTableEvent(
+                        request.actor,
+                        database=database_name,
+                        table=table_name,
+                        before_schema=initial_schema,
+                        after_schema=after_schema,
+                    )
+                )
+
+        return Response.json(
+            result,
+            status=200 if upsert else 201,
+            default=CustomJSONEncoder().default,
+        )
+
+
+class TableUpsertView(TableInsertView):
+    name = "table-upsert"
+
+    async def post(self, request):
+        return await super().post(request, upsert=True)
+
+
+class TableSetColumnTypeView(BaseView):
+    name = "table-set-column-type"
+
+    def __init__(self, datasette):
+        self.ds = datasette
+
+    async def post(self, request):
+        try:
+            resolved = await self.ds.resolve_table(request)
+        except NotFound as e:
+            return Response.error([e.args[0]], 404)
+
+        database_name = resolved.db.name
+        table_name = resolved.table
+
+        if not await self.ds.allowed(
+            action="set-column-type",
+            resource=TableResource(database=database_name, table=table_name),
+            actor=request.actor,
+        ):
+            return Response.error(["Permission denied"], 403)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError as e:
+            return Response.error([f"Invalid JSON: {e}"], 400)
+        except PayloadTooLarge as e:
+            return Response.error([str(e)], 413)
+
+        if not isinstance(data, dict):
+            return Response.error(["JSON must be a dictionary"], 400)
+
+        invalid_keys = set(data.keys()) - {"column", "column_type"}
+        if invalid_keys:
+            return Response.error(
+                ['Invalid parameter: "{}"'.format('", "'.join(sorted(invalid_keys)))],
+                400,
+            )
+
+        if "column" not in data:
+            return Response.error(['"column" is required'], 400)
+        column = data["column"]
+        if not isinstance(column, str):
+            return Response.error(['"column" must be a string'], 400)
+
+        if "column_type" not in data:
+            return Response.error(['"column_type" is required'], 400)
+
+        column_details = await self.ds._get_resource_column_details(
+            database_name, table_name
+        )
+        if column not in column_details:
+            return Response.error([f"Column not found: {column}"], 400)
+
+        column_type_data = data["column_type"]
+        if column_type_data is None:
+            await self.ds.remove_column_type(database_name, table_name, column)
+            return Response.json(
+                {
+                    "ok": True,
+                    "database": database_name,
+                    "table": table_name,
+                    "column": column,
+                    "column_type": None,
+                },
+                status=200,
+            )
+
+        if not isinstance(column_type_data, dict):
+            return Response.error(['"column_type" must be an object or null'], 400)
+
+        invalid_column_type_keys = set(column_type_data.keys()) - {"type", "config"}
+        if invalid_column_type_keys:
+            return Response.error(
+                [
+                    'Invalid column_type parameter: "{}"'.format(
+                        '", "'.join(sorted(invalid_column_type_keys))
+                    )
+                ],
+                400,
+            )
+
+        if "type" not in column_type_data:
+            return Response.error(['"column_type.type" is required'], 400)
+        column_type = column_type_data["type"]
+        if not isinstance(column_type, str):
+            return Response.error(['"column_type.type" must be a string'], 400)
+
+        config = column_type_data.get("config")
+        if config is not None and not isinstance(config, dict):
+            return Response.error(['"column_type.config" must be a dictionary'], 400)
+
+        if column_type not in self.ds._column_types:
+            return Response.error([f"Unknown column type: {column_type}"], 400)
+
+        try:
+            await self.ds.set_column_type(
+                database_name, table_name, column, column_type, config
+            )
+        except ValueError as e:
+            return Response.error([str(e)], 400)
+
+        return Response.json(
+            {
+                "ok": True,
+                "database": database_name,
+                "table": table_name,
+                "column": column,
+                "column_type": {"type": column_type, "config": config},
+            },
+            status=200,
+        )
+
+
+class TableDropView(BaseView):
+    name = "table-drop"
+
+    def __init__(self, datasette):
+        self.ds = datasette
+
+    async def post(self, request):
+        try:
+            resolved = await self.ds.resolve_table(request)
+        except NotFound as e:
+            return Response.error([e.args[0]], 404)
+        db = resolved.db
+        database_name = db.name
+        table_name = resolved.table
+        # Table must exist
+        db = self.ds.get_database(database_name)
+        if not await db.table_exists(table_name):
+            return Response.error([f"Table not found: {table_name}"], 404)
+        if not await self.ds.allowed(
+            action="drop-table",
+            resource=TableResource(database=database_name, table=table_name),
+            actor=request.actor,
+        ):
+            return Response.error(["Permission denied"], 403)
+        if not db.is_mutable:
+            return Response.error(["Database is immutable"], 403)
+        confirm = False
+        try:
+            data = await request.json()
+            confirm = data.get("confirm")
+        except json.JSONDecodeError:
+            pass
+        except PayloadTooLarge as e:
+            return Response.error([str(e)], 413)
+
+        if not confirm:
+            return Response.json(
+                {
+                    "ok": True,
+                    "database": database_name,
+                    "table": table_name,
+                    "row_count": (
+                        await db.execute(
+                            f"select count(*) from {escape_sqlite(table_name)}"
+                        )
+                    ).single_value(),
+                    "message": 'Pass "confirm": true to confirm',
+                },
+                status=200,
+            )
+
+        # Drop table
+        def drop_table(conn):
+            table = sqlite_utils.Database(conn)[table_name]
+            table.disable_fts()
+            table.drop()
+
+        await db.execute_write_fn(drop_table, request=request)
+        await self.ds.track_event(
+            DropTableEvent(
+                actor=request.actor, database=database_name, table=table_name
+            )
+        )
+        self.ds.add_message(
+            request,
+            f"Table {table_name} dropped",
+            self.ds.WARNING,
+        )
+        return Response.json({"ok": True}, status=200)
+
+
+class TableCountView(BaseView):
+    name = "table-count"
+
+    async def post(self, request):
+        try:
+            return await self.count(request)
+        except (NotFound, Forbidden, BadRequest, DatasetteError) as ex:
+            return Response.error(str(ex), status=ex.status)
+
+    async def count(self, request):
+        resolved = await self.ds.resolve_table(request)
+        visible, _private = await self.ds.check_visibility(
+            request.actor,
+            action="view-table",
+            resource=TableResource(database=resolved.db.name, table=resolved.table),
+        )
+        if not visible:
+            raise Forbidden("You do not have permission to view this table")
+        _, where_clauses, params, _, _ = await _table_filters(
+            self.ds, request, resolved.db.name, resolved.table
+        )
+        _next = request.args.get("_next")
+        if request.args.get("_count") == "before" and _next:
+            return await self.count_before(
+                request, resolved, _next, where_clauses, params
+            )
+        sql = f"select count(*) from {escape_sqlite(resolved.table)}"
+        if where_clauses:
+            sql += " where " + " and ".join(where_clauses)
+        try:
+            results = await resolved.db.execute(sql, params)
+        except QueryInterrupted:
+            return Response.error("Count query timed out", status=400)
+        except (sqlite3.OperationalError, InvalidSql) as ex:
+            return Response.error(str(ex), status=400)
+        return Response.json(
+            {"ok": True, "count": results.single_value()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def count_before(self, request, resolved, _next, where_clauses, params):
+        """Count the filtered rows that come before a ?_next= cursor.
+
+        Used to show "Rows 51-100" on pages after the first, without slowing
+        down the page itself."""
+        db, table_name = resolved.db, resolved.table
+        if resolved.is_view:
+            # For views _next is a plain offset
+            try:
+                count = int(_next)
+            except ValueError:
+                return Response.error("Invalid _next", status=400)
+        else:
+            pks = await db.primary_keys(table_name)
+            use_rowid = not pks
+            table_metadata = await self.ds.table_config(db.name, table_name)
+            sortable_columns = await _sortable_columns_for_table(
+                self.ds, db.name, table_name, use_rowid
+            )
+            sort, sort_desc, _ = await _sort_order(
+                table_metadata, sortable_columns, request, ""
+            )
+            params = dict(params)
+            before_clause = _at_or_before_next_where_clause(
+                _next, sort, sort_desc, pks, use_rowid, params
+            )
+            if before_clause is None:
+                return Response.error("Invalid _next", status=400)
+            sql = "select count(*) from {} where {}".format(
+                escape_sqlite(table_name),
+                " and ".join(where_clauses + [before_clause]),
+            )
+            try:
+                results = await db.execute(sql, params)
+            except QueryInterrupted:
+                return Response.error("Count query timed out", status=400)
+            except (sqlite3.OperationalError, InvalidSql) as ex:
+                return Response.error(str(ex), status=400)
+            count = results.single_value()
+        return Response.json(
+            {"ok": True, "count": count},
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+class TableFragmentView(BaseView):
+    name = "table-fragment"
+
+    def __init__(self, datasette):
+        self.ds = datasette
+
+    async def get(self, request):
+        resolved = await self.ds.resolve_table(request)
+        request = await _fragment_request_for_row(request, resolved)
+        view_data = await table_view_data(
+            self.ds,
+            request,
+            resolved,
+            extra_extras={"_html"},
+            context_for_html_hack=True,
+            default_labels=True,
+        )
+        if isinstance(view_data, Response):
+            return view_data
+        data, _rows, _columns, _expanded_columns, _sql, _next_url = view_data
+        templates = data["custom_table_templates"]
+        html = await self.ds.render_template(
+            templates,
+            dict(
+                data,
+                settings=self.ds.settings_dict(),
+            ),
+            request=request,
+            view_name="table",
+        )
+        return Response.html(html)
+
+
+def _escape_like(value):
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# Returns the exclusive upper bound for an indexed prefix search:
+# For example, values beginning with "abc" fall below the next prefix boundary.
+# The LIKE clause is still applied separately for exact escaped-LIKE semantics.
+def _prefix_range_end(value):
+    if not value:
+        return None
+    characters = list(value)
+    for i in range(len(characters) - 1, -1, -1):
+        if ord(characters[i]) < 0x10FFFF:
+            return "{}{}".format("".join(characters[:i]), chr(ord(characters[i]) + 1))
+    return None
+
+
+def _autocomplete_like(column):
+    return f"{escape_sqlite(column)} like :like escape char(92)"
+
+
+def _autocomplete_prefix_like(column):
+    return f"{escape_sqlite(column)} like :prefix escape char(92)"
+
+
+def _autocomplete_order_by(pks, label_column, exact_pk, label_matches_first=True):
+    clauses = []
+    if exact_pk:
+        clauses.append(
+            f"case when cast({escape_sqlite(pks[0])} as text) = :q then 0 else 1 end"
+        )
+    if label_column:
+        label_like = _autocomplete_like(label_column)
+        if label_matches_first:
+            clauses.append(f"case when {label_like} then 0 else 1 end")
+        clauses.append(
+            f"case when {label_like} then length(cast({escape_sqlite(label_column)} as text)) end"
+        )
+    else:
+        clauses.append(f"length(cast({escape_sqlite(pks[0])} as text))")
+    clauses.extend(escape_sqlite(pk) for pk in pks)
+    return ", ".join(clauses)
+
+
+def _autocomplete_pk_order_by(pks):
+    return ", ".join(escape_sqlite(pk) for pk in pks)
+
+
+def _autocomplete_initial_order_by(pks):
+    order_by = [f"{escape_sqlite(pks[0])} desc"]
+    order_by.extend(escape_sqlite(pk) for pk in pks[1:])
+    return ", ".join(order_by)
+
+
+def _autocomplete_response_rows(rows, pks, label_column):
+    response_rows = []
+    for row in rows:
+        item = {"pks": {pk: row[pk] for pk in pks}}
+        if label_column:
+            item["label"] = row[label_column]
+        response_rows.append(item)
+    return response_rows
+
+
+AUTOCOMPLETE_TIME_LIMIT_MS = 500
+
+
+class TableAutocompleteView(BaseView):
+    name = "table-autocomplete"
+
+    async def get(self, request):
+        resolved = await self.ds.resolve_table(request)
+        if resolved.is_view:
+            raise BadRequest("Autocomplete is only available for tables")
+
+        db = resolved.db
+        database_name = db.name
+        table_name = resolved.table
+        visible, _ = await self.ds.check_visibility(
+            request.actor,
+            action="view-table",
+            resource=TableResource(database=database_name, table=table_name),
+        )
+        if not visible:
+            raise Forbidden("You do not have permission to view this table")
+
+        pks = await db.primary_keys(table_name)
+        if not pks:
+            pks = ["rowid"]
+        label_column = await db.label_column_for_table(table_name)
+        select_columns = list(
+            dict.fromkeys(pks + ([label_column] if label_column else []))
+        )
+        select_sql = ", ".join(escape_sqlite(column) for column in select_columns)
+        q = request.args.get("q") or ""
+        initial_arg = request.args.get("_initial")
+        initial = (
+            not q
+            and initial_arg is not None
+            and initial_arg != ""
+            and value_as_boolean(initial_arg)
+        )
+        if not q and not initial:
+            return Response.json({"ok": True, "rows": []})
+        params = {
+            "q": q,
+            "like": f"%{_escape_like(q)}%",
+            "prefix": f"{_escape_like(q)}%",
+        }
+
+        like_columns = pks[:]
+        if label_column and label_column not in like_columns:
+            like_columns.append(label_column)
+        where_sql = " or ".join(_autocomplete_like(column) for column in like_columns)
+        exact_pk = len(pks) == 1
+        order_by = _autocomplete_order_by(pks, label_column, exact_pk)
+
+        if initial:
+            where_sql = "1 = 1"
+            order_by = _autocomplete_initial_order_by(pks)
+
+        sql = f"""
+            select {select_sql}
+            from {escape_sqlite(table_name)}
+            where {where_sql}
+            order by {order_by}
+            limit 10
+        """
+
+        try:
+            results = await db.execute(
+                sql, params, custom_time_limit=AUTOCOMPLETE_TIME_LIMIT_MS
+            )
+        except QueryInterrupted:
+            fallback_where = _autocomplete_prefix_like(pks[0])
+            prefix_end = _prefix_range_end(q)
+            if prefix_end:
+                params["prefix_end"] = prefix_end
+                first_pk = escape_sqlite(pks[0])
+                fallback_where = f"{first_pk} >= :q and {first_pk} < :prefix_end and {fallback_where}"
+            fallback_sql = f"""
+                select {select_sql}
+                from {escape_sqlite(table_name)}
+                where {fallback_where}
+                order by {_autocomplete_pk_order_by(pks)}
+                limit 10
+            """
+            try:
+                results = await db.execute(
+                    fallback_sql,
+                    params,
+                    custom_time_limit=AUTOCOMPLETE_TIME_LIMIT_MS,
+                )
+            except QueryInterrupted:
+                return Response.json({"ok": True, "rows": []})
+
+        return Response.json(
+            {
+                "ok": True,
+                "rows": _autocomplete_response_rows(results.rows, pks, label_column),
+            }
+        )
+
+
+async def _columns_to_select(table_columns, pks, request):
+    columns = list(table_columns)
+    if "_col" in request.args:
+        columns = list(pks)
+        _cols = request.args.getlist("_col")
+        bad_columns = [column for column in _cols if column not in table_columns]
+        if bad_columns:
+            raise DatasetteError(
+                "_col={} - invalid columns".format(", ".join(bad_columns)),
+                status=400,
+            )
+        # De-duplicate maintaining order, skipping columns already added (pks):
+        columns.extend(c for c in dict.fromkeys(_cols) if c not in columns)
+    if "_nocol" in request.args:
+        # Return all columns EXCEPT these
+        bad_columns = [
+            column
+            for column in request.args.getlist("_nocol")
+            if (column not in table_columns) or (column in pks)
+        ]
+        if bad_columns:
+            raise DatasetteError(
+                "_nocol={} - invalid columns".format(", ".join(bad_columns)),
+                status=400,
+            )
+        tmp_columns = [
+            column for column in columns if column not in request.args.getlist("_nocol")
+        ]
+        columns = tmp_columns
+    return columns
+
+
+async def _sortable_columns_for_table(datasette, database_name, table_name, use_rowid):
+    db = datasette.databases[database_name]
+    table_metadata = await datasette.table_config(database_name, table_name)
+    if "sortable_columns" in table_metadata:
+        sortable_columns = set(table_metadata["sortable_columns"])
+    else:
+        sortable_columns = set(await db.table_columns(table_name))
+    if use_rowid:
+        sortable_columns.add("rowid")
+    return sortable_columns
+
+
+async def _sort_order(table_metadata, sortable_columns, request, order_by):
+    sort = request.args.get("_sort")
+    sort_desc = request.args.get("_sort_desc")
+
+    if not sort and not sort_desc:
+        sort = table_metadata.get("sort")
+        sort_desc = table_metadata.get("sort_desc")
+
+    if sort and sort_desc:
+        raise DatasetteError(
+            "Cannot use _sort and _sort_desc at the same time", status=400
+        )
+
+    if sort:
+        if sort not in sortable_columns:
+            raise DatasetteError(f"Cannot sort table by {sort}", status=400)
+
+        order_by = escape_sqlite(sort)
+
+    if sort_desc:
+        if sort_desc not in sortable_columns:
+            raise DatasetteError(f"Cannot sort table by {sort_desc}", status=400)
+
+        order_by = f"{escape_sqlite(sort_desc)} desc"
+
+    return sort, sort_desc, order_by
+
+
+async def table_view(datasette, request):
+    await datasette.refresh_schemas()
+    with tracer.trace_child_tasks():
+        response = await table_view_traced(datasette, request)
+
+    # CORS
+    if datasette.cors:
+        add_cors_headers(response.headers)
+
+    # Cache TTL header
+    ttl = request.args.get("_ttl", None)
+    if ttl is None or not ttl.isdigit():
+        ttl = datasette.setting("default_cache_ttl")
+
+    private = getattr(request, "_datasette_private_response", False)
+
+    if datasette.cache_headers and response.status == 200:
+        if private:
+            # This response is only visible to the current actor (denied to
+            # anonymous requests), so it must never be stored by a shared
+            # cache/CDN - and ?_ttl= must not be able to override that.
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Vary"] = "Cookie"
+        else:
+            ttl = int(ttl)
+            if ttl == 0:
+                ttl_header = "no-cache"
+            else:
+                ttl_header = f"max-age={ttl}"
+            response.headers["Cache-Control"] = ttl_header
+
+    # Referrer policy
+    response.headers["Referrer-Policy"] = "no-referrer"
+
+    return response
+
+
+async def table_view_traced(datasette, request):
+    from datasette.app import TableNotFound
+
+    try:
+        resolved = await datasette.resolve_table(request)
+    except TableNotFound as not_found:
+        # Was this actually a stored query?
+        stored_query = await datasette.get_query(
+            not_found.database_name, not_found.table
+        )
+        # If this is a stored query, not a table, then dispatch to QueryView instead
+        if stored_query:
+            return await QueryView()(request, datasette)
+        else:
+            raise
+
+    if request.method == "POST":
+        return Response.text("Method not allowed", status=405)
+
+    format_ = request.url_vars.get("format") or "html"
+    extra_extras = None
+    context_for_html_hack = False
+    default_labels = False
+    if format_ == "html":
+        extra_extras = {"_html"}
+        context_for_html_hack = True
+        default_labels = True
+
+    # ?_stream=1 for a format that can stream fetches the largest pages
+    stream = bool(
+        request.args.get("_stream") and datasette._renderer_can_stream.get(format_)
+    )
+
+    start = time.perf_counter()
+    view_data = await table_view_data(
+        datasette,
+        request,
+        resolved,
+        extra_extras=extra_extras,
+        context_for_html_hack=context_for_html_hack,
+        default_labels=default_labels,
+        renderer_extras=datasette._renderer_extras.get(format_),
+        stream=stream,
+    )
+    if isinstance(view_data, Response):
+        return view_data
+    query_ms = (time.perf_counter() - start) * 1000
+    data, rows, columns, _expanded_columns, sql, next_url = view_data
+
+    # Handle formats from plugins
+    if format_ in datasette.renderers:
+        next_token = data["next"]
+
+        async def fetch_next_page():
+            # Used to stream every row, a page at a time
+            nonlocal next_token
+            if not next_token:
+                return None
+            page_data, page_rows, *_ = await table_view_data(
+                datasette,
+                request,
+                resolved,
+                default_labels=default_labels,
+                _next=next_token,
+                rows_only=True,
+                stream=stream,
+            )
+            next_token = page_data["next"]
+            return page_rows
+
+        r = await render_with_output_renderer(
+            datasette,
+            request,
+            format_,
+            data=data,
+            columns=columns,
+            rows=rows,
+            sql=sql,
+            query_name=None,
+            database=resolved.db.name,
+            table=resolved.table,
+            view_name="table",
+            truncated=False,
+            error=None,
+            fetch_next_page=fetch_next_page,
+        )
+        if stream_requested(datasette, request, format_):
+            # Every row is in this response, so there is no next page
+            next_url = None
+    elif format_ == "html":
+        headers = {}
+        templates = [
+            f"table-{to_css_class(resolved.db.name)}-{to_css_class(resolved.table)}.html",
+            "table.html",
+        ]
+        environment = datasette.get_jinja_environment(request)
+        template = environment.select_template(templates)
+        alternate_url_json = datasette.absolute_url(
+            request,
+            datasette.urls.modify(request, format="json"),
+        )
+        headers.update(
+            {
+                "Link": f'<{alternate_url_json}>; rel="alternate"; type="application/json+datasette"'
+            }
+        )
+        table_context = TableContext(
+            actions=data["actions"],
+            all_columns=data["all_columns"],
+            columns=data["columns"],
+            count=data["count"],
+            count_sql=data["count_sql"],
+            custom_table_templates=data["custom_table_templates"],
+            database=data["database"],
+            database_color=data["database_color"],
+            display_columns=data["display_columns"],
+            display_rows=data["display_rows"],
+            expandable_columns=data["expandable_columns"],
+            facet_results=data["facet_results"],
+            facets_timed_out=data["facets_timed_out"],
+            filters=data["filters"],
+            form_hidden_args=data["form_hidden_args"],
+            human_description_en=data["human_description_en"],
+            filter_description_en=data["filter_description_en"],
+            sort_description_en=data["sort_description_en"],
+            is_view=data["is_view"],
+            metadata=data["metadata"],
+            next_url=data["next_url"],
+            primary_keys=data["primary_keys"],
+            private=data["private"],
+            query=data["query"],
+            renderers=data["renderers"],
+            renderer_options=datasette._renderer_options,
+            set_column_type_ui=data["set_column_type_ui"],
+            sorted_facet_results=data["sorted_facet_results"],
+            suggested_facets=data["suggested_facets"],
+            table=data["table"],
+            table_definition=data["table_definition"],
+            view_definition=data["view_definition"],
+            ok=data["ok"],
+            next=data["next"],
+            count_truncated=data["count_truncated"],
+            rows=data["rows"],
+            filter_columns=data["filter_columns"],
+            supports_search=data["supports_search"],
+            search=data.get("search") or "",
+            extra_wheres_for_ui=data["extra_wheres_for_ui"],
+            clear_filters_url=data["clear_filters_url"],
+            page_position=data["page_position"],
+            url_csv=data["url_csv"],
+            url_csv_path=data["url_csv_path"],
+            url_csv_hidden_args=data["url_csv_hidden_args"],
+            url_tsv_path=data["url_tsv_path"],
+            sort=data["sort"],
+            sort_desc=data["sort_desc"],
+            settings=datasette.settings_dict(),
+            alternate_url_json=alternate_url_json,
+            is_sortable=any(c["sortable"] for c in data["display_columns"]),
+            allow_execute_sql=await datasette.allowed(
+                action="execute-sql",
+                resource=DatabaseResource(database=resolved.db.name),
+                actor=request.actor,
+            ),
+            query_ms=query_ms,
+            select_templates=[
+                f"{'*' if template_name == template.name else ''}{template_name}"
+                for template_name in templates
+            ],
+            top_table=make_slot_function(
+                "top_table",
+                datasette,
+                request,
+                database=resolved.db.name,
+                table=resolved.table,
+            ),
+            table_page_data=data["table_page_data"],
+            table_insert_ui=data["table_insert_ui"],
+            table_alter_ui=data["table_alter_ui"],
+            row_mutation_ui=data["row_mutation_ui"],
+        )
+        r = Response.html(
+            await datasette.render_template(
+                template,
+                table_context,
+                request=request,
+                view_name="table",
+            ),
+            headers=headers,
+        )
+    else:
+        assert False, f"Invalid format: {format_}"
+    if next_url and format_ != "html":
+        r.headers["link"] = f'<{next_url}>; rel="next"'
+    return r
+
+
+def _encode_sort_value(value):
+    if value is None:
+        return "$null"
+    # A raw colon cannot occur in a legacy tilde-encoded text component.
+    if isinstance(value, int):
+        return f"i:{value}"
+    if isinstance(value, float):
+        # float.hex() writes positive exponents as "p+1". A raw "+" in a query
+        # string decodes to a space, so drop it - float.fromhex() accepts "p1"
+        return f"f:{value.hex().replace('+', '')}"
+    if isinstance(value, bytes):
+        return f"b:{value.hex()}"
+    return tilde_encode(str(value))
+
+
+def _decode_sort_value(value):
+    if value == "$null":
+        return None
+    # Typed values are not tilde-encoded, so check for them before tilde_decode()
+    try:
+        if value.startswith("i:"):
+            number = int(value[2:])
+            if not -(2**63) <= number < 2**63:
+                raise ValueError
+            return number
+        if value.startswith("f:"):
+            number = float.fromhex(value[2:])
+            if math.isnan(number):
+                raise ValueError
+            return number
+        if value.startswith("b:"):
+            return bytes.fromhex(value[2:])
+    except (ValueError, OverflowError):
+        raise BadRequest("Invalid _next")
+    return tilde_decode(value)
+
+
+def _parse_next(_next, sort, sort_desc):
+    """Split a ?_next= cursor into (sort_value, primary key components)."""
+    sort_value = None
+    components = _next.split(",")
+    # If a sort order is applied and there are multiple components,
+    # the first of these is the sort value
+    if (sort or sort_desc) and (len(components) > 1):
+        sort_value = _decode_sort_value(components.pop(0))
+    return sort_value, [tilde_decode(component) for component in components]
+
+
+def _at_or_before_next_where_clause(_next, sort, sort_desc, pks, use_rowid, params):
+    """SQL clause selecting the rows up to and including a ?_next= cursor - the
+    rows on earlier pages. Returns None if the cursor is not valid.
+
+    This is the inverse of _next_where_clauses(), written out directly rather
+    than as "not (...)" so that SQLite can use an index range search on the
+    primary key (or on the sort column, if it is indexed)."""
+    sort_value, components = _parse_next(_next, sort, sort_desc)
+    if use_rowid:
+        if len(components) != 1:
+            return None
+        pk_clause = f"rowid <= :p{len(params)}"
+        params[f"p{len(params)}"] = components[0]
+    else:
+        if len(components) != len(pks):
+            return None
+        param_len = len(params)
+        pk_clause = compound_keys_at_or_before_sql(pks, param_len)
+        for i, pk_value in enumerate(components):
+            params[f"p{param_len + i}"] = pk_value
+    if not (sort or sort_desc):
+        return pk_clause
+    # Rows are ordered by the sort column then the primary key. SQLite puts
+    # nulls first in ascending order and last in descending order.
+    column = escape_sqlite(sort or sort_desc)
+    if sort_value is None:
+        if sort:
+            # Only nulls come before, up to the cursor's primary key
+            return f"({column} is null and {pk_clause})"
+        # Every non-null value comes before the nulls
+        return f"({column} is not null or ({column} is null and {pk_clause}))"
+    p = f":p{len(params)}"
+    params[f"p{len(params)}"] = sort_value
+    if sort:
+        return (
+            f"({column} is null or {column} < {p}"
+            f" or ({column} = {p} and {pk_clause}))"
+        )
+    return f"({column} > {p} or ({column} = {p} and {pk_clause}))"
+
+
+def _next_where_clauses(_next, sort, sort_desc, pks, use_rowid, params):
+    """SQL clauses selecting the rows at and after a ?_next= keyset cursor.
+
+    Adds the cursor's values to params and returns a list of where clauses."""
+    clauses = []
+    sort_value, components = _parse_next(_next, sort, sort_desc)
+
+    # Figure out the SQL for next-based-on-primary-key first
+    next_by_pk_clauses = []
+    if use_rowid:
+        next_by_pk_clauses.append(f"rowid > :p{len(params)}")
+        params[f"p{len(params)}"] = components[0]
+    else:
+        # Apply the tie-breaker based on primary keys
+        if len(components) == len(pks):
+            param_len = len(params)
+            next_by_pk_clauses.append(compound_keys_after_sql(pks, param_len))
+            for i, pk_value in enumerate(components):
+                params[f"p{param_len + i}"] = pk_value
+
+    # Now add the sort SQL, which may incorporate next_by_pk_clauses
+    if sort or sort_desc:
+        if sort_value is None:
+            if sort_desc:
+                # Just items where column is null ordered by pk
+                clauses.append(
+                    "({column} is null and {next_clauses})".format(
+                        column=escape_sqlite(sort_desc),
+                        next_clauses=" and ".join(next_by_pk_clauses),
+                    )
+                )
+            else:
+                clauses.append(
+                    "({column} is not null or ({column} is null and {next_clauses}))".format(
+                        column=escape_sqlite(sort),
+                        next_clauses=" and ".join(next_by_pk_clauses),
+                    )
+                )
+        else:
+            clauses.append(
+                "({column} {op} :p{p}{extra_desc_only} or ({column} = :p{p} and {next_clauses}))".format(
+                    column=escape_sqlite(sort or sort_desc),
+                    op=">" if sort else "<",
+                    p=len(params),
+                    extra_desc_only=(
+                        ""
+                        if sort
+                        else f" or {escape_sqlite(sort or sort_desc)} is null"
+                    ),
+                    next_clauses=" and ".join(next_by_pk_clauses),
+                )
+            )
+            params[f"p{len(params)}"] = sort_value
+    else:
+        clauses.extend(next_by_pk_clauses)
+    return clauses
+
+
+def _page_position(datasette, request, is_view, sort, sort_desc, pks, use_rowid):
+    """Context for the "you are not on the first page" strip, or None on page 1."""
+    _next = request.args.get("_next")
+    if not _next:
+        return None
+    position = {
+        "first_url": datasette.urls.modify(request, remove="_next"),
+        "count_before_url": datasette.urls.modify(
+            request_route_path(request).rstrip("/")
+            + "/-/count?"
+            + request.query_string,
+            add={"_count": "before"},
+        ),
+        "after_column": None,
+        "after_value": None,
+    }
+    if is_view:
+        return position
+    sort_value, components = _parse_next(_next, sort, sort_desc)
+    if (sort or sort_desc) and len(_next.split(",")) > 1:
+        position["after_column"] = sort or sort_desc
+        position["after_value"] = None if sort_value is None else str(sort_value)
+    else:
+        position["after_column"] = "rowid" if use_rowid else ", ".join(pks)
+        position["after_value"] = ", ".join(components)
+    return position
+
+
+async def _table_filters(datasette, request, database_name, table_name):
+    # Arguments that start with _ and don't contain a __ are
+    # special - things like ?_search= - and should not be
+    # treated as filters.
+    filter_args = []
+    for key in request.args:
+        if not (key.startswith("_") and "__" not in key):
+            for v in request.args.getlist(key):
+                filter_args.append((key, v))
+
+    # Build where clauses from query string arguments
+    filters = Filters(sorted(filter_args))
+    where_clauses, params = filters.build_where_clauses(table_name)
+
+    # Execute filters_from_request plugin hooks - including the default
+    # ones that live in datasette/filters.py
+    extra_context_from_filters = {}
+    extra_human_descriptions = []
+
+    for hook in pm.hook.filters_from_request(
+        request=request,
+        table=table_name,
+        database=database_name,
+        datasette=datasette,
+    ):
+        filter_arguments = await await_me_maybe(hook)
+        if filter_arguments:
+            where_clauses.extend(filter_arguments.where_clauses)
+            params.update(filter_arguments.params)
+            extra_human_descriptions.extend(filter_arguments.human_descriptions)
+            extra_context_from_filters.update(filter_arguments.extra_context)
+
+    return (
+        filters,
+        where_clauses,
+        params,
+        extra_human_descriptions,
+        extra_context_from_filters,
+    )
+
+
+async def table_view_data(
+    datasette,
+    request,
+    resolved,
+    extra_extras=None,
+    context_for_html_hack=False,
+    default_labels=False,
+    _next=None,
+    renderer_extras=None,
+    rows_only=False,
+    stream=False,
+):
+    extra_extras = extra_extras or set()
+    # We have a table or view
+    db = resolved.db
+    database_name = resolved.db.name
+    table_name = resolved.table
+    is_view = resolved.is_view
+
+    # Can this user view it?
+    visible, private = await datasette.check_visibility(
+        request.actor,
+        action="view-table",
+        resource=TableResource(database=database_name, table=table_name),
+    )
+    if not visible:
+        raise Forbidden("You do not have permission to view this table")
+    # Record whether this response is private (visible to this actor only)
+    # so the outer table_view() can set appropriate Cache-Control headers,
+    # regardless of which output format ends up being rendered.
+    request._datasette_private_response = private
+
+    # Redirect based on request.args, if necessary
+    redirect_response = await _redirect_if_needed(datasette, request, resolved)
+    if redirect_response:
+        return redirect_response
+
+    if context_for_html_hack:
+        await precompute_database_action_permissions(
+            datasette, request.actor, database_name
+        )
+        if not is_view:
+            await precompute_table_action_permissions(
+                datasette, request.actor, database_name, table_name
+            )
+
+    # Introspect columns and primary keys for table
+    pks = await db.primary_keys(table_name)
+    table_columns = await db.table_columns(table_name)
+
+    # Take ?_col= and ?_nocol= into account
+    specified_columns = await _columns_to_select(table_columns, pks, request)
+    select_specified_columns = ", ".join(escape_sqlite(t) for t in specified_columns)
+    select_all_columns = ", ".join(escape_sqlite(t) for t in table_columns)
+
+    # rowid tables (no specified primary key) need a different SELECT
+    use_rowid = not pks and not is_view
+    order_by = ""
+    if use_rowid:
+        select_specified_columns = f"rowid, {select_specified_columns}"
+        select_all_columns = f"rowid, {select_all_columns}"
+        order_by = "rowid"
+        order_by_pks = "rowid"
+    else:
+        order_by_pks = ", ".join([escape_sqlite(pk) for pk in pks])
+        order_by = order_by_pks
+
+    if is_view:
+        order_by = ""
+
+    # TODO: This logic should turn into logic about which ?_extras get
+    # executed instead:
+    nocount = request.args.get("_nocount")
+    nofacet = request.args.get("_nofacet")
+    nosuggest = request.args.get("_nosuggest")
+    if request.args.get("_shape") in ("array", "object"):
+        nocount = True
+        nofacet = True
+
+    table_metadata = await datasette.table_config(database_name, table_name)
+
+    (
+        filters,
+        where_clauses,
+        params,
+        extra_human_descriptions,
+        extra_context_from_filters,
+    ) = await _table_filters(datasette, request, database_name, table_name)
+
+    # Deal with custom sort orders
+    sortable_columns = await _sortable_columns_for_table(
+        datasette, database_name, table_name, use_rowid
+    )
+
+    sort, sort_desc, order_by = await _sort_order(
+        table_metadata, sortable_columns, request, order_by
+    )
+
+    from_sql = "from {table_name} {where}".format(
+        table_name=escape_sqlite(table_name),
+        where=(
+            ("where {} ".format(" and ".join(where_clauses))) if where_clauses else ""
+        ),
+    )
+    # Copy of params so we can mutate them later:
+    from_sql_params = dict(**params)
+    # The filter where clause before any pagination clauses are added
+    filter_where_sql = " and ".join(where_clauses)
+
+    count_sql = f"select count(*) {from_sql}"
+
+    # Handle pagination driven by ?_next=
+    _next = _next or request.args.get("_next")
+
+    offset = ""
+    if _next:
+        if is_view:
+            # _next is an offset
+            offset = f" offset {int(_next)}"
+        else:
+            where_clauses.extend(
+                _next_where_clauses(_next, sort, sort_desc, pks, use_rowid, params)
+            )
+
+    # The first page needs this tie-breaker too: the ?_next= cursor assumes that
+    # rows with the same sort value come back in primary key order
+    if (sort or sort_desc) and not is_view:
+        order_by = f"{order_by}, {order_by_pks}"
+
+    where_clause = ""
+    if where_clauses:
+        where_clause = f"where {' and '.join(where_clauses)} "
+
+    if order_by:
+        order_by = f"order by {order_by}"
+
+    extra_args = {}
+    # Handle ?_size=500
+    # TODO: This was:
+    # page_size = _size or request.args.get("_size") or table_metadata.get("size")
+    page_size = request.args.get("_size")
+    if not page_size:
+        # Streaming every row is fastest using the largest possible pages
+        page_size = "max" if stream else table_metadata.get("size")
+    if page_size:
+        if page_size == "max":
+            page_size = datasette.max_returned_rows
+        try:
+            page_size = int(page_size)
+            if page_size < 0:
+                raise ValueError
+
+        except ValueError:
+            raise BadRequest("_size must be a positive integer")
+
+        if page_size > datasette.max_returned_rows:
+            raise BadRequest(f"_size must be <= {datasette.max_returned_rows}")
+
+        extra_args["page_size"] = page_size
+    else:
+        page_size = datasette.page_size
+
+    # Facets are calculated against SQL without order by or limit
+    sql_no_order_no_limit = f"select {select_all_columns} {from_sql}"
+
+    # This is the SQL that populates the main table on the page
+    sql = f"select {select_specified_columns} from {escape_sqlite(table_name)} {where_clause}{order_by} limit {page_size + 1}{offset}"
+
+    if request.args.get("_timelimit"):
+        extra_args["custom_time_limit"] = int(request.args.get("_timelimit"))
+
+    # Execute the main query!
+    try:
+        results = await db.execute(sql, params, truncate=True, **extra_args)
+    except (sqlite3.OperationalError, InvalidSql) as e:
+        raise DatasetteError(str(e), title="Invalid SQL", status=400)
+
+    columns = [r[0] for r in results.description]
+    rows = list(results.rows)
+
+    # Expand labeled columns if requested
+    expanded_columns = []
+    # List of (fk_dict, label_column-or-None) pairs for that table
+    expandable_columns = []
+    for fk in await db.foreign_keys_for_table(table_name):
+        label_column = await db.label_column_for_table(fk["other_table"])
+        expandable_columns.append((fk, label_column))
+
+    columns_to_expand = None
+    try:
+        all_labels = value_as_boolean(request.args.get("_labels", ""))
+    except ValueError:
+        all_labels = default_labels
+    # Check for explicit _label=
+    if "_label" in request.args:
+        columns_to_expand = request.args.getlist("_label")
+    if columns_to_expand is None and all_labels:
+        # expand all columns with foreign keys
+        columns_to_expand = [fk["column"] for fk, _ in expandable_columns]
+
+    if columns_to_expand:
+        expanded_labels = {}
+        for fk, _ in expandable_columns:
+            column = fk["column"]
+            if column not in columns_to_expand:
+                continue
+            if column not in columns:
+                continue
+            expanded_columns.append(column)
+            # Gather the values
+            column_index = columns.index(column)
+            values = [row[column_index] for row in rows]
+            # Expand them
+            expanded_labels.update(
+                await datasette.expand_foreign_keys(
+                    request.actor, database_name, table_name, column, values
+                )
+            )
+        if expanded_labels:
+            # Rewrite the rows
+            new_rows = []
+            for row in rows:
+                new_row = CustomRow(columns)
+                # CustomRow/sqlite3.Row iterate over values, so .keys() is required
+                for column in row.keys():  # noqa: SIM118
+                    value = row[column]
+                    if (column, value) in expanded_labels and value is not None:
+                        new_row[column] = {
+                            "value": value,
+                            "label": expanded_labels[(column, value)],
+                        }
+                    else:
+                        new_row[column] = value
+                new_rows.append(new_row)
+            rows = new_rows
+
+    # Pagination next link
+    next_value, next_url = await _next_value_and_url(
+        datasette,
+        db,
+        request,
+        table_name,
+        _next,
+        rows,
+        pks,
+        use_rowid,
+        sort,
+        sort_desc,
+        page_size,
+        is_view,
+    )
+    rows = rows[:page_size]
+
+    if rows_only:
+        # A later page of a streaming response: skip the extras
+        return (
+            {"next": next_value and str(next_value) or None},
+            rows,
+            columns,
+            expanded_columns,
+            sql,
+            next_url,
+        )
+
+    # Resolve extras
+    extras = extra_names_from_request(request)
+    if not extra_extras:
+        # Data formats reject unknown extras; the HTML path (which passes
+        # extra_extras={"_html"}) resolves internal extras of its own
+        table_extra_registry.validate_requested(extras, ExtraScope.TABLE)
+    if renderer_extras:
+        # Extras declared by the output renderer for this format. Any that
+        # are not available for tables are skipped when extras are resolved.
+        extras.update(renderer_extras)
+    if any(k for k in request.args if k == "_facet" or k.startswith("_facet_")):
+        extras.add("facet_results")
+    if request.args.get("_shape") == "object":
+        extras.add("primary_keys")
+    if "count" in extras:
+        extras.add("count_truncated")
+    if extra_extras:
+        extras.update(extra_extras)
+
+    # Faceting
+    if not datasette.setting("default_allow_facet") and any(
+        arg.startswith("_facet") for arg in request.args
+    ):
+        raise BadRequest("_facet= is not allowed")
+
+    for key, values in TABLE_EXTRA_BUNDLES.items():
+        if f"_{key}" in extras:
+            extras.update(values)
+        extras.discard(f"_{key}")
+
+    table_extra_context = TableExtraContext(
+        datasette=datasette,
+        request=request,
+        resolved=resolved,
+        db=db,
+        database_name=database_name,
+        table_name=table_name,
+        is_view=is_view,
+        private=private,
+        rows=rows,
+        columns=columns,
+        expanded_columns=expanded_columns,
+        results_description=results.description,
+        table_columns=table_columns,
+        pks=pks,
+        count_sql=count_sql,
+        from_sql=from_sql,
+        from_sql_params=from_sql_params,
+        nocount=nocount,
+        nofacet=nofacet,
+        nosuggest=nosuggest,
+        next_arg=request.args.get("_next"),
+        next_url=next_url,
+        sql=sql,
+        sql_no_order_no_limit=sql_no_order_no_limit,
+        params=params,
+        table_metadata=table_metadata,
+        filters=filters,
+        extra_human_descriptions=extra_human_descriptions,
+        sort=sort,
+        sort_desc=sort_desc,
+        sortable_columns=sortable_columns,
+        extras=extras,
+        extra_registry=table_extra_registry,
+        display_columns_and_rows=display_columns_and_rows,
+        run_sequential=run_sequential,
+    )
+
+    data = {
+        "ok": True,
+        "next": next_value and str(next_value) or None,
+        "next_url": next_url,
+    }
+    data.update(
+        await resolve_table_extras(
+            extras,
+            table_extra_context,
+            # The HTML view needs extras that are not JSON serializable
+            include_internal=bool(extra_extras),
+        )
+    )
+    if context_for_html_hack:
+        # Apply transform_value for columns with assigned types
+        data["rows"] = await apply_column_type_transforms(
+            datasette, database_name, table_name, rows[:page_size]
+        )
+    else:
+        # The JSON renderer applies those transforms itself
+        data["rows"] = [dict(row) for row in rows[:page_size]]
+
+    if context_for_html_hack:
+        data["count_truncated"] = count_is_truncated(
+            datasette, db, database_name, table_name, count_sql, data.get("count")
+        )
+        data.update(extra_context_from_filters)
+        # filter_columns combine the columns we know are available
+        # in the table with any additional columns (such as rowid)
+        # which are available in the query
+        data["filter_columns"] = list(columns) + [
+            table_column
+            for table_column in table_columns
+            if table_column not in columns
+        ]
+        filter_keys = {key for key, _ in filters.pairs}
+        data["clear_filters_url"] = (
+            datasette.urls.modify(request, remove=filter_keys | {"_next"})
+            if filter_keys
+            else None
+        )
+        url_labels_extra = {}
+        if data.get("expandable_columns"):
+            url_labels_extra = {"_labels": "on"}
+        url_csv_args = {**url_labels_extra, "_size": "max"}
+        url_csv = datasette.urls.modify(request, format="csv", add=url_csv_args)
+        url_csv_path = url_csv.split("?")[0]
+        data.update(
+            {
+                "filter_description_en": filters.human_description_en(
+                    extra=extra_human_descriptions
+                    + [
+                        extra_where["text"]
+                        for extra_where in extra_context_from_filters.get(
+                            "extra_wheres_for_ui", []
+                        )
+                    ]
+                ),
+                "sort_description_en": (
+                    "sorted by {}{}".format(
+                        sort or sort_desc, " descending" if sort_desc else ""
+                    )
+                    if (sort or sort_desc)
+                    else ""
+                ),
+                "url_csv": url_csv,
+                "url_csv_path": url_csv_path,
+                "url_tsv_path": tsv_export_path(datasette, request),
+                "url_csv_hidden_args": [
+                    (key, value)
+                    # Blank values matter: ?name= filters for name = ""
+                    for key, value in urllib.parse.parse_qsl(
+                        request.query_string, keep_blank_values=True
+                    )
+                    if key not in ("_labels", "_facet", "_size")
+                ]
+                + [("_size", "max")],
+            }
+        )
+        data["page_position"] = _page_position(
+            datasette, request, is_view, sort, sort_desc, pks, use_rowid
+        )
+        # if no sort specified AND table has a single primary key,
+        # set sort to that so arrow is displayed
+        if not sort and not sort_desc:
+            if 1 == len(pks):
+                sort = pks[0]
+            elif use_rowid:
+                sort = "rowid"
+        data["sort"] = sort
+        data["sort_desc"] = sort_desc
+        table_insert_ui = await _table_insert_ui(
+            datasette, request, db, database_name, table_name, is_view, pks
+        )
+        table_alter_ui = await _table_alter_ui(
+            datasette, request, db, database_name, table_name, is_view, pks
+        )
+        data["table_insert_ui"] = table_insert_ui
+        data["table_alter_ui"] = table_alter_ui
+        row_mutation_ui = False
+        if not is_view and db.is_mutable:
+            row_action_permissions = await datasette.allowed_many(
+                actions=["update-row", "delete-row"],
+                resource=TableResource(database=database_name, table=table_name),
+                actor=request.actor,
+            )
+            row_mutation_ui = any(row_action_permissions.values())
+        data["row_mutation_ui"] = row_mutation_ui
+        data["table_page_data"] = await _table_page_data(
+            datasette=datasette,
+            request=request,
+            db=db,
+            database_name=database_name,
+            table_name=table_name,
+            is_view=is_view,
+            table_insert_ui=table_insert_ui,
+            table_alter_ui=table_alter_ui,
+            execute_sql_ui=await _execute_sql_ui(
+                datasette,
+                request,
+                database_name,
+                filter_where=filter_where_sql,
+                filter_params=from_sql_params,
+                db=db,
+                table_name=table_name,
+                use_rowid=use_rowid,
+                filter_description=filters.human_description_en(
+                    extra=extra_human_descriptions
+                    + [
+                        extra_where["text"]
+                        for extra_where in extra_context_from_filters.get(
+                            "extra_wheres_for_ui", []
+                        )
+                    ]
+                ),
+            ),
+        )
+
+    return data, rows[:page_size], columns, expanded_columns, sql, next_url
+
+
+async def _next_value_and_url(
+    datasette,
+    db,
+    request,
+    table_name,
+    _next,
+    rows,
+    pks,
+    use_rowid,
+    sort,
+    sort_desc,
+    page_size,
+    is_view,
+):
+    next_value = None
+    next_url = None
+    if 0 < page_size < len(rows):
+        if is_view:
+            next_value = int(_next or 0) + page_size
+        else:
+            next_value = path_from_row_pks(rows[-2], pks, use_rowid)
+        # If there's a sort or sort_desc, add that value as a prefix
+        if (sort or sort_desc) and not is_view:
+            try:
+                prefix = rows[-2][sort or sort_desc]
+            except (IndexError, KeyError):
+                # sort/sort_desc column missing from SELECT - look up value by PK instead
+                # Tables with no primary key paginate on rowid
+                lookup_pks = pks or ["rowid"]
+                prefix_where_clause = " and ".join(
+                    f"{escape_sqlite(pk)} = :pk{i}" for i, pk in enumerate(lookup_pks)
+                )
+                prefix_lookup_sql = (
+                    f"select {escape_sqlite(sort or sort_desc)} "
+                    f"from {escape_sqlite(table_name)} where {prefix_where_clause}"
+                )
+                prefix = (
+                    await db.execute(
+                        prefix_lookup_sql,
+                        {**{f"pk{i}": rows[-2][pk] for i, pk in enumerate(lookup_pks)}},
+                    )
+                ).single_value()
+            if isinstance(prefix, dict) and "value" in prefix:
+                prefix = prefix["value"]
+            prefix = _encode_sort_value(prefix)
+            next_value = f"{prefix},{next_value}"
+            added_args = {"_next": next_value}
+            if sort:
+                added_args["_sort"] = sort
+            else:
+                added_args["_sort_desc"] = sort_desc
+        else:
+            added_args = {"_next": next_value}
+        next_url = datasette.absolute_url(
+            request,
+            datasette.urls.modify(request, replace=added_args),
+        )
+    return next_value, next_url

@@ -1,0 +1,235 @@
+.. _pages:
+
+=========================
+ Pages and API endpoints
+=========================
+
+The Datasette web application offers a number of different pages that can be accessed to explore the data in question, each of which is accompanied by an equivalent JSON API.
+
+.. _IndexView:
+
+Homepage
+========
+
+The root page of any Datasette installation is a homepage that helps people see at a glance what the instance contains, and jump to the data they want. For an example, see `latest.datasette.io <https://latest.datasette.io/>`_.
+
+The homepage shows:
+
+- A search box, which is focused when the page loads. It searches table and view names, column names, table descriptions from :ref:`metadata <metadata>`, and the names, titles, descriptions and SQL of stored queries. Results update as you type; use the up and down arrow keys to highlight a result and Enter to open it. Pressing ``/`` in the empty search box opens the "Jump to" menu (see :ref:`JumpView`), as it does on every other page.
+- Any sections added by plugins using the :ref:`makeHomepageSections() <javascript_plugins_makeHomepageSections>` JavaScript plugin hook.
+- **Recently visited** tables, views, queries and databases. These are recorded in the browser's ``localStorage`` as you visit those pages, separately for each signed-in actor, and are never sent to the server. The same history provides the "Recent" list in the Jump to menu.
+- When more than one database is attached, a row of database buttons for filtering the list to a single database.
+- **Queries**: stored queries defined in configuration or by plugins, followed by your own saved queries, up to five in total, with a link to the full list at ``/-/queries``. Other people's saved queries appear only in search results.
+- **Tables and views** from every database in a single list, 30 to a page, with the most connected tables (linked to the most other tables by foreign keys) first. Each shows its row count, how many tables it links to, description, first few columns, and whether it has full-text search. :ref:`Hidden tables <DatabaseView_hidden>` are not included.
+
+While searching, everything except the results is hidden. Matching tables and views come first, followed by matching queries and then anything else plugins have added to the Jump to menu using the :ref:`plugin_hook_jump_items_sql` plugin hook, such as apps.
+
+The homepage accepts these query string parameters:
+
+``?q=``
+    Search for tables, views, columns and queries.
+``?database=``
+    Only show tables, views and queries from the named database.
+``?page=``
+    The page of tables and views to show, starting at 1.
+``?_fragment=results``
+    Return only the HTML for the summary line and search results, without the rest of the page. The search box uses this to update results as you type.
+
+Results only include tables, views and queries that the current actor has permission to see.
+
+Add ``/.json`` to the end of the URL for the JSON version of the same catalog, which accepts the same ``?q=``, ``?database=`` and ``?page=`` parameters:
+
+* `latest.datasette.io/.json <https://latest.datasette.io/.json>`_
+* `latest.datasette.io/.json?q=facet <https://latest.datasette.io/.json?q=facet>`_
+
+The JSON has these keys:
+
+``databases``, ``items``, ``queries``, ``q``, ``database_filter``, ``metadata``, ``private``
+    The same values as the variables of those names in the :ref:`index page template context <template_context>`, except that ``columns`` for each of the ``items`` is the complete list of column names with no ``more_columns`` key, and there are no ``color`` keys.
+``total``
+    The number of tables and views matching the search and database filter, across all pages.
+``queries_total``
+    The number of stored queries matching the search and database filter, which can be more than the number listed in ``queries``.
+``totals``
+    An object with ``databases``, ``tables`` and ``views`` counts. The table and view counts are those matching the search across every database, ignoring the database filter.
+``next_url``, ``previous_url``
+    Absolute URLs to the next and previous page of JSON, or ``null``. To fetch every table and view follow ``next_url`` until it is ``null``.
+
+This JSON is :ref:`not yet part of the stable API <json_api_stability>` and includes the ``"unstable"`` marker key.
+
+The index page can also be accessed at ``/-/``, useful for if the default index page has been replaced using an :ref:`index.html custom template <customization_custom_templates>`. The ``/-/`` page will always render the default Datasette ``index.html`` template.
+
+.. _DatabaseView:
+
+Database
+========
+
+Each database has a page listing the tables, views and stored queries available for that database. If the :ref:`actions_execute_sql` permission is enabled (it's on by default) there will also be an interface for executing arbitrary SQL select queries against the data.
+
+Examples:
+
+* `latest.datasette.io/fixtures <https://latest.datasette.io/fixtures>`_
+* `datasette.io/global-power-plants <https://datasette.io/global-power-plants>`_
+
+The JSON version of this page provides programmatic access to the underlying data:
+
+* `latest.datasette.io/fixtures.json <https://latest.datasette.io/fixtures.json>`_
+* `datasette.io/global-power-plants.json <https://datasette.io/global-power-plants.json>`_
+
+The returned object includes an ``"ok": true`` key alongside keys such as ``"database"``, ``"tables"``, ``"views"``, ``"queries"`` and ``"metadata"``.
+
+.. _DatabaseView_hidden:
+
+Hidden tables
+-------------
+
+Some tables listed on the database page are treated as hidden. Hidden tables are not completely invisible - they can be accessed through the "hidden tables" link at the bottom of the page. They are hidden because they represent low-level implementation details which are generally not useful to end-users of Datasette.
+
+The following tables are hidden by default:
+
+- Any table with a name that starts with an underscore - this is a Datasette convention to help plugins easily hide their own internal tables.
+- Tables that have been configured as ``"hidden": true`` using :ref:`table_configuration_hidden`.
+- ``*_fts`` tables that implement SQLite full-text search indexes.
+- Tables relating to the inner workings of the SpatiaLite SQLite extension.
+- ``sqlite_stat`` tables used to store statistics used by the query optimizer.
+
+.. _QueryView:
+
+Queries
+=======
+
+.. _pages_custom_sql_queries:
+
+Custom SQL queries
+------------------
+
+The ``/database-name/-/query`` page can be used to execute an arbitrary SQL query against that database, if the :ref:`actions_execute_sql` permission is enabled. This query is passed as the ``?sql=`` query string parameter.
+
+This means you can link directly to a query by constructing the following URL:
+
+``/database-name/-/query?sql=SELECT+*+FROM+table_name``
+
+Each configured :ref:`stored query <stored_queries>` has its own page, at ``/database-name/query-name``. Viewing this page will execute the query and display the results.
+
+In both cases adding a ``.json`` extension to the URL will return the results as JSON.
+
+.. _pages_execute_write:
+
+Write SQL queries
+-----------------
+
+The ``/database-name/-/execute-write`` page can be used to execute SQL statements that write to a mutable database, if the :ref:`actions_execute_write_sql` permission is enabled.
+
+This page extracts named parameters from the SQL, shows the tables that will be affected and lists the permissions required before the query can be executed. It also includes templates for common ``INSERT``, ``UPDATE`` and ``DELETE`` statements.
+
+Datasette checks additional permissions based on the operations in the SQL. Row changes require the relevant table-level permissions such as :ref:`actions_insert_row`, :ref:`actions_update_row` and :ref:`actions_delete_row`; reads from source tables require :ref:`actions_view_table`; and schema changes require permissions such as :ref:`actions_create_table`, :ref:`actions_alter_table` or :ref:`actions_drop_table`.
+
+Use the :ref:`ExecuteWriteView` JSON API to execute writable SQL programmatically.
+
+.. _pages_stored_query_browser:
+
+Stored query browsers
+---------------------
+
+The ``/-/queries`` page lists stored queries across every database visible to the current actor. The ``/database-name/-/queries`` page lists stored queries for a single database. The JSON versions accept ``?_size=`` (default 50, ``max`` for the :ref:`setting_max_returned_rows` limit) and a ``?_next=`` pagination token.
+
+These pages support search, pagination and filters for read-only or writable queries and private or public queries. Adding a ``.json`` extension to either URL returns the same list as JSON.
+
+They share the look of the :ref:`homepage <IndexView>`: the search box updates the list as you type, with the up and down arrow keys and Enter to pick a query, and a row of database buttons shows how many matching queries each database has. Each query shows its title, its database, a description or the start of its SQL, its inputs and its owner, tagged if it is yours, writes to the database, is private, or is a trusted query that is not from configuration.
+
+Add ``?_fragment=results`` to get just the summary line and the list as an HTML fragment, as used by the live search.
+
+.. _TableView:
+
+Table
+=====
+
+The table page is the heart of Datasette: it allows users to interactively explore the contents of a database table, including sorting, filtering, :ref:`full_text_search` and applying :ref:`facets`.
+
+The HTML interface is worth spending some time exploring. As with other pages, you can return the JSON data by appending ``.json`` to the URL path, before any `?` query string arguments.
+
+The query string arguments are described in more detail here: :ref:`table_arguments`
+
+You can also use the table page to interactively construct a SQL query - by applying different filters and a sort order for example - and then click the "View and edit SQL" button to see the SQL query that was used for the page and edit and re-submit it.
+
+Some examples:
+
+* `../content/repos <https://datasette.io/content/repos>`_ lists the repositories that make up the Datasette ecosystem. It demonstrates Datasette's support for :ref:`full_text_search`.
+* `../fixtures/facetable <https://latest.datasette.io/fixtures/facetable>`_ is a small table from Datasette's test fixtures, useful for trying out sorting, filtering and :ref:`facets`.
+* `../global-power-plants?country_long=United+Kingdom <https://datasette.io/global-power-plants/global-power-plants?country_long=United+Kingdom>`_ is a filtered table page showing every power plant in the United Kingdom. It includes some default facets (configured using `its configuration <https://datasette.io/-/config>`_) and uses the `datasette-cluster-map <https://github.com/simonw/datasette-cluster-map>`_ plugin to show a map of the results.
+
+.. _TableFragmentView:
+
+Table fragment
+--------------
+
+The ``/<database>/<table>/-/fragment`` endpoint returns the rendered table HTML
+for rows matching the provided filters. It is used by Datasette's row editing
+interface to refresh rows after changes while still respecting custom table
+templates and ``render_cell`` plugin hooks.
+
+.. _RowView:
+
+Row
+===
+
+Every row in every Datasette table has its own URL. This means individual records can be linked to directly.
+
+Table cells with extremely long text contents are truncated on the table view according to the :ref:`setting_truncate_cells_html` setting. If a cell has been truncated the full length version of that cell will be available on the row page.
+
+Rows which are the targets of foreign key references from other tables will show a link to a filtered search for all records that reference that row. Here's an example from the fixtures database:
+
+`../fixtures/facet_cities/1 <https://latest.datasette.io/fixtures/facet_cities/1>`_
+
+Note that this URL includes the encoded primary key of the record.
+
+The "Export data" button on a row page offers that row as TSV, CSV or JSON, to view, download or copy - see :ref:`csv_export`.
+
+Here's that same page as JSON:
+
+`../fixtures/facet_cities/1.json <https://latest.datasette.io/fixtures/facet_cities/1.json>`_
+
+
+.. _pages_schemas:
+
+Schemas
+=======
+
+Datasette offers ``/-/schema`` endpoints to expose the SQL schema for databases and tables.
+
+.. _InstanceSchemaView:
+
+Instance schema
+---------------
+
+Access ``/-/schema`` to see the complete schema for all attached databases in the Datasette instance.
+
+Use ``/-/schema.md`` to get the same information as Markdown.
+
+Use ``/-/schema.json`` to get the same information as JSON, which looks like this:
+
+.. code-block:: json
+
+    {
+      "ok": true,
+      "schemas": [
+        {
+          "database": "content",
+          "schema": "create table posts ..."
+        }
+      ]
+    }
+
+.. _DatabaseSchemaView:
+
+Database schema
+---------------
+
+Use ``/database-name/-/schema`` to see the complete schema for a specific database. The ``.md`` and ``.json`` extensions work here too. The JSON returns an object with ``"ok"``, ``"database"`` and ``"schema"`` keys.
+
+.. _TableSchemaView:
+
+Table schema
+------------
+
+Use ``/database-name/table-name/-/schema`` to see the schema for a specific table. The ``.md`` and ``.json`` extensions work here too. The JSON returns an object with ``"ok"``, ``"database"``, ``"table"``, and ``"schema"`` keys.

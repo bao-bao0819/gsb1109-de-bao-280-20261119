@@ -1,0 +1,104 @@
+import pytest
+import pytest_asyncio
+
+from .fixtures import make_ds
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def trace_ds():
+    ds = await make_ds(settings={"trace_debug": True})
+    yield ds
+    ds.close()
+
+
+@pytest.mark.parametrize("trace_debug", (True, False))
+async def test_trace(trace_debug):
+    ds = await make_ds(settings={"trace_debug": trace_debug})
+    response = await ds.client.get("/fixtures/simple_primary_key.json?_trace=1")
+    assert response.status_code == 200
+
+    data = response.json()
+    if not trace_debug:
+        assert "_trace" not in data
+        return
+
+    assert "_trace" in data
+    trace_info = data["_trace"]
+    assert isinstance(trace_info["request_duration_ms"], float)
+    assert isinstance(trace_info["sum_trace_duration_ms"], float)
+    assert isinstance(trace_info["num_traces"], int)
+    assert isinstance(trace_info["traces"], list)
+    traces = trace_info["traces"]
+    assert len(traces) == trace_info["num_traces"]
+    for trace in traces:
+        assert isinstance(trace["type"], str)
+        assert isinstance(trace["start"], float)
+        assert isinstance(trace["end"], float)
+        assert trace["duration_ms"] == (trace["end"] - trace["start"]) * 1000
+        assert isinstance(trace["traceback"], list)
+        assert isinstance(trace["database"], str)
+        assert isinstance(trace["sql"], str)
+        assert isinstance(trace.get("params"), (list, dict, None.__class__))
+
+    sqls = [trace["sql"] for trace in traces if "sql" in trace]
+    # There should be SQL statements from request handling in the trace.
+    # Note: CREATE TABLE, INSERT OR REPLACE, executescript, and executemany
+    # are not expected here because internal tables are now created and
+    # populated during invoke_startup(), before the request is traced.
+    assert any(sql.startswith("select ") for sql in sqls), "No select statements traced"
+
+
+async def test_trace_silently_fails_for_large_page(trace_ds):
+    # Max HTML size is 256KB
+    # Small response should have trace
+    small_response = await trace_ds.client.get(
+        "/fixtures/simple_primary_key.json?_trace=1"
+    )
+    assert small_response.status_code == 200
+    assert "_trace" in small_response.json()
+
+    # Big response should not
+    big_response = await trace_ds.client.get(
+        "/fixtures/-/query.json",
+        params={"_trace": 1, "sql": "select zeroblob(1024 * 256)"},
+    )
+    assert big_response.status_code == 200
+    assert "_trace" not in big_response.json()
+
+
+async def test_trace_query_errors(trace_ds):
+    response = await trace_ds.client.get(
+        "/fixtures/-/query.json",
+        params={"_trace": 1, "sql": "select * from non_existent_table"},
+    )
+    assert response.status_code == 400
+
+    data = response.json()
+    assert "_trace" in data
+    trace_info = data["_trace"]
+    assert trace_info["traces"][-1]["error"] == "no such table: non_existent_table"
+
+
+async def test_trace_child_tasks_resets_contextvar_on_exception():
+    from datasette import tracer
+
+    before = tracer.trace_task_id.get()
+    with pytest.raises(ValueError), tracer.trace_child_tasks():
+        assert tracer.trace_task_id.get() is not None
+        raise ValueError("simulated error")
+    # The contextvar must be reset even though the block raised
+    assert tracer.trace_task_id.get() == before
+
+
+async def test_trace_parallel_queries(trace_ds):
+    response = await trace_ds.client.get("/parallel-queries?_trace=1")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["one"] == 1
+    assert data["two"] == 2
+    trace_info = data["_trace"]
+    traces = [trace for trace in trace_info["traces"] if "sql" in trace]
+    one, two = traces
+    # "two" should have started before "one" ended
+    assert two["start"] < one["end"]

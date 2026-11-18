@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}{{ metadata.title or "Datasette" }}: {% for database in databases %}{{ database.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% endblock %}
+
+{% block extra_head %}
+{% if noindex %}<meta name="robots" content="noindex">{% endif %}
+{% endblock %}
+
+{% block body_class %}index{% endblock %}
+
+{% block content %}
+{% set multiple_databases = databases|length > 1 %}
+<div class="homepage{% if q %} homepage-searching{% endif %}" data-homepage>
+<header class="homepage-header">
+    <h1>{{ metadata.title or "Datasette" }}{% if private %} 🔒{% endif %}</h1>
+    {% set action_links, action_title = homepage_actions, "Homepage actions" %}
+    {% include "_action_menu.html" %}
+</header>
+
+{{ top_homepage() }}
+
+{% block description_source_license %}{% include "_description_source_license.html" %}{% endblock %}
+
+{% include "_homepage_summary.html" %}
+
+<form class="homepage-search" action="{{ urls.instance() }}" method="get" role="search" data-homepage-search>
+    <label for="homepage-search-input" class="visually-hidden">Search tables, views, queries and columns</label>
+    <svg class="homepage-search-icon" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+    <input id="homepage-search-input" type="search" name="q" value="{{ q }}" placeholder="Search tables, views, queries and columns" autocomplete="off">
+    {% if database_filter %}<input type="hidden" name="database" value="{{ database_filter }}">{% endif %}
+    <button type="submit" class="homepage-search-button">Search</button>
+</form>
+
+<div class="homepage-sections" data-homepage-sections></div>
+
+<section class="homepage-recent" aria-labelledby="homepage-recent-heading" data-homepage-recent hidden>
+    <div class="homepage-recent-header">
+        <h2 id="homepage-recent-heading">Recently visited</h2>
+        <button type="button" class="button-as-link homepage-recent-clear" data-homepage-recent-clear>Clear</button>
+    </div>
+    <ul class="recent-list" data-homepage-recent-list></ul>
+</section>
+
+<div class="homepage-results" data-homepage-results aria-live="polite">
+{% include "_homepage_results.html" %}
+</div>
+</div>
+
+<script src="{{ static('homepage.js') }}" defer></script>
+<script src="{{ static('catalog-cards.js') }}" defer></script>
+{% endblock %}

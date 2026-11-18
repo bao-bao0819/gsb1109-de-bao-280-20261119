@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% import "_catalog_cards.html" as catalog_cards with context %}
+
+{% block title %}{{ database }}{% endblock %}
+
+{% block extra_head %}
+{{- super() -}}
+{% include "_codemirror.html" %}
+{% include "_sql_parameter_styles.html" %}
+{% if database_page_data.createTable %}
+<script>window._datasetteDatabaseData = {{ database_page_data|tojson }};</script>
+<script src="{{ static('edit-tools-loader.js') }}" data-edit-tools-src="{{ static('edit-tools.js') }}" defer></script>
+{% endif %}
+{% endblock %}
+
+{% block body_class %}db db-{{ database|to_css_class }}{% endblock %}
+
+{% block crumbs %}
+{{ crumbs.nav(request=request, database=database) }}
+{% endblock %}
+
+{% block recent_item %}{% with recent_type="database", recent_name=database, recent_title=metadata.title, recent_url=urls.database(database) %}{% include "_recent_item.html" %}{% endwith %}{% endblock %}
+
+{% block content %}
+{% set shown_tables = (tables if show_hidden else tables|rejectattr("hidden"))|list %}
+<div class="homepage database-page">
+<div class="page-header" style="border-color: #{{ database_color }}">
+    <h1>{{ metadata.title or database }}{% if private %} 🔒{% endif %}</h1>
+</div>
+{% set action_links, action_title = database_actions(), "Database actions" %}
+{% include "_action_menu.html" %}
+
+{{ top_database() }}
+
+{% block description_source_license %}{% include "_description_source_license.html" %}{% endblock %}
+
+<p class="homepage-summary">
+    <span>{{ "{:,}".format(shown_tables|length) }} table{% if shown_tables|length != 1 %}s{% endif %}</span>
+    {%- if views %}<span>{{ "{:,}".format(views|length) }} view{% if views|length != 1 %}s{% endif %}</span>{% endif -%}
+    {%- if queries %}<span>{{ "{:,}".format(queries_count) }} quer{% if queries_count != 1 %}ies{% else %}y{% endif %}</span>{% endif -%}
+    {%- if size %}<span>{{ size|filesizeformat }}</span>{% endif -%}
+</p>
+
+{% if allow_execute_sql %}
+    <form class="sql core" action="{{ urls.database(database) }}/-/query" method="get" data-parameters-url="{{ urls.database(database) }}/-/query/parameters">
+        <h3>Custom SQL query</h3>
+        <p class="sql-editor"><textarea id="sql-editor" name="sql">{% if tables %}select * from {{ tables[0].name|escape_sqlite }}{% else %}select sqlite_version(){% endif %}</textarea></p>
+        {% set parameter_names = [] %}
+        {% set parameter_values = {} %}
+        {% set sql_parameters_allow_expand = false %}
+        {% include "_sql_parameters.html" %}
+        <p>
+            <button id="sql-format" type="button" hidden>Format SQL</button>
+            <input type="submit" value="Run SQL">
+        </p>
+    </form>
+{% endif %}
+
+{% if attached_databases %}
+    <div class="message-info">
+        <p>The following databases are attached to this connection, and can be used for cross-database joins:</p>
+        <ul class="bullets">
+            {% for db_name in attached_databases %}
+                <li><strong>{{ db_name }}</strong> - <a href="{{ urls.database(db_name) }}/-/query?sql=select+*+from+[{{ db_name }}].sqlite_master+where+type='table'">tables</a></li>
+            {% endfor %}
+        </ul>
+    </div>
+{% endif %}
+
+{% if queries %}
+<section class="homepage-queries" aria-labelledby="queries">
+    <div class="homepage-section-header">
+        <h2 id="queries">Queries</h2>
+        <a class="homepage-section-link" href="{{ urls.database(database) }}/-/queries">{{ "{:,}".format(queries_count) }} quer{% if queries_count != 1 %}ies{% else %}y{% endif %} →</a>
+    </div>
+    <ul class="query-list">
+        {% for query in queries %}
+        <li class="query-row">
+            <a class="query-row-name" href="{{ urls.query(database, query.name) }}{% if query.fragment %}#{{ query.fragment }}{% endif %}">{{ query.title or query.name }}</a>
+            {%- if query.private %} 🔒{% endif %}
+            {% if query.is_write %}<span class="type-tag type-tag-write">writes</span>{% endif %}
+            <span class="query-row-detail">
+                {%- if query.description %}{{ query.description }}{% elif query.sql and not query.hide_sql %}<code>{{ query.sql|truncate(120) }}</code>{% endif -%}
+            </span>
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+
+{% if shown_tables or views %}
+<section class="homepage-tables" aria-labelledby="tables">
+    <div class="homepage-section-header">
+        <h2 id="tables">Tables{% if views %} and views{% endif %}</h2>
+        <a class="homepage-section-link" href="{{ urls.database(database) }}/-/schema">Schema →</a>
+    </div>
+    {% set shown_names = shown_tables|map(attribute="name")|list %}
+    {% call catalog_cards.list() %}
+    {% for table in shown_tables %}
+        {% set linked_tables = (table.foreign_keys.incoming + table.foreign_keys.outgoing)|map(attribute="other_table")|select("in", shown_names)|reject("equalto", table.name)|unique|sort %}
+        {% if table.count is none %}{% set count_text = "Many" %}
+        {% elif table.count_truncated %}{% set count_text = ">" ~ "{:,}".format(table.count - 1) %}
+        {% else %}{% set count_text = "{:,}".format(table.count) %}{% endif %}
+        {{- catalog_cards.card({
+            "url": urls.table(database, table.name),
+            "name": table.name,
+            "database": database,
+            "type": "table",
+            "private": table.private,
+            "hidden": table.hidden,
+            "count": table.count,
+            "columns": table.columns[:8],
+            "more_columns": table.columns[8:],
+            "column_count": table.columns|length,
+            "has_fts": table.fts_table,
+            "linked_tables": linked_tables,
+        }, count_text=count_text) }}
+    {% endfor %}
+    {% for view in views %}
+        {{- catalog_cards.card({
+            "url": urls.table(database, view.name),
+            "name": view.name,
+            "type": "view",
+            "private": view.private,
+        }) }}
+    {% endfor %}
+    {% endcall %}
+</section>
+{% endif %}
+
+{% if hidden_count and not show_hidden %}
+    <p class="homepage-more">… and <a href="{{ urls.database(database) }}?_show_hidden=1">{{ "{:,}".format(hidden_count) }} hidden table{% if hidden_count == 1 %}{% else %}s{% endif %}</a></p>
+{% endif %}
+
+{% if allow_download %}
+    <p class="download-sqlite">
+        <a class="quiet-button" href="{{ urls.database(database) }}.db" rel="nofollow" title="Download {{ database }}.db">
+            <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 15V3"></path>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <path d="m7 10 5 5 5-5"></path>
+            </svg>
+            <span>Download SQLite database</span>
+            <span class="download-sqlite-size">{{ size|filesizeformat }}</span>
+        </a>
+    </p>
+{% endif %}
+
+</div>
+
+<script src="{{ static('catalog-cards.js') }}" defer></script>
+{% include "_codemirror_foot.html" %}
+{% include "_sql_parameter_scripts.html" %}
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+  window.datasetteSqlParameters.setupSqlParameterRefresh({});
+});
+</script>
+
+{% endblock %}

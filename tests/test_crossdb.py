@@ -1,0 +1,79 @@
+import sqlite3
+import urllib
+
+from click.testing import CliRunner
+
+from datasette.cli import cli
+
+
+async def test_crossdb_join(ds_on_disk_two_databases_crossdb):
+    # --crossdb attaches database files, so this uses the on-disk fixture
+    client = ds_on_disk_two_databases_crossdb.client
+    sql = """
+    select
+      'extra database' as db,
+      pk,
+      text1,
+      text2
+    from
+      [extra database].searchable
+    union all
+    select
+      'fixtures' as db,
+      pk,
+      text1,
+      text2
+    from
+      fixtures.searchable
+    """
+    response = await client.get(
+        "/_memory/-/query.json?"
+        + urllib.parse.urlencode({"sql": sql, "_shape": "array"})
+    )
+    assert response.status_code == 200
+    assert response.json() == [
+        {"db": "extra database", "pk": 1, "text1": "barry cat", "text2": "terry dog"},
+        {"db": "extra database", "pk": 2, "text1": "terry dog", "text2": "sara weasel"},
+        {"db": "fixtures", "pk": 1, "text1": "barry cat", "text2": "terry dog"},
+        {"db": "fixtures", "pk": 2, "text1": "terry dog", "text2": "sara weasel"},
+    ]
+
+
+def test_crossdb_warning_if_too_many_databases(tmp_path_factory):
+    db_dir = tmp_path_factory.mktemp("dbs")
+    dbs = []
+    for i in range(11):
+        path = str(db_dir / f"db_{i}.db")
+        conn = sqlite3.connect(path)
+        conn.execute("vacuum")
+        conn.close()
+        dbs.append(path)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--crossdb",
+            "--get",
+            "/",
+        ]
+        + dbs,
+        catch_exceptions=False,
+    )
+    assert (
+        "Warning: --crossdb only works with the first 10 attached databases"
+        in result.stderr
+    )
+
+
+async def test_crossdb_attached_database_list_display(
+    ds_on_disk_two_databases_crossdb,
+):
+    client = ds_on_disk_two_databases_crossdb.client
+    response = await client.get("/_memory")
+    for fragment in (
+        "databases are attached to this connection",
+        "<li><strong>fixtures</strong> - ",
+        '<li><strong>extra database</strong> - <a href="/extra+database/-/query?sql=',
+    ):
+        assert fragment in response.text

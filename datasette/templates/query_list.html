@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}{% if database %}{{ database }}: {% endif %}queries{% endblock %}
+
+{% block body_class %}query-list{% if database %} db-{{ database|to_css_class }}{% endif %}{% endblock %}
+
+{% block crumbs %}
+{{ crumbs.nav(request=request, database=database) }}
+{% endblock %}
+
+{% block content %}
+<div class="homepage query-list-page{% if filters.q %} homepage-searching{% endif %}" data-homepage data-browse-when-empty>
+<header class="homepage-header">
+    <h1>Queries{% if database %} <span class="db-tag query-list-heading-db" style="--db-color: #{{ database_color }}">{{ database }}</span>{% endif %}</h1>
+</header>
+
+{% include "_query_list_summary.html" %}
+
+<form class="homepage-search core" action="{{ query_list_path }}" method="get" role="search" data-homepage-search>
+    <svg class="homepage-search-icon" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+    <label for="query-search" class="visually-hidden">Search queries</label>
+    <input id="query-search" type="search" name="q" value="{{ filters.q }}" placeholder="Search query titles, descriptions and SQL" autocomplete="off">
+    {% if filters.is_write %}<input type="hidden" name="is_write" value="{{ filters.is_write }}">{% endif %}
+    {% if filters.is_private %}<input type="hidden" name="is_private" value="{{ filters.is_private }}">{% endif %}
+    {% if filters.source %}<input type="hidden" name="source" value="{{ filters.source }}">{% endif %}
+    {% if filters.owner_id %}<input type="hidden" name="owner_id" value="{{ filters.owner_id }}">{% endif %}
+    <button type="submit" class="homepage-search-button">Search</button>
+</form>
+
+<div data-homepage-results>
+{% include "_query_list_results.html" %}
+</div>
+</div>
+<script src="{{ static('homepage.js') }}" defer></script>
+{% endblock %}

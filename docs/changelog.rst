@@ -22,6 +22,7 @@ Enhancements
 - Allow ``Resource`` subclasses to be subscripted, e.g. ``ModelResource[MyModel]`` (`2069 <https://github.com/django-import-export/django-import-export/issues/2069>`_)
 - ``ForeignKeyWidget``, ``CachedForeignKeyWidget`` and ``ManyToManyWidget`` now accept the related model as an ``"app_label.ModelName"`` string, resolved via the app registry (`2202 <https://github.com/django-import-export/django-import-export/issues/2202>`_)
 - Refactor bulk updates to use attribute not field (`2145 <https://github.com/django-import-export/django-import-export/issues/2145>`_)
+- Extracted row-level error recording from :meth:`~import_export.resources.Resource.import_row` into the overridable hooks :meth:`~import_export.resources.Resource.handle_row_validation_error` and :meth:`~import_export.resources.Resource.handle_row_error`, and per-field conversion error collection from :meth:`~import_export.resources.Resource.import_instance` into :meth:`~import_export.resources.Resource.add_field_error`
 
 Fixes
 #####

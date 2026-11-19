@@ -467,6 +467,9 @@ following hooks to customize error handling:
 * :meth:`~import_export.resources.Resource.get_result_class`
 * :meth:`~import_export.resources.Resource.get_row_result_class`
 * :meth:`~import_export.resources.Resource.get_error_result_class`
+* :meth:`~import_export.resources.Resource.add_field_error`
+* :meth:`~import_export.resources.Resource.handle_row_validation_error`
+* :meth:`~import_export.resources.Resource.handle_row_error`
 
 .. _import_model_relations:
 

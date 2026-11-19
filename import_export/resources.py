@@ -534,6 +534,10 @@ class Resource(metaclass=DeclarativeMetaclass):
         one of more fields, those errors are captured and reraised as a single,
         multi-field ValidationError.
 
+        Every field is attempted, so that a row which contains more than one
+        unconvertible value reports each of them (keyed by field attribute)
+        rather than only the first.
+
         :param instance: A new or existing model instance.
 
         :param row: A ``dict`` containing key / value data for the row to be imported.
@@ -548,9 +552,35 @@ class Resource(metaclass=DeclarativeMetaclass):
             try:
                 self.import_field(field, instance, row, **kwargs)
             except ValueError as e:
-                errors[field.attribute] = ValidationError(force_str(e), code="invalid")
+                self.add_field_error(errors, field, e)
         if errors:
             raise ValidationError(errors)
+
+    def add_field_error(self, errors, field, error):
+        """
+        Records a type conversion failure for a single field in the ``errors``
+        dict being built by :meth:`import_instance`, keyed by the field's
+        attribute so that callers can associate the message with the named
+        field.
+
+        If another import field maps to the same attribute and has already
+        recorded an error, the messages are combined so that neither error
+        is lost.
+
+        :param errors: The dict of attribute name to ``ValidationError``
+          being built by :meth:`import_instance`.
+
+        :param field: The :class:`import_export.fields.Field` which failed.
+
+        :param error: The ``ValueError`` raised during conversion.
+        """
+        validation_error = ValidationError(force_str(error), code="invalid")
+        if field.attribute in errors:
+            existing = errors[field.attribute]
+            validation_error = ValidationError(
+                existing.messages + validation_error.messages
+            )
+        errors[field.attribute] = validation_error
 
     def save_m2m(self, instance, row, **kwargs):
         r"""
@@ -825,19 +855,49 @@ class Resource(metaclass=DeclarativeMetaclass):
             self.after_import_row(row, row_result, **kwargs)
 
         except ValidationError as e:
-            row_result.import_type = RowResult.IMPORT_TYPE_INVALID
-            row_result.validation_error = e
+            self.handle_row_validation_error(row_result, e)
         except Exception as e:
-            row_result.import_type = RowResult.IMPORT_TYPE_ERROR
-            # There is no point logging a transaction error for each row
-            # when only the original error is likely to be relevant
-            if not isinstance(e, TransactionManagementError):
-                logger.debug(e, exc_info=True)
-            row_result.errors.append(
-                self.get_error_result_class()(e, row=row, number=kwargs["row_number"])
-            )
+            self.handle_row_error(row_result, e, row, kwargs["row_number"])
 
         return row_result
+
+    def handle_row_validation_error(self, row_result, error):
+        """
+        Records a ``ValidationError`` raised during the import of a single row
+        on the row result.  This covers both type conversion failures and
+        cross-field / model validation failures, which
+        :meth:`validate_instance` combines into a single multi-field
+        ``ValidationError`` so that no individual message is lost.
+
+        :param row_result: A :class:`~import_export.results.RowResult` instance.
+
+        :param error: The ``ValidationError`` raised during the row import.
+        """
+        row_result.import_type = RowResult.IMPORT_TYPE_INVALID
+        row_result.validation_error = error
+
+    def handle_row_error(self, row_result, error, row, row_number):
+        """
+        Records an unexpected (non-validation) error raised during the import
+        of a single row on the row result.
+
+        :param row_result: A :class:`~import_export.results.RowResult` instance.
+
+        :param error: The exception raised during the row import.
+
+        :param row: A ``dict`` containing key / value data for the row being
+          imported.
+
+        :param row_number: The index of the row being imported.
+        """
+        row_result.import_type = RowResult.IMPORT_TYPE_ERROR
+        # There is no point logging a transaction error for each row
+        # when only the original error is likely to be relevant
+        if not isinstance(error, TransactionManagementError):
+            logger.debug(error, exc_info=True)
+        row_result.errors.append(
+            self.get_error_result_class()(error, row=row, number=row_number)
+        )
 
     def import_data(
         self,

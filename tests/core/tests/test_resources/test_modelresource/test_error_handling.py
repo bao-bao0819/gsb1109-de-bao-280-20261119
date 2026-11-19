@@ -11,7 +11,7 @@ from core.tests.resources import (
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.test import TestCase
 
-from import_export import exceptions, resources, results
+from import_export import exceptions, fields, resources, results, widgets
 
 
 class ErrorHandlingTest(TestCase):
@@ -71,6 +71,83 @@ class ErrorHandlingTest(TestCase):
         self.assertTrue(result.has_validation_errors())
         self.assertIs(result.rows[0].import_type, results.RowResult.IMPORT_TYPE_INVALID)
         self.assertIn("birthday", result.invalid_rows[0].field_specific_errors)
+
+    def test_import_data_reports_all_conversion_errors_for_a_row(self):
+        # a row containing two unconvertible values must report both errors
+        resource = BookResource()
+        dataset = tablib.Dataset(headers=["name", "published_time", "added"])
+        dataset.append(["Some book", "not-a-time", "not-a-datetime"])
+
+        result = resource.import_data(dataset, raise_errors=False)
+
+        self.assertTrue(result.has_validation_errors())
+        self.assertIs(result.rows[0].import_type, results.RowResult.IMPORT_TYPE_INVALID)
+        invalid_row = result.invalid_rows[0]
+        self.assertEqual(2, invalid_row.error_count)
+        self.assertIn("published_time", invalid_row.field_specific_errors)
+        self.assertIn("added", invalid_row.field_specific_errors)
+
+    def test_import_data_reports_conversion_and_model_errors_for_a_row(self):
+        # a row containing a type conversion failure and a model validation
+        # error must report both errors
+        class TestResource(resources.ModelResource):
+            class Meta:
+                model = Author
+                clean_model_instances = True
+
+        resource = TestResource()
+        dataset = tablib.Dataset(headers=["name", "birthday"])
+        dataset.append(["123", "1882test-01-18"])
+
+        result = resource.import_data(dataset, raise_errors=False)
+
+        self.assertTrue(result.has_validation_errors())
+        self.assertIs(result.rows[0].import_type, results.RowResult.IMPORT_TYPE_INVALID)
+        invalid_row = result.invalid_rows[0]
+        self.assertEqual(2, invalid_row.error_count)
+        self.assertIn("birthday", invalid_row.field_specific_errors)
+        self.assertIn("name", invalid_row.field_specific_errors)
+
+    def test_import_data_combines_errors_for_fields_sharing_an_attribute(self):
+        # two import fields can map to the same attribute: both conversion
+        # errors must be retained
+        class TestResource(resources.ModelResource):
+            birthday_duplicate = fields.Field(
+                attribute="birthday",
+                column_name="birthday_duplicate",
+                widget=widgets.DateTimeWidget(),
+            )
+
+            class Meta:
+                model = Author
+                fields = ("birthday", "birthday_duplicate")
+
+        resource = TestResource()
+        dataset = tablib.Dataset(headers=["birthday", "birthday_duplicate"])
+        dataset.append(["bad-date", "another-bad-date"])
+
+        result = resource.import_data(dataset, raise_errors=False)
+
+        self.assertTrue(result.has_validation_errors())
+        invalid_row = result.invalid_rows[0]
+        self.assertEqual(2, invalid_row.error_count)
+        self.assertEqual(2, len(invalid_row.field_specific_errors["birthday"]))
+
+    def test_failed_row_visible_to_both_error_consumers(self):
+        # a failed row must be readable both as field-keyed validation errors
+        # and as the original input cells in the failed dataset
+        resource = BookResource()
+        dataset = tablib.Dataset(headers=["name", "added"])
+        dataset.append(["Some book", "not-a-date"])
+
+        result = resource.import_data(
+            dataset, raise_errors=False, collect_failed_rows=True
+        )
+
+        self.assertIn("added", result.invalid_rows[0].field_specific_errors)
+        failed_row = result.failed_dataset.dict[0]
+        self.assertEqual("Some book", failed_row["name"])
+        self.assertEqual("not-a-date", failed_row["added"])
 
     def test_import_data_empty_dataset_with_collect_failed_rows(self):
         class _AuthorResource(resources.ModelResource):

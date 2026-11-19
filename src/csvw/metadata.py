@@ -848,7 +848,14 @@ class TableLike(Description):
             return self._parent._fname.parent  # pylint: disable=protected-access
         return self._fname.parent if self._fname else None  # pylint: disable=protected-access
 
-    def expand(self, tmpl: URITemplate, row: dict, _row, _name=None, qname=False) -> str:
+    def expand(
+            self,
+            tmpl: URITemplate,
+            row: dict,
+            _row,
+            _name=None,
+            qname=False,
+    ) -> Union[str, list[str]]:
         """
         Expand a `URITemplate` using `row`, `_row` and `_name` as context and resolving the result
         against `TableLike.url`.
@@ -862,6 +869,12 @@ class TableLike(Description):
             >>> tg.expand(URITemplate('/path?{a}{#b}'), dict(a='1', b='2'), None)
             'https://raw.githubusercontent.com/path?1#2'
 
+        If the template references a list-valued cell (i.e. a column with a `separator`),
+        the template is expanded once for each item in the list - using the already parsed
+        list of values - and a `list` of URLs is returned. Thus, items are URL-encoded
+        individually and the separator joining the items of a cell cannot be confused with
+        characters within an item. Missing items (i.e. `None` values) are skipped, rather
+        than being turned into pseudo-values.
         """
         if tmpl is INVALID:
             return self.url.resolve(self.base)
@@ -873,18 +886,37 @@ class TableLike(Description):
                 res = f"{url}{tmpl.uri.split(':')[1]}"
                 break
         else:
-            res = Link(
-                tmpl.expand(
-                    _row=_row,
-                    _name=_name,
-                    **{_k: _v for _k, _v in row.items() if isinstance(_k, str)}
-                )).resolve(self.url.resolve(self.base) if self.url else self.base)
-        if not isinstance(res, pathlib.Path):
-            if qname:
-                for prefix, url in NAMESPACES.items():
-                    if res.startswith(url):
-                        res = res.replace(url, prefix + ':')
-                        break
+            context = {_k: _v for _k, _v in row.items() if isinstance(_k, str)}
+            variables = {v for var in tmpl.variables for v in var.variable_names}
+            lists = {
+                k: v for k, v in context.items() if isinstance(v, list) and k in variables}
+            if lists:
+                keys, values = zip(*lists.items())
+                res = [
+                    Link(
+                        tmpl.expand(
+                            _row=_row,
+                            _name=_name,
+                            **{**context, **dict(zip(keys, items))})
+                    ).resolve(self.url.resolve(self.base) if self.url else self.base)
+                    for items in itertools.product(*values)
+                    # Missing values must not be turned into pseudo-URLs:
+                    if not any(item is None for item in items)]
+            else:
+                res = Link(
+                    tmpl.expand(_row=_row, _name=_name, **context)
+                ).resolve(self.url.resolve(self.base) if self.url else self.base)
+
+        def as_qname(r):
+            if isinstance(r, pathlib.Path):
+                return r
+            for prefix, url in NAMESPACES.items():
+                if r.startswith(url):
+                    return r.replace(url, prefix + ':')
+            return r
+
+        if qname:
+            res = [as_qname(r) for r in res] if isinstance(res, list) else as_qname(res)
         return res
 
 

@@ -611,6 +611,51 @@ GID,On Street,Species,Trim Cycle,Inventory Date
             assert lineno == 3
             break
 
+    def test_expand_with_list_valued_column(self, tmp_path):
+        # The links to be expanded reference a numeric column and a list-valued
+        # label column:
+        metadata = """\
+{
+  "@context": "http://www.w3.org/ns/csvw",
+  "tables": [{
+    "url": "csv.txt",
+    "tableSchema": {
+      "columns": [
+        {"name": "num", "datatype": "integer"},
+        {
+          "name": "label",
+          "titles": "Label",
+          "separator": ";",
+          "null": ["NA"],
+          "valueUrl": "http://example.org/labels/{num}/{label}"
+        }
+      ]
+    }
+  }]
+}"""
+        tg = self._make_tablegroup(
+            tmp_path, data='num,Label\n1,"a b;c/d;x,y;NA"', metadata=metadata)
+        table = tg.tables[0]
+        row = list(table)[0]
+        assert row['label'] == ['a b', 'c/d', 'x,y', None]
+
+        # The template is expanded for each item of the already parsed list, URL-encoding
+        # slashes and spaces within each item separately. Missing labels do not give rise
+        # to pseudo-values, and the separator between labels cannot be confused with
+        # separators within labels:
+        col = table.tableSchema.columns[1]
+        assert table.expand(col.valueUrl, row, _row=1) == [
+            'http://example.org/labels/1/a%20b',
+            'http://example.org/labels/1/c%2Fd',
+            'http://example.org/labels/1/x%2Cy']
+
+        obj = csvw.CSVW(str(tmp_path / 'csv.txt'), md_url=str(tmp_path / 'md'))
+        describes = obj.to_json()['tables'][0]['row'][0]['describes'][0]
+        assert describes['label'] == [
+            'http://example.org/labels/1/a%20b',
+            'http://example.org/labels/1/c%2Fd',
+            'http://example.org/labels/1/x%2Cy']
+
     def test_foreign_keys(self):
         with pytest.raises(ValueError):
             csvw.ForeignKey.fromdict({

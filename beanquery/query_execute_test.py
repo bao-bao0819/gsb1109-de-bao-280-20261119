@@ -501,6 +501,80 @@ class TestBeancountMetadataFunctions(QueryBase):
         self.assertResult('''SELECT any_meta('name')''', 'The Name', object)
 
 
+class TestEffectiveMeta(QueryBase):
+    INPUT = """
+        2024-01-01 open Assets:Cash
+          department: "ACC"
+        2024-01-01 open Expenses:Food
+        2024-01-01 open Assets:Bank
+        2024-01-01 open Expenses:Misc
+
+        2024-01-02 * "All three levels"
+          department: "TXN"
+          Assets:Cash  100 USD
+            department: "POS"
+          Expenses:Food
+
+        2024-01-03 * "Account only"
+          Assets:Cash  50 USD
+          Expenses:Food
+
+        2024-01-04 * "Cleared on posting"
+          department: "TXN2"
+          Assets:Cash  25 USD
+            department:
+          Expenses:Food
+
+        2024-01-05 * "Nothing anywhere"
+          Assets:Bank  10 USD
+          Expenses:Misc
+    """
+
+    def test_effective_meta(self):
+        curs = self.ctx.execute('''
+            SELECT date, account, effective_meta('department'), effective_meta_source('department')
+            ORDER BY date, account
+        ''')
+        self.assertEqual([
+            # Value set at all three levels: the posting wins.
+            (datetime.date(2024, 1, 2), 'Assets:Cash', 'POS', 'posting'),
+            (datetime.date(2024, 1, 2), 'Expenses:Food', 'TXN', 'transaction'),
+            # Value set only on the account open directive.
+            (datetime.date(2024, 1, 3), 'Assets:Cash', 'ACC', 'account'),
+            (datetime.date(2024, 1, 3), 'Expenses:Food', None, 'default'),
+            # An empty value on the posting explicitly clears the
+            # department: no inheritance from the transaction.
+            (datetime.date(2024, 1, 4), 'Assets:Cash', None, 'posting'),
+            (datetime.date(2024, 1, 4), 'Expenses:Food', 'TXN2', 'transaction'),
+            # No value at any level.
+            (datetime.date(2024, 1, 5), 'Assets:Bank', None, 'default'),
+            (datetime.date(2024, 1, 5), 'Expenses:Misc', None, 'default'),
+        ], curs.fetchall())
+
+    def test_effective_meta_default(self):
+        self.assertResult('''
+            SELECT effective_meta('department', 'UNSET')
+            WHERE account = 'Assets:Bank'
+        ''', 'UNSET', object)
+        self.assertResult('''
+            SELECT effective_meta('department', 'UNSET')
+            WHERE account = 'Assets:Cash' AND date = 2024-01-03
+        ''', 'ACC', object)
+
+    def test_effective_meta_default_rows(self):
+        # Rows falling back to the default value, singled out for review.
+        curs = self.ctx.execute('''
+            SELECT date, account
+            WHERE effective_meta_source('department') = 'default'
+            ORDER BY date, account
+        ''')
+        self.assertEqual([
+            (datetime.date(2024, 1, 3), 'Expenses:Food'),
+            (datetime.date(2024, 1, 5), 'Assets:Bank'),
+            (datetime.date(2024, 1, 5), 'Expenses:Misc'),
+        ], curs.fetchall())
+
+
 class TestFilterEntries(CommonInputBase, QueryBase):
 
     def compile(self, query):

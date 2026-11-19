@@ -405,6 +405,86 @@ def any_meta(context, key):
     raise NotImplementedError
 
 
+def _effective_meta(context, meta, entry_meta, account, key, default=None):
+    """Compute the effective metadata value and its source level.
+
+    Lookup order: posting, transaction, account open directive. A key
+    present with an empty value (None or an empty string) explicitly
+    clears the value and stops the lookup. Returns a (value, source)
+    tuple where source is one of 'posting', 'transaction', 'account'
+    or 'default'.
+    """
+    if meta is not None and key in meta:
+        value = meta[key]
+        return (None if value is None or value == '' else value), 'posting'
+    if entry_meta is not None and key in entry_meta:
+        value = entry_meta[key]
+        return (None if value is None or value == '' else value), 'transaction'
+    open_entry, _ = context.tables['accounts'].accounts.get(account, NONENONE)
+    if open_entry is not None and key in open_entry.meta:
+        value = open_entry.meta[key]
+        return (None if value is None or value == '' else value), 'account'
+    return default, 'default'
+
+
+@register('_effective_meta')
+class EffectiveMeta(query_compile.EvalFunction):
+    __intypes__ = [dict, dict, str, str]
+    pure = False
+
+    def __init__(self, context, operands):
+        super().__init__(context, operands, object)
+
+    def __call__(self, row):
+        meta, entry_meta, account, key = [operand(row) for operand in self.operands]
+        return _effective_meta(self.context, meta, entry_meta, account, key)[0]
+
+
+@register('_effective_meta')
+class EffectiveMetaDefault(query_compile.EvalFunction):
+    __intypes__ = [dict, dict, str, str, types.Any]
+    pure = False
+
+    def __init__(self, context, operands):
+        super().__init__(context, operands, object)
+
+    def __call__(self, row):
+        meta, entry_meta, account, key, default = [operand(row) for operand in self.operands]
+        return _effective_meta(self.context, meta, entry_meta, account, key, default)[0]
+
+
+@register('_effective_meta_source')
+class EffectiveMetaSource(query_compile.EvalFunction):
+    __intypes__ = [dict, dict, str, str]
+    pure = False
+
+    def __init__(self, context, operands):
+        super().__init__(context, operands, str)
+
+    def __call__(self, row):
+        meta, entry_meta, account, key = [operand(row) for operand in self.operands]
+        return _effective_meta(self.context, meta, entry_meta, account, key)[1]
+
+
+# Stub kept only for function type checking and for generating documentation.
+@function([str], object)
+@function([str, types.Any], object)
+def effective_meta(context, key, default=None):
+    """Get metadata from the posting, its parent transaction or the account
+    open directive, in this order. A key present with an empty value
+    explicitly clears the value and stops the lookup. When the key is
+    not defined at any level, the default is returned."""
+    raise NotImplementedError
+
+
+# Stub kept only for function type checking and for generating documentation.
+@function([str], str)
+def effective_meta_source(context, key):
+    """Get the level providing the effective_meta() value: 'posting',
+    'transaction', 'account' or 'default'."""
+    raise NotImplementedError
+
+
 @function([str], dict, pass_context=True)
 @function([str, str], object, pass_context=True)
 @function([str], dict, pass_context=True, name='commodity_meta')

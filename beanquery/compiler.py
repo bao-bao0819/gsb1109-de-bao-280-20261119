@@ -583,6 +583,29 @@ class Compiler:
                 ast.Attribute(ast.Column('entry', parseinfo=node.parseinfo), 'meta'), key])])
             return self._compile(node)
 
+        # Replace ``effective_meta(key[, default])`` with
+        # ``_effective_meta(meta, entry.meta, account, key[, default])``.
+        if node.fname == 'effective_meta':
+            args = [
+                ast.Column('meta', parseinfo=node.parseinfo),
+                ast.Attribute(ast.Column('entry', parseinfo=node.parseinfo), 'meta'),
+                ast.Column('account', parseinfo=node.parseinfo),
+            ]
+            args.extend(node.operands)
+            node = ast.Function('_effective_meta', args)
+            return self._compile(node)
+
+        # Replace ``effective_meta_source(key)`` with
+        # ``_effective_meta_source(meta, entry.meta, account, key)``.
+        if node.fname == 'effective_meta_source':
+            key = node.operands[0]
+            node = ast.Function('_effective_meta_source', [
+                ast.Column('meta', parseinfo=node.parseinfo),
+                ast.Attribute(ast.Column('entry', parseinfo=node.parseinfo), 'meta'),
+                ast.Column('account', parseinfo=node.parseinfo),
+                key])
+            return self._compile(node)
+
         # Replace ``has_account(regexp)`` with ``('(?i)' + regexp) ~? any (accounts)``.
         if node.fname == 'has_account':
             node = ast.Any(ast.Add(ast.Constant('(?i)'), node.operands[0]), '?~', ast.Column('accounts'))

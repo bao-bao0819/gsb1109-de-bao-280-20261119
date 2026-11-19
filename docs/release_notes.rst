@@ -55,6 +55,11 @@ Breaking changes
   Passing ``read_mode`` or ``encoding`` to a storage class (for example via
   :meth:`~import_export.admin.ImportMixin.get_tmp_storage_class_kwargs`) now raises ``TypeError``.
 
+  :class:`~import_export.tmp_storages.BaseStorage` defines a new ``exists()`` method, implemented by all the
+  bundled storage classes.  It is used at the confirm-import step to detect a temporary upload which has
+  expired or been removed.  If you provide a custom storage class which does not subclass ``BaseStorage``,
+  implement ``exists()`` to return whether the stored data is still available.
+
   The ``input_format`` parameter has been removed from
   :meth:`~import_export.admin.ImportMixin.write_to_tmp_storage`, as the storage no longer depends on the
   format.  Update any override to the new signature ``write_to_tmp_storage(self, import_file)``.

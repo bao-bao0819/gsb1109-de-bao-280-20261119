@@ -1,10 +1,15 @@
+import logging
 from urllib.parse import urlencode
 
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.admin.models import ADDITION, CHANGE, DELETION, LogEntry
 from django.contrib.auth import get_permission_codename
-from django.core.exceptions import FieldError, PermissionDenied
+from django.core.exceptions import (
+    FieldError,
+    PermissionDenied,
+    SuspiciousFileOperation,
+)
 from django.forms import MultipleChoiceField, MultipleHiddenInput
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import render
@@ -24,6 +29,8 @@ from .mixins import BaseExportMixin, BaseImportMixin
 from .results import RowResult
 from .signals import post_export, post_import
 from .tmp_storages import TempFolderStorage
+
+logger = logging.getLogger(__name__)
 
 
 class ImportExportMixinBase:
@@ -181,25 +188,114 @@ class ImportMixin(BaseImportMixin, ImportExportMixinBase):
                 name=confirm_form.cleaned_data["import_file_name"],
                 **self.get_tmp_storage_class_kwargs(),
             )
+            original_file_name = confirm_form.cleaned_data["original_file_name"]
 
-            data = tmp_storage.read()
-            dataset = input_format.create_dataset(data)
+            if not tmp_storage.exists():
+                return self.handle_tmp_storage_unavailable(request, original_file_name)
+            try:
+                # then read the raw bytes back; the format handles decoding
+                # warning, big files may exceed memory
+                data = tmp_storage.read()
+            except (FileNotFoundError, SuspiciousFileOperation) as e:
+                # the file may have been removed between the exists() check
+                # and the read (for example by a concurrent cleanup job)
+                logger.warning(
+                    "Temporary import file %r disappeared before it could be "
+                    "read: %s",
+                    tmp_storage.name,
+                    e,
+                )
+                return self.handle_tmp_storage_unavailable(request, original_file_name)
+            if data is None:
+                # storages such as CacheStorage return None instead of raising
+                # when the stored data has expired
+                return self.handle_tmp_storage_unavailable(request, original_file_name)
+
+            try:
+                dataset = input_format.create_dataset(data)
+            except Exception as e:
+                return self.handle_confirm_read_failure(request, original_file_name, e)
             result = self.process_dataset(dataset, confirm_form, request, **kwargs)
 
             tmp_storage.remove()
 
             return self.process_result(result, request)
-        else:
-            context = self.admin_site.each_context(request)
-            context.update(
-                {
-                    "title": _("Import"),
-                    "confirm_form": confirm_form,
-                    "opts": self.model._meta,
-                    "errors": confirm_form.errors,
-                }
+        return self.render_confirm_form(request, confirm_form)
+
+    def render_confirm_form(self, request, confirm_form):
+        context = self.admin_site.each_context(request)
+        context.update(
+            {
+                "title": _("Import"),
+                "confirm_form": confirm_form,
+                "opts": self.model._meta,
+                "errors": confirm_form.errors,
+            }
+        )
+        return TemplateResponse(request, [self.import_template_name], context)
+
+    def get_import_url(self):
+        return reverse(
+            "%s:%s_%s_import"
+            % ((self.admin_site.name,) + self.get_model_info()),
+            current_app=self.admin_site.name,
+        )
+
+    def handle_tmp_storage_unavailable(self, request, original_file_name):
+        """
+        Handle the case where the file stored during the preview step is no
+        longer available at confirmation time (for example it was removed by
+        an external cleanup job or the cache entry expired).
+
+        No data is imported. The user is redirected back to the import form
+        with an instruction to re-upload the file.
+        """
+        logger.warning(
+            "Temporary import file for %r is no longer available; the user "
+            "must re-upload the file",
+            original_file_name,
+        )
+        messages.error(
+            request,
+            _(
+                "The temporary upload of '%(file_name)s' has expired or was "
+                "removed, so the import could not be confirmed and no data "
+                "was imported. Please re-upload the file and confirm the "
+                "import again."
             )
-            return TemplateResponse(request, [self.import_template_name], context)
+            % {"file_name": original_file_name},
+        )
+        return HttpResponseRedirect(self.get_import_url())
+
+    def handle_confirm_read_failure(self, request, original_file_name, exc):
+        """
+        Handle the case where the temporary file still exists but its contents
+        can no longer be parsed with the selected format.
+
+        No data is imported. The error report states which step of the
+        workflow failed and the user is redirected back to the import form to
+        correct and re-upload the file.
+        """
+        logger.warning(
+            "Could not parse temporary import file %r at the confirm-import "
+            "step: %s",
+            original_file_name,
+            exc,
+        )
+        messages.error(
+            request,
+            _(
+                "The temporary upload of '%(file_name)s' is still available "
+                "but failed validation at the confirm-import step "
+                "(%(exc_name)s), so no data was imported. Please correct "
+                "the file and re-upload it."
+            )
+            % {
+                "file_name": original_file_name,
+                "exc_name": type(exc).__name__,
+            },
+        )
+        return HttpResponseRedirect(self.get_import_url())
 
     def process_dataset(
         self,

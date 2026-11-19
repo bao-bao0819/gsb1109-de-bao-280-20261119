@@ -1,6 +1,7 @@
 import os
 
 from core.admin import AuthorAdmin, BookAdmin
+from core.models import Book
 from core.tests.admin_integration.mixins import AdminTestMixin
 from django.test.testcases import TestCase
 from django.utils.translation import gettext_lazy as _
@@ -22,8 +23,16 @@ class ImportAdminSecurityTests(AdminTestMixin, TestCase):
             "original_file_name": "books.csv",
         }
         self._prepend_form_prefix(data)
-        with self.assertRaises(FileNotFoundError):
-            self._post_url_response(self.book_process_import_url, data)
+        # the traversed path does not resolve to a stored upload, so the
+        # request is redirected back to the import form with an error
+        # instead of leaking a filesystem error to the user, and nothing
+        # is imported
+        response = self._post_url_response(
+            self.book_process_import_url, data, follow=True
+        )
+        self.assertRedirects(response, self.book_import_url)
+        self.assertContains(response, "has expired or was removed")
+        self.assertFalse(Book.objects.exists())
 
     def test_import_buttons_visible_without_add_permission(self):
         # When using ImportMixin, users should be able to see the import button

@@ -31,6 +31,10 @@ class TestBaseStorage(TestCase):
         with self.assertRaises(NotImplementedError):
             self.storage.remove()
 
+    def test_exists(self):
+        with self.assertRaises(NotImplementedError):
+            self.storage.exists()
+
     def test_removed_kwargs_raise(self):
         # read_mode and encoding were removed in v5 (issue 2006):
         # fail loudly rather than silently ignoring them
@@ -67,8 +71,14 @@ id,name,author,author_email,imported,published,price,categories
         self.assertEqual(self.test_string, tmp_storage.read())
 
         self.assertTrue(os.path.isfile(tmp_storage.get_full_path()))
+        self.assertTrue(tmp_storage.exists())
         tmp_storage.remove()
         self.assertFalse(os.path.isfile(tmp_storage.get_full_path()))
+        self.assertFalse(tmp_storage.exists())
+
+    def test_temp_folder_storage_exists_false_for_unknown_name(self):
+        tmp_storage = TempFolderStorage(name="does-not-exist")
+        self.assertFalse(tmp_storage.exists())
 
     def test_temp_folder_storage_reads_binary(self):
         tmp_storage = TestTempFolderStorage()
@@ -94,8 +104,15 @@ id,name,author,author_email,imported,published,price,categories
         self.assertEqual(self.test_string, tmp_storage.read())
 
         self.assertIsNotNone(cache.get(tmp_storage.CACHE_PREFIX + tmp_storage.name))
+        self.assertTrue(tmp_storage.exists())
         tmp_storage.remove()
         self.assertIsNone(cache.get(tmp_storage.CACHE_PREFIX + tmp_storage.name))
+        self.assertFalse(tmp_storage.exists())
+
+    def test_cache_storage_exists_false_for_unknown_name(self):
+        tmp_storage = CacheStorage()
+        tmp_storage.name = "does-not-exist"
+        self.assertFalse(tmp_storage.exists())
 
     def test_cache_storage_read_by_name(self):
         tmp_storage = CacheStorage()
@@ -121,8 +138,14 @@ id,name,author,author_email,imported,published,price,categories
         self.assertEqual(self.test_string, tmp_storage.read())
 
         self.assertTrue(default_storage.exists(tmp_storage.get_full_path()))
+        self.assertTrue(tmp_storage.exists())
         tmp_storage.remove()
         self.assertFalse(default_storage.exists(tmp_storage.get_full_path()))
+        self.assertFalse(tmp_storage.exists())
+
+    def test_media_storage_exists_false_for_unknown_name(self):
+        tmp_storage = MediaStorage(name="does-not-exist")
+        self.assertFalse(tmp_storage.exists())
 
     def test_media_storage_reads_binary(self):
         tmp_storage = TestMediaStorage()

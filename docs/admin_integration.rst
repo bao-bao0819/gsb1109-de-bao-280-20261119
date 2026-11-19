@@ -114,6 +114,14 @@ that data is properly secured and managed.**
     This will need to be understood and managed in production settings.
     For example, using a cache expiration policy or cron job to clear stale resources.
 
+If the temporary upload is no longer available when the user confirms the import
+(for example because it was removed by a cleanup job or the cache entry expired),
+then no data is imported and the user is redirected back to the import form with
+an error explaining that the upload has expired and the file must be re-uploaded.
+If the file is still present but its contents can no longer be parsed with the
+selected format, the error instead identifies the confirm-import step as the point
+of failure and the file is left untouched so that the failure can be investigated.
+
 .. _customizable_storage:
 
 Customizable storage

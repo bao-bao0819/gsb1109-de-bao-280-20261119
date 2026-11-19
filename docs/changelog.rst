@@ -26,6 +26,9 @@ Enhancements
 Fixes
 #####
 
+- The confirm-import step now handles a temporary upload which has expired or been removed before confirmation: instead of raising a server error, no data is imported and the user is redirected back to the import form with an instruction to re-upload the file
+- When a temporary upload still exists but can no longer be parsed at the confirm-import step, the error now identifies that step as the point of failure, instead of raising an unhandled exception
+- Added ``BaseStorage.exists()`` so each temporary storage mechanism can report whether the upload is still available
 - Fixed ``DateWidget.clean()`` returning datetime instances so that xlsx round-trips of ``DateField`` values are correctly detected as unchanged by ``skip_row()`` (`2195 <https://github.com/django-import-export/django-import-export/issues/2195>`_, `2208 <https://github.com/django-import-export/django-import-export/pull/2208>`_)
 - Fixed import / export links being hidden when an admin mixin from another library declares ``change_list_template`` as a read-only property (e.g. django-admin-sortable2).  The import / export change list template now extends the template Django would otherwise have used, resolved on each request (`2205 <https://github.com/django-import-export/django-import-export/issues/2205>`_)
 - Fixed the import preview diff showing a spurious change for values which the widget considers equal but which render differently, for example a ``DecimalField`` value of ``1803.60`` imported from an xlsx cell as ``1803.6`` (`2199 <https://github.com/django-import-export/django-import-export/issues/2199>`_)

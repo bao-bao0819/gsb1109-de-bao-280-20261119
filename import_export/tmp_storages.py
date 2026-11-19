@@ -35,6 +35,10 @@ class BaseStorage:
     def remove(self):
         raise NotImplementedError
 
+    def exists(self):
+        """Return whether the stored data is still available."""
+        raise NotImplementedError
+
 
 class TempFolderStorage(BaseStorage):
     def save(self, data):
@@ -47,6 +51,9 @@ class TempFolderStorage(BaseStorage):
 
     def remove(self):
         os.remove(self.get_full_path())
+
+    def exists(self):
+        return os.path.exists(self.get_full_path())
 
     def get_full_path(self):
         return os.path.join(tempfile.gettempdir(), self.name)
@@ -79,6 +86,9 @@ class CacheStorage(BaseStorage):
     def remove(self):
         cache.delete(self.CACHE_PREFIX + self.name)
 
+    def exists(self):
+        return self.CACHE_PREFIX + self.name in cache
+
 
 class MediaStorage(BaseStorage):
     _storage = None
@@ -107,6 +117,9 @@ class MediaStorage(BaseStorage):
 
     def remove(self):
         self._storage.delete(self.get_full_path())
+
+    def exists(self):
+        return self._storage.exists(self.get_full_path())
 
     def get_full_path(self):
         if self.MEDIA_FOLDER is not None:

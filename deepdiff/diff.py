@@ -30,7 +30,7 @@ from deepdiff.helper import (strings, bytes_type, numbers, uuids, ListItemRemove
                              detailed__dict__, add_root_to_paths,
                              np, get_truncate_datetime, dict_, CannotCompare, ENUM_INCLUDE_KEYS,
                              PydanticBaseModel, Opcode, SetOrdered, ipranges,
-                             separate_wildcard_and_exact_paths)
+                             separate_wildcard_and_exact_paths, RE_COMPILED_TYPE)
 from deepdiff.serialization import SerializationMixin
 from deepdiff.distance import DistanceMixin, logarithmic_similarity
 from deepdiff.model import (
@@ -193,6 +193,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  log_scale_similarity_threshold: float=0.1,
                  log_stacktrace: bool=False,
                  math_epsilon: Optional[float]=None,
+                 math_epsilon_per_path: Optional[Mapping[Union[str, Pattern[str]], float]]=None,
                  max_diffs: Optional[int]=None,
                  max_passes: int=10000000,
                  multiprocessing: bool=False,
@@ -220,6 +221,9 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         self.include_glob_paths = None
         self.iterable_match_keys = None
         self._compiled_match_keys = None
+        self._math_epsilon_per_path_exact = None
+        self._math_epsilon_per_path_glob = None
+        self._math_epsilon_per_path_regex = None
         if kwargs:
             raise ValueError((
                 "The following parameter(s) are not valid: %s\n"
@@ -230,7 +234,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                 "view, hasher, hashes, max_passes, max_diffs, zip_ordered_iterables, "
                 "cutoff_distance_for_pairs, cutoff_intersection_for_pairs, log_frequency_in_sec, cache_size, "
                 "cache_tuning_sample_size, get_deep_distance, group_by, group_by_sort_key, cache_purge_level, log_stacktrace,"
-                "math_epsilon, iterable_compare_func, iterable_match_keys, use_enum_value, _original_type, "
+                "math_epsilon, math_epsilon_per_path, iterable_compare_func, iterable_match_keys, use_enum_value, _original_type, "
                 "threshold_to_diff_deeper, default_timezone "
                 "ignore_order_func, custom_operators, encodings, ignore_encoding_errors, use_log_scale, log_scale_similarity_threshold "
                 "multiprocessing, multiprocessing_workers, multiprocessing_threshold, "
@@ -308,8 +312,13 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
 
             self.significant_digits = self.get_significant_digits(significant_digits, ignore_numeric_type_changes)
             self.math_epsilon = math_epsilon
+            (self._math_epsilon_per_path_exact,
+             self._math_epsilon_per_path_glob,
+             self._math_epsilon_per_path_regex) = self._parse_math_epsilon_per_path(math_epsilon_per_path)
             if self.math_epsilon is not None and self.ignore_order:
                 logger.warning("math_epsilon in conjunction with ignore_order=True is only used for flat object comparisons. Custom math_epsilon will not have an effect when comparing nested objects.")
+            if self._math_epsilon_per_path_configured and self.ignore_order and not self.iterable_match_keys:
+                logger.warning("math_epsilon_per_path in conjunction with ignore_order=True is only used for flat object comparisons or lists paired via iterable_match_keys. It will not have an effect when comparing nested objects in unordered iterables.")
             self.truncate_datetime = get_truncate_datetime(truncate_datetime)
             self.number_format_notation = number_format_notation
             if verbose_level in {0, 1, 2}:
@@ -1993,6 +2002,58 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         if level.t1 != level.t2:
             self._report_result('values_changed', level, local_tree=local_tree)
 
+    @staticmethod
+    def _parse_math_epsilon_per_path(math_epsilon_per_path):
+        """Split a math_epsilon_per_path mapping into exact, glob and regex lookups.
+
+        Keys may be exact path strings (``root['a']['amount']``), glob patterns
+        (``root['devices'][*]['temperature']``) or compiled regular expressions.
+        """
+        if not math_epsilon_per_path:
+            return None, None, None
+        from deepdiff.path import path_has_wildcard, GlobPathMatcher
+        exact = {}
+        glob = []
+        regex = []
+        for path_pattern, epsilon in math_epsilon_per_path.items():
+            if not isinstance(epsilon, numbers):
+                raise ValueError(
+                    "math_epsilon_per_path values must be numbers. Got: {!r}".format(epsilon))
+            if isinstance(path_pattern, RE_COMPILED_TYPE):
+                regex.append((path_pattern, epsilon))
+            elif isinstance(path_pattern, str):
+                if path_has_wildcard(path_pattern):
+                    if not path_pattern.startswith('root'):
+                        raise ValueError(
+                            "Wildcard paths must start with 'root'. Got: {}".format(path_pattern))
+                    glob.append((GlobPathMatcher(path_pattern), epsilon))
+                else:
+                    exact[path_pattern] = epsilon
+            else:
+                raise ValueError(
+                    "math_epsilon_per_path keys must be path strings or compiled regexes. Got: {!r}".format(path_pattern))
+        return exact or None, glob or None, regex or None
+
+    @property
+    def _math_epsilon_per_path_configured(self):
+        return bool(self._math_epsilon_per_path_exact
+                    or self._math_epsilon_per_path_glob
+                    or self._math_epsilon_per_path_regex)
+
+    def _get_math_epsilon_for_path(self, path):
+        """Return the path-specific math epsilon for a path, or None if not configured."""
+        if self._math_epsilon_per_path_exact and path in self._math_epsilon_per_path_exact:
+            return self._math_epsilon_per_path_exact[path]
+        if self._math_epsilon_per_path_glob:
+            for matcher, epsilon in self._math_epsilon_per_path_glob:
+                if matcher.match(path):
+                    return epsilon
+        if self._math_epsilon_per_path_regex:
+            for pattern, epsilon in self._math_epsilon_per_path_regex:
+                if pattern.search(path):
+                    return epsilon
+        return None
+
     def _diff_numbers(self, level, local_tree=None, report_type_change=True):
         """Diff Numbers"""
         if report_type_change:
@@ -2001,11 +2062,17 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         else:
             t1_type = t2_type = ''
 
+        math_epsilon = self.math_epsilon
+        if self._math_epsilon_per_path_configured:
+            path_epsilon = self._get_math_epsilon_for_path(level.path())
+            if path_epsilon is not None:
+                math_epsilon = path_epsilon
+
         if self.use_log_scale:
             if not logarithmic_similarity(level.t1, level.t2, threshold=self.log_scale_similarity_threshold):
                 self._report_result('values_changed', level, local_tree=local_tree)
-        elif self.math_epsilon is not None:
-            if not is_close(level.t1, level.t2, abs_tol=self.math_epsilon):
+        elif math_epsilon is not None:
+            if not is_close(level.t1, level.t2, abs_tol=math_epsilon):
                 self._report_result('values_changed', level, local_tree=local_tree)
         elif self.significant_digits is None:
             if level.t1 != level.t2:

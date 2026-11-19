@@ -66,6 +66,37 @@ class LatestOfEachTestCase(HistoricalTestCase):
             },
         )
 
+    def test_same_history_date_uses_record_order(self):
+        """
+        Records written at the exact same time (e.g. a historical data
+        backfill) are ordered by `history_id`, matching the historical model's
+        default ordering of ``("-history_date", "-history_id")``.
+        """
+        same_time = datetime(2020, 1, 1, 12, 0, 0)
+        document = RankedDocument(rank=1)
+        document._history_date = same_time
+        document.save()
+        document.rank = 2
+        document.save()
+        document.rank = 3
+        document.save()
+        document_pk = document.pk
+        document.delete()
+
+        # The deletion is the last record at that timestamp, so it is the
+        # latest of each - not one of the earlier edits.
+        latest = RankedDocument.history.latest_of_each().get()
+        self.assertEqual(latest.history_type, "-")
+        self.assertEqual(latest.rank, 3)
+        self.assertEqual(latest.history_date, same_time)
+
+        # The whole-table `as_of` query resolves to the deletion.
+        self.assertFalse(RankedDocument.history.as_of(same_time).exists())
+
+        # The single-object `as_of` query reaches the same verdict.
+        with self.assertRaises(RankedDocument.DoesNotExist):
+            RankedDocument(id=document_pk).history.as_of(same_time)
+
 
 class AsOfTestCase(TestCase):
     model = Document

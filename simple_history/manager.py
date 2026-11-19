@@ -57,15 +57,28 @@ class HistoricalQuerySet(QuerySet):
         """
         Ensures results in the queryset are the latest historical record for each
         primary key. This includes deletion records.
+
+        Records are ordered by ``history_date`` and, for records sharing the same
+        timestamp, by ``history_id`` - matching the historical model's default
+        ordering of ``("-history_date", "-history_id")``.
         """
         # Subquery for finding the records that belong to the same history-tracked
         # object as the record from the outer query (identified by `_pk_attr`),
-        # and that have a later `history_date` than the outer record.
+        # and that come later than the outer record. "Later" follows the historical
+        # model's ordering: first by `history_date`, then by the primary key
+        # (`history_id`) to break ties for records written at the same time.
         # The very latest record of a history-tracked object should be excluded from
         # this query - which will make it included in the `~Exists` query below.
+        history_id_attr = self.model._meta.pk.attname
         later_records = self.filter(
             Q(**{self._pk_attr: OuterRef(self._pk_attr)}),
-            Q(history_date__gt=OuterRef("history_date")),
+            Q(
+                Q(history_date__gt=OuterRef("history_date"))
+                | Q(
+                    history_date=OuterRef("history_date"),
+                    **{f"{history_id_attr}__gt": OuterRef(history_id_attr)},
+                )
+            ),
         )
 
         # Filter the records to only include those for which the `later_records`

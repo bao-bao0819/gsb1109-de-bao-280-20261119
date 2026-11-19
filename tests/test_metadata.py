@@ -240,6 +240,48 @@ def _load_json(path):
         return json.load(f)
 
 
+def _composite_key_fixture(child_rows):
+    # A parent table with composite primary key (a: string, b: integer) and a child table whose
+    # CSV columns are in a different order (y, x) than the declared foreign key columns (x, y).
+    data = {
+        "parent.csv": "a,b,note\n01,10,p1\n02,20,p2\n",
+        "child.csv": "y,x\n" + child_rows,
+    }
+    metadata = {
+        "@context": "http://www.w3.org/ns/csvw",
+        "tables": [
+            {
+                "url": "parent.csv",
+                "tableSchema": {
+                    "columns": [
+                        {"name": "a", "datatype": "string"},
+                        {"name": "b", "datatype": "integer"},
+                        {"name": "note", "datatype": "string"},
+                    ],
+                    "primaryKey": ["a", "b"],
+                },
+            },
+            {
+                "url": "child.csv",
+                "tableSchema": {
+                    "columns": [
+                        {"name": "x", "datatype": "string"},
+                        {"name": "y", "datatype": "integer"},
+                    ],
+                    "foreignKeys": [{
+                        "columnReference": ["x", "y"],
+                        "reference": {
+                            "resource": "parent.csv",
+                            "columnReference": ["a", "b"],
+                        },
+                    }],
+                },
+            },
+        ],
+    }
+    return data, metadata
+
+
 class TestTable:
 
     @staticmethod
@@ -759,6 +801,59 @@ AF,9799379"""}
                 data['country_slice.csv'].replace('AF;AD', 'AF;AX'), encoding='utf-8')
             with pytest.raises(ValueError):
                 tg.check_referential_integrity()
+
+    def test_composite_foreign_key_from_reordered_csv(self, tmp_path):
+        # The foreign key columns appear in a different order in the child CSV (y, x) than in
+        # the declared columnReference (x, y); matching must follow the declared key order.
+        data, metadata = _composite_key_fixture("10,01\n20,02\n")
+        tg = self._make_tablegroup(tmp_path, data=data, metadata=json.dumps(metadata))
+        child = tg.tabledict['child.csv']
+        assert list(child) == [
+            collections.OrderedDict([('y', 10), ('x', '01')]),
+            collections.OrderedDict([('y', 20), ('x', '02')]),
+        ]
+        assert tg.check_referential_integrity()
+
+    def test_composite_foreign_key_normalized_by_datatype(self, tmp_path):
+        # "010" and "10" are different lexical values, but both parse to the integer 10, so the
+        # declared datatype decides that the composite key matches.
+        data, metadata = _composite_key_fixture("010,01\n")
+        tg = self._make_tablegroup(tmp_path, data=data, metadata=json.dumps(metadata))
+        assert list(tg.tabledict['child.csv'])[0]['y'] == 10
+        assert tg.check_referential_integrity()
+
+    def test_composite_foreign_key_error_reports_source_row(self, tmp_path, mocker):
+        # The first two rows match via the declared (reordered) key; only the row on CSV line 4
+        # violates the constraint. The error message pinpoints that source row.
+        data, metadata = _composite_key_fixture("10,01\n20,02\n30,03\n")
+        tg = self._make_tablegroup(tmp_path, data=data, metadata=json.dumps(metadata))
+        with pytest.raises(ValueError, match=r'child\.csv:4.*not found in table parent\.csv'):
+            tg.check_referential_integrity()
+
+        log = mocker.Mock()
+        assert not tg.check_referential_integrity(log=log)
+        msg = log.warning.call_args[0][0]
+        assert 'child.csv:4' in msg
+        assert "Key `('03', 30)`" in msg
+
+    def test_composite_foreign_key_lexical_match_without_datatype(self, tmp_path):
+        # Without a declared datatype the values stay lexical: the same cell content "10" does
+        # not match the parsed integer 10 in the referenced table.
+        data, metadata = _composite_key_fixture("10,01\n")
+        del metadata['tables'][1]['tableSchema']['columns'][1]['datatype']
+        tg = self._make_tablegroup(tmp_path, data=data, metadata=json.dumps(metadata))
+        tg.validate_schema()
+        with pytest.raises(ValueError, match=r'child\.csv:2.*not found in table parent\.csv'):
+            tg.check_referential_integrity()
+
+    def test_composite_foreign_key_rejects_mismatched_datatype(self, tmp_path):
+        # Declaring the same lexical cell content with a different base datatype on the child
+        # side (string instead of integer) makes the schema-level validation reject the key.
+        data, metadata = _composite_key_fixture("10,01\n")
+        metadata['tables'][1]['tableSchema']['columns'][1]['datatype'] = 'string'
+        tg = self._make_tablegroup(tmp_path, data=data, metadata=json.dumps(metadata))
+        with pytest.raises(ValueError, match='non-matching datatype.*y:string.*b:integer'):
+            tg.check_referential_integrity()
 
     def test_remote_schema(self, tmp_path, mocker):
         def request_get(url):

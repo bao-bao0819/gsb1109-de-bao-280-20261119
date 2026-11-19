@@ -1,6 +1,8 @@
 from __future__ import annotations
 import abc
+import functools
 import sys
+from contextvars import ContextVar
 
 from ._bits import Tibs
 from ._dtypes import DtypeTransformer
@@ -8,6 +10,7 @@ from ._bits import TibsLike
 from ._common import final, Indenter, field_parser
 from typing import Any, Sequence, TextIO
 from ._options import Options
+from ._receipt import Receipt, _ReceiptRecorder
 from lark import UnexpectedInput
 import lark
 from ._tibs import tibs_from_any, tibs_to_padded_bytes
@@ -15,6 +18,10 @@ from ._tibs import tibs_from_any, tibs_to_padded_bytes
 __all__ = ["FieldType"]
 
 fieldtype_classes: dict[str, FieldType] = {}
+
+# When a parse is being recorded (see FieldType.parse_with_receipt) this holds the recorder
+# collecting Receipt nodes, otherwise it is None and parsing proceeds as normal.
+_receipt_recorder: ContextVar[_ReceiptRecorder | None] = ContextVar("receipt_recorder", default=None)
 
 
 class FieldTypeTransformer(DtypeTransformer):
@@ -82,6 +89,27 @@ class FieldType(abc.ABC):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         fieldtype_classes[cls.__name__] = cls
+        # Wrap each subclass's _parse so that, when a receipt recorder is active, the span
+        # actually parsed is recorded. Only _parse calls that really happen are seen here, so
+        # untaken If branches never appear in the receipt.
+        original_parse = cls._parse
+
+        @functools.wraps(original_parse)
+        def _parse_recording(self, b: Tibs, startbit: int, vars_: dict[str, Any]) -> int:
+            recorder = _receipt_recorder.get()
+            if recorder is None or not recorder.enabled:
+                return original_parse(self, b, startbit, vars_)
+            node = Receipt(self, startbit)
+            recorder.open(node)
+            try:
+                used = original_parse(self, b, startbit, vars_)
+            except BaseException:
+                recorder.abort(node)
+                raise
+            recorder.close(node, used)
+            return used
+
+        cls._parse = _parse_recording
 
     @final
     def parse(self, b: TibsLike | None = None, /, **kwargs) -> int:
@@ -100,6 +128,32 @@ class FieldType(abc.ABC):
             return self._parse(b, 0, kwargs)
         except ValueError as e:
             raise ValueError(f"Error parsing field {self}: {str(e)}")
+
+    @final
+    def parse_with_receipt(self, b: TibsLike | None = None, /, **kwargs) -> Receipt:
+        """
+        Parse the field type from the supplied bits, recording where each field was read from.
+
+        Returns a :class:`Receipt` tree mirroring the fields that were actually parsed, each
+        node holding the ``start`` and ``end`` bit positions it occupied in ``b`` together with
+        the value read. Only fields that really occurred are recorded: an :class:`If` field
+        contributes just its taken branch, and a :class:`Repeat` field one child per iteration
+        that happened, so untaken branches are never given a fabricated span.
+
+        :param b: The bits to parse.
+        :return: The root :class:`Receipt` of the parse.
+        """
+        b = tibs_from_any(b) if b is not None else Tibs()
+        self.clear()
+        recorder = _ReceiptRecorder()
+        token = _receipt_recorder.set(recorder)
+        try:
+            self._parse(b, 0, kwargs)
+        except ValueError as e:
+            raise ValueError(f"Error parsing field {self}: {str(e)}")
+        finally:
+            _receipt_recorder.reset(token)
+        return recorder.roots[0]
 
     @final
     def pack(self, values: Sequence[Any] | Any, /, **kwargs) -> Tibs:

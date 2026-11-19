@@ -121,7 +121,7 @@ class If(FieldType):
     @override
     def _get_value(self) -> Any:
         if self.condition_value is None:
-            raise ValueError("Cannot get value of If field before parsing or unpacking it.")
+            return None
         if self.condition_value:
             return self.then_._get_value()
         else:

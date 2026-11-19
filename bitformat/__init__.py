@@ -35,6 +35,7 @@ from ._bits import Tibs, Mutibs, TibsLike
 from ._array import Array
 from ._dtypes import Register, Dtype, DtypeSingle, DtypeArray, DtypeTuple
 from ._fieldtype import FieldType
+from ._receipt import Receipt
 from ._field import Field
 from ._format import Format
 from ._if import If
@@ -49,7 +50,7 @@ from ._dtype_definitions import dtype_definitions as _dtype_definitions
 
 
 __all__ = ["Tibs", "Mutibs", "TibsLike", "Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "Format", "FieldType", "Field", "Array", "Expression",
-           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind"]
+           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind", "Receipt"]
 
 
 def _init():

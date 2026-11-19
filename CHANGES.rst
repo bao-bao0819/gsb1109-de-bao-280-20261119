@@ -1,6 +1,17 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- Added the ``ref`` column to the ``entries``, ``transactions``, and
+  ``postings`` tables. The column exposes a stable reference derived
+  from the external voucher number of a transaction, stored in the
+  ``document`` transaction metadata. Postings are referenced as
+  ``<voucher>#<n>`` where ``<n>`` is the 1-based position of the
+  posting within the transaction. Unlike the ``filename`` and
+  ``lineno`` columns, the reference does not change when the ledger
+  is reordered. The column is ``NULL`` when a transaction has no
+  external voucher number or when the voucher number is not unique;
+  duplicated voucher numbers are also reported as loading errors.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

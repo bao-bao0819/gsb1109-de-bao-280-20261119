@@ -41,12 +41,81 @@ hashable.register(data.Transaction, lambda t: (t.date, t.flag, t.narration))
 _TABLES = []
 
 
+# Name of the transaction metadata key carrying the external voucher
+# number used to establish stable references.
+VOUCHER_METADATA_KEY = 'document'
+
+
+class StableReferenceError(typing.NamedTuple):
+    """Error reported when a stable reference cannot be established."""
+    meta: dict
+    message: str
+    entry: data.Transaction
+
+
+def _build_stable_refs(entries):
+    """Compute stable references for transactions.
+
+    Returns a tuple ``(refs, errors)`` where ``refs`` maps
+    ``id(entry)`` to the external voucher number of the transaction,
+    or to None for transactions whose voucher number is not unique and
+    can therefore not be used to establish a stable reference, and
+    ``errors`` contains one error for each transaction carrying a
+    duplicated voucher number.
+    """
+    refs = {}
+    errors = []
+    if entries is None:
+        return refs, errors
+    vouchers = {}
+    for entry in entries:
+        if isinstance(entry, data.Transaction):
+            voucher = entry.meta.get(VOUCHER_METADATA_KEY)
+            if voucher is None or voucher == '':
+                continue
+            vouchers.setdefault(str(voucher), []).append(entry)
+    for voucher, matches in vouchers.items():
+        if len(matches) == 1:
+            refs[id(matches[0])] = voucher
+        else:
+            for entry in matches:
+                refs[id(entry)] = None
+                errors.append(StableReferenceError(
+                    entry.meta,
+                    f'cannot establish stable reference: duplicate external voucher number "{voucher}"',
+                    entry))
+    return refs, errors
+
+
+class StableRefColumn(query_compile.EvalColumn):
+    """The stable reference of an entry, or None when it cannot be established."""
+
+    def __init__(self, refs):
+        super().__init__(str)
+        self.refs = refs
+
+    def __call__(self, entry):
+        if not isinstance(entry, data.Transaction):
+            return None
+        return self.refs.get(id(entry))
+
+
 def attach(context, dsn, *, entries=None, errors=None, options=None):
     filename = urlparse(dsn).path
     if filename:
         entries, errors, options = loader.load_file(filename)
+    reported = set()
     for table in _TABLES:
-        context.tables[table.name] = table(entries, options)
+        instance = table(entries, options)
+        context.tables[table.name] = instance
+        # Report problems preventing stable references to be
+        # established. The same problems are detected by each table
+        # computing them, thus deduplicate them.
+        for error in getattr(instance, 'refs_errors', ()):
+            key = (error.message, id(error.entry))
+            if key not in reported:
+                reported.add(key)
+                context.errors.append(error)
     context.options.update(options)
     context.errors.extend(errors)
     # Set the default table. This eventually will have to be removed.
@@ -168,6 +237,13 @@ class TransactionsTable(Table):
     # definition from the Transaction class.
     columns = Transaction.columns
 
+    def __init__(self, entries, options):
+        super().__init__(entries, options)
+        self.refs, self.refs_errors = _build_stable_refs(entries)
+        columns = ColumnsRegistry(self.columns)
+        columns['ref'] = StableRefColumn(self.refs)
+        self.columns = columns
+
 
 class PricesTable(Table):
     name = 'prices'
@@ -251,6 +327,7 @@ class _BeancountTable(tables.Table):
         self.open = open
         self.close = close
         self.clear = clear
+        self.refs, self.refs_errors = _build_stable_refs(entries)
 
     def evolve(self, **kwargs):
         table = copy.copy(self)
@@ -284,6 +361,12 @@ class _BeancountTable(tables.Table):
 class EntriesTable(_BeancountTable):
     name = 'entries'
     columns = ColumnsRegistry()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        columns = ColumnsRegistry(self.columns)
+        columns['ref'] = StableRefColumn(self.refs)
+        self.columns = columns
 
     def __iter__(self):
         entries = self.prepare()
@@ -391,6 +474,12 @@ class _PostingsTableRow:
         # The current posting being evaluated.
         self.posting = None
 
+        # The 1-based index of the current posting within its transaction.
+        self.pindex = 0
+
+        # Mapping of transaction ids to stable references.
+        self.refs = None
+
     def __hash__(self):
         # The context hash is used in caching column accessor functions.
         # Instead than hashing the row context content, use the rowid as
@@ -406,11 +495,13 @@ class PostingsTable(_BeancountTable):
     def __iter__(self):
         entries = self.prepare()
         context = _PostingsTableRow()
+        context.refs = self.refs
         for entry in entries:
             if isinstance(entry, data.Transaction):
                 context.entry = entry
-                for posting in entry.postings:
+                for index, posting in enumerate(entry.postings, 1):
                     context.rowid += 1
+                    context.pindex = index
                     context.posting = posting
                     yield context
 
@@ -472,6 +563,21 @@ class PostingsTable(_BeancountTable):
         if meta is None:
             return None
         return '{:s}:{:d}:'.format(meta['filename'], meta['lineno'])
+
+    @columns.register(str)
+    def ref(context):
+        """A stable reference to the posting, composed of the external
+        voucher number of the transaction (the "document" metadata
+        key) and the 1-based position of the posting within the
+        transaction, separated by a "#". Unlike the filename and
+        lineno columns, the reference does not change when the ledger
+        is reordered. NULL when the transaction has no external
+        voucher number or when the voucher number is not unique."""
+        refs = context.refs
+        voucher = refs.get(id(context.entry)) if refs is not None else None
+        if voucher is None:
+            return None
+        return '{:s}#{:d}'.format(voucher, context.pindex)
 
     @columns.register(str)
     def flag(context):

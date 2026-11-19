@@ -1,0 +1,33 @@
+{
+    "@context": [
+        "http://www.w3.org/ns/csvw",
+        {
+            "@language": "zh"
+        }
+    ],
+    "tables": [
+        {
+            "url": "zh-titles.csv",
+            "tableSchema": {
+                "columns": [
+                    {
+                        "name": "latitude",
+                        "titles": {
+                            "zh": "纬度",
+                            "en": "Lat"
+                        },
+                        "datatype": "number"
+                    },
+                    {
+                        "name": "longitude",
+                        "titles": {
+                            "zh": "经度",
+                            "en": "Lat"
+                        },
+                        "datatype": "number"
+                    }
+                ]
+            }
+        }
+    ]
+}

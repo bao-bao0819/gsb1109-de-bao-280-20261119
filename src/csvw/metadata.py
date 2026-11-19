@@ -41,7 +41,7 @@ DEFAULT = object()
 
 __all__ = [
     'TableGroup', 'Table', 'Column', 'ForeignKey', 'Link', 'NaturalLanguage', 'Datatype',
-    'is_url', 'CSVW',
+    'AmbiguousColumnError', 'is_url', 'CSVW',
 ]
 
 is_url = utils.is_url
@@ -58,6 +58,26 @@ class Invalid:  # pylint: disable=R0903,C0115:
 
 
 INVALID = Invalid()
+
+
+class AmbiguousColumnError(ValueError):
+    """
+    Raised when a column header cannot be resolved to a single column description.
+
+    This happens if the header text matches titles of more than one column, and the available
+    information - in particular the selected language - is not sufficient to disambiguate.
+    Such a conflict should be reported back to the metadata provider, so that the metadata can
+    be fixed (e.g. by using distinct titles, or by assigning the titles to the correct languages).
+    """
+
+    def __init__(self, header: str, columns: list['Column'], message: str = None):
+        self.header = header
+        self.columns = columns
+        super().__init__(message or (
+            f'Ambiguous column header "{header}" matches multiple columns: '
+            f'{[str(c) for c in columns]}. Please have the metadata provider disambiguate '
+            f'the column titles (e.g. by language or distinct titles).'
+        ))
 
 
 @dataclasses.dataclass
@@ -148,6 +168,30 @@ class Link:
                 return self.string
             return (base if base.is_dir() else base.parent) / self.string
         return urljoin(base, self.string)
+
+
+_LANG_EXACT = 0  # the requested language
+_LANG_PREFIX = 1  # same primary language subtag, e.g. 'zh' for 'zh-Hans'
+_LANG_NEUTRAL = 2  # language-neutral, i.e. 'und'
+_LANG_OTHER = 3  # an unrelated language
+
+
+def _language_match_quality(tag: Optional[str], lang: Optional[str]) -> int:
+    """
+    Rank the match quality of a title's language tag against the selected language.
+
+    The lower the value, the better the match. With no selected language, all tags compare equal.
+    """
+    if not lang or lang == 'und':
+        return _LANG_NEUTRAL
+    tag = tag or 'und'
+    if tag == 'und':
+        return _LANG_NEUTRAL
+    if tag.lower() == lang.lower():
+        return _LANG_EXACT
+    if tag.split('-')[0].lower() == lang.split('-')[0].lower():
+        return _LANG_PREFIX
+    return _LANG_OTHER
 
 
 class NaturalLanguage(collections.OrderedDict):
@@ -467,6 +511,31 @@ class Description(DescriptionBase):  # pylint: disable=R0902
                 return self._parent.inherit_null()
         return self.null
 
+    def effective_lang(self) -> str:
+        """
+        The language selected for this description.
+
+        This is the first `lang` property which is not the default "und" in the description's
+        inheritance chain, falling back to the `@language` declared in an `@context`.
+        """
+        obj, seen = self, set()
+        while obj is not None and id(obj) not in seen:
+            seen.add(id(obj))
+            lang = getattr(obj, 'lang', None)
+            if lang and lang != 'und':
+                return lang
+            obj = getattr(obj, '_parent', None)
+
+        obj, seen = self, set()
+        while obj is not None and id(obj) not in seen:
+            seen.add(id(obj))
+            ctx = obj.at_props.get('context')
+            for c in (ctx if isinstance(ctx, list) else []):
+                if isinstance(c, dict) and c.get('@language'):
+                    return c['@language']
+            obj = getattr(obj, '_parent', None)
+        return 'und'
+
 
 @dataclasses.dataclass
 class Column(Description):
@@ -505,18 +574,27 @@ class Column(Description):
     def __eq__(self, other):
         return self.asdict() == other.asdict()
 
-    def has_title(self, v) -> Union[str, bool]:
+    def has_title(self, v, lang: Optional[str] = None) -> Union[str, bool]:
         """
         Check whether the name or a title of the column matches v.
 
-        If v matches a title, the associated language tag (or 'und') is returned.
+        If v matches a title, the associated language tag (or 'und') is returned. Matching a
+        title is case-sensitive. If `lang` is specified, the language tag of the best matching
+        title is returned, i.e. titles in `lang` are preferred over titles in other languages.
         """
         if self.name and self.name == v:
             return True
-        for tag, titles in (self.titles or {}).items():
-            if v in titles:
-                return tag or 'und'
-        return False
+        tags = self.title_languages(v)
+        if not tags:
+            return False
+        if lang is None:
+            return tags[0] or 'und'
+        return min(
+            (tag or 'und' for tag in tags), key=lambda t: _language_match_quality(t, lang))
+
+    def title_languages(self, v) -> list[Optional[str]]:
+        """Return the language tags of all titles matching v (None for language-neutral titles)."""
+        return [tag for tag, titles in (self.titles or {}).items() if v in titles]
 
     @property
     def header(self) -> str:  # pylint: disable=missing-function-docstring
@@ -712,17 +790,66 @@ class Schema(Description):
         """A table's columns mapped by header, i.e. normalized name."""
         return {c.header: c for c in self.columns}
 
-    def get_column(self, name: str, strict: bool = False) -> Optional[Column]:
-        """Resolve a Column by name, titles or propertyUrl."""
-        col = self.columndict.get(name)
-        assert (not strict) or (col and col.name), name
-        if not col:
-            for c in self.columns:
-                if c.titles and c.titles.getfirst() == name:
-                    return c
-                if c.propertyUrl and c.propertyUrl.uri == name:
-                    return c
-        return col
+    def get_column(
+            self,
+            name: str,
+            strict: bool = False,
+            lang: Optional[str] = None,
+            disambiguate: bool = True,
+    ) -> Optional[Column]:
+        """
+        Resolve a Column by name, titles or propertyUrl.
+
+        Technical column names (i.e. the `name` property) always take precedence over titles.
+        Titles are matched case-sensitively, preferring titles in `lang` (or the inherited
+        column language, if `lang` is not given) over titles in other languages. If no title
+        in the preferred language matches, a unique title in another language is used.
+
+        :param disambiguate: If `False`, no `AmbiguousColumnError` is raised. `None` is \
+        returned for ambiguous headers instead, so callers can decide how to proceed.
+        :raises AmbiguousColumnError: If the header matches titles of more than one column and \
+        neither the technical names nor the preferred language disambiguate.
+        """
+        def found(col):
+            assert (not strict) or (col and col.name), name
+            return col
+
+        col = next((c for c in self.columns if c.name and c.name == name), None)
+        if col:
+            return found(col)
+
+        # Synthetic column names for columns not specified in the metadata:
+        col = next((c for c in self.columns if not c.name and c.header == name), None)
+        if col and re.fullmatch(r'_col\.\d+', name):
+            return found(col)
+
+        by_property = [c for c in self.columns if c.propertyUrl and c.propertyUrl.uri == name]
+        if by_property:
+            if len(by_property) > 1:
+                return found(self._ambiguous(name, by_property, disambiguate))
+            return found(by_property[0])
+
+        lang = lang if lang is not None else self.effective_lang()
+        matches = []
+        for c in self.columns:
+            tags = c.title_languages(name)
+            if tags:
+                matches.append((min(_language_match_quality(tag, lang) for tag in tags), c))
+
+        if not matches:
+            return None
+
+        best = min(q for q, _ in matches)
+        candidates = [c for q, c in matches if q == best]
+        if len(candidates) > 1:
+            return found(self._ambiguous(name, candidates, disambiguate))
+        return found(candidates[0])
+
+    @staticmethod
+    def _ambiguous(name, columns, disambiguate):
+        if disambiguate:
+            raise AmbiguousColumnError(name, columns)
+        return None
 
 
 @dataclasses.dataclass
@@ -785,8 +912,16 @@ class TableLike(Description):
             self.at_props['id'] = self.base
         valid_context_property(self.at_props.get('context'))
 
-    def get_column(self, spec: str) -> Optional[Column]:  # pylint: disable=C0116
-        return self.tableSchema.get_column(spec) if self.tableSchema else None
+    def get_column(
+            self,
+            spec: str,
+            strict: bool = False,
+            lang: Optional[str] = None,
+            disambiguate: bool = True,
+    ) -> Optional[Column]:  # pylint: disable=C0116
+        return self.tableSchema.get_column(
+            spec, strict=strict, lang=lang, disambiguate=disambiguate) \
+            if self.tableSchema else None
 
     @classmethod
     def from_file(cls, fname: Union[str, pathlib.Path], data=None) -> 'TableLike':
@@ -1077,17 +1212,33 @@ class Table(TableLike):
 
         return stack.enter_context(UnicodeReaderWithLineNumber(handle, dialect=dialect))
 
-    def _validated_csv_header(self, header, strict) -> list[str]:
-        if not strict:
-            if self.tableSchema.columns and len(self.tableSchema.columns) < len(header):
-                warnings.warn('Column number mismatch')
-            for name, col in zip(header, self.tableSchema.columns):
-                res = col.has_title(name)
-                if (not col.name) and not res:
-                    warnings.warn('Incompatible table models')
-                if (isinstance(res, str) and  # noqa: W504
-                        res.split('-')[0] not in ['und', (self.lang or 'und').split('-')[0]]):
-                    warnings.warn('Incompatible column titles')
+    def _validated_csv_header(self, header, strict, lang: Optional[str] = None) -> list[str]:
+        if self.tableSchema.columns:
+            lang = lang or self.effective_lang()
+            if strict:
+                # Make sure ambiguous headers are reported even for data without rows.
+                for name in header:
+                    self.tableSchema.get_column(name, lang=lang)
+            else:
+                if len(self.tableSchema.columns) < len(header):
+                    warnings.warn('Column number mismatch')
+                for name in header:
+                    try:
+                        col = self.tableSchema.get_column(name, lang=lang)
+                    except AmbiguousColumnError as e:
+                        warnings.warn(str(e))
+                        continue
+                    if col is None:
+                        if not any(c.has_title(name) for c in self.tableSchema.columns):
+                            warnings.warn(
+                                f'Unspecified column "{name}" in table {self.local_name}')
+                        else:
+                            warnings.warn('Incompatible table models')
+                    elif col.name != name:
+                        tag = col.has_title(name, lang=lang)
+                        if isinstance(tag, str) and tag.split('-')[0] not in [
+                                'und', lang.split('-')[0]]:
+                            warnings.warn('Incompatible column titles')
         return header
 
     def _read_row(
@@ -1138,19 +1289,42 @@ class Table(TableLike):
             colnames: list[str],
             strict: bool,
             row: Iterable,
+            lang: Optional[str] = None,
     ) -> list[tuple[int, str, Column]]:
+        """
+        Match the header of a data file to the columns of the table schema.
+
+        Headers are resolved by technical column name first, then by title in the selected
+        language. If a header matches titles of multiple columns, the error is raised in strict
+        mode and the header is treated as unspecified column otherwise, after a warning has been
+        issued by `_validated_csv_header`.
+        """
         def default_col(index):
             return Column.fromvalue({'name': f'_col.{index}'})
 
-        # If columns in the data are ordered as in the spec, we can match values to
-        # columns by index, rather than looking up columns by name.
-        if (header == colnames) or \
-                (len(self.tableSchema.columns) >= len(header) and not strict):
-            # Note that virtual columns are only allowed to come **after** regular ones,
-            # so we can simply zip the whole columns list, and silently ignore surplus
-            # virtual columns.
+        lang = lang if lang is not None else self.effective_lang()
+
+        def match(name):
+            try:
+                col = self.tableSchema.get_column(name, lang=lang)
+            except AmbiguousColumnError:
+                if strict:
+                    raise
+                return name, None, True
+            return (col.header, col, False) if col else (name, None, False)
+
+        matches = [match(h) for h in header]
+        resolved = bool(header) and all(col for _, col, _ in matches) and \
+            len({id(col) for _, col, _ in matches}) == len(header)
+        ambiguous = any(amb for _, _, amb in matches)
+
+        if header == colnames:
             header_cols = list(zip(header, self.tableSchema.columns))
-        elif not strict and self.tableSchema.columns and \
+        elif resolved:
+            # Headers may be given as title and in arbitrary order, as long as they can be
+            # mapped unambiguously to the column descriptions.
+            header_cols = [(h, c) for h, c, _ in matches]
+        elif not ambiguous and not strict and self.tableSchema.columns and \
                 (len(self.tableSchema.columns) < len(header)):
             header_cols = []
             for i, cname in enumerate(header):
@@ -1158,9 +1332,14 @@ class Table(TableLike):
                     header_cols.append((cname, self.tableSchema.columns[i]))
                 except IndexError:
                     col = default_col(i + 1)
-                    header_cols.append((col.name, col))
+                    header_cols.append(match(cname)[:2] if cname else (col.name, col))
+        elif not ambiguous and not strict and len(self.tableSchema.columns) >= len(header):
+            # Note that virtual columns are only allowed to come **after** regular ones,
+            # so we can simply zip the whole columns list, and silently ignore surplus
+            # virtual columns.
+            header_cols = list(zip(header, self.tableSchema.columns))
         else:
-            header_cols = [(h, self.tableSchema.get_column(h)) for h in header]
+            header_cols = [(h, c) for h, c, _ in matches]
 
         if not header_cols:
             for i, _ in enumerate(row):
@@ -1176,6 +1355,7 @@ class Table(TableLike):
             fname=None,
             _Row: type = collections.OrderedDict,  # pylint: disable=invalid-name
             strict=True,
+            lang: Optional[str] = None,
     ) -> Generator[Union[dict[str, Any], tuple[str, int, dict[str, Any]]], None, None]:
         """Iterate over the rows of the table
 
@@ -1195,10 +1375,13 @@ class Table(TableLike):
         :param strict: Flag signaling whether data is read strictly - i.e. raising `ValueError` \
         when invalid data is encountered - or not - i.e. only issueing a warning and returning \
         invalid data as `str` as provided by the undelying DSV reader.
+        :param lang: Language tag to select column titles. Defaults to the `lang` property \
+        inherited by the table, or the `@language` of the metadata's `@context`.
         :return: A generator of dicts or triples (fname, lineno, dict) if with_metadata
         """
         dialect = self._get_dialect()
         fname = fname or self.url.resolve(self.base)
+        lang = lang or self.effective_lang()
 
         table_parse_spec = TableParseSpec.from_columns(self.tableSchema.columns)
 
@@ -1209,7 +1392,7 @@ class Table(TableLike):
             # specified in the metadata.
             if dialect.header:
                 try:
-                    header = self._validated_csv_header(next(reader)[1], strict)
+                    header = self._validated_csv_header(next(reader)[1], strict, lang=lang)
                 except StopIteration:  # pragma: no cover
                     return
             else:
@@ -1219,7 +1402,7 @@ class Table(TableLike):
             for i, (lineno, row) in enumerate(reader):
                 if i == 0:
                     header_cols = self._get_header_cols(
-                        header, table_parse_spec.colnames, strict, row)
+                        header, table_parse_spec.colnames, strict, row, lang=lang)
                     missing = table_parse_spec.requiredcols - \
                         {c.header for j, h, c in header_cols if c}
                     if missing:

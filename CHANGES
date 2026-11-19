@@ -2,6 +2,17 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Match column headers by technical name first, then by title in the selected language,
+  i.e. the inherited `lang` property or the `@language` of the metadata's `@context`
+  (and a `lang` argument passed to `Table.iterdicts`).
+- Report headers which ambiguously match titles of multiple columns as
+  `AmbiguousColumnError` in strict mode, and as warning in non-strict mode, rather than
+  arbitrarily picking the first matching column.
+
+
 Version 4.2.0
 -------------
 

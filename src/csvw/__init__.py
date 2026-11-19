@@ -4,7 +4,7 @@ csvw - https://w3c.github.io/csvw/primer/
 
 from .metadata import (
     TableGroup, Table, Column, ForeignKey, Link, NaturalLanguage, Datatype, URITemplate, CSVW,
-    Dialect)
+    Dialect, AmbiguousColumnError)
 
 from .dsv import (UnicodeWriter,
     UnicodeReader, UnicodeReaderWithLineNumber, UnicodeDictReader, NamedTupleReader,
@@ -19,7 +19,7 @@ __all__ = [
     'Dialect', 'UnicodeWriter',
     'UnicodeReader', 'UnicodeReaderWithLineNumber', 'UnicodeDictReader', 'NamedTupleReader',
     'iterrows', 'rewrite',
-    'CSVW',
+    'CSVW', 'AmbiguousColumnError',
 ]
 
 __title__ = 'csvw'

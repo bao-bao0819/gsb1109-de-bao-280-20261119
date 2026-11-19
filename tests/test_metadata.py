@@ -77,6 +77,104 @@ class TestColumnAccess:
         assert t.get_column('xyz').name is None
 
 
+class TestColumnHeaderMatching:
+    """Header columns are matched by technical name, then by title in the selected language."""
+
+    @staticmethod
+    def _table(tmp_path, header, metadata, data=None):
+        path = tmp_path / 'data.csv'
+        path.write_text(header + '\n' + (data or '1,2') + '\n', encoding='utf8')
+        t = csvw.Table.fromvalue(metadata)
+        t.url = csvw.Link(str(path))
+        return t
+
+    @staticmethod
+    def _metadata(lang=None, columns=None, context_language=None):
+        md = {
+            "@context": [
+                "http://www.w3.org/ns/csvw",
+                {"@language": context_language or "zh"},
+            ],
+            "url": "data.csv",
+            "tableSchema": {"columns": columns or [
+                {"name": "latitude", "titles": {"zh": "纬度", "en": "Lat"}, "datatype": "number"},
+                {"name": "longitude", "titles": {"zh": "经度", "en": "Lat"}, "datatype": "number"},
+            ]},
+        }
+        if lang:
+            md["lang"] = lang
+        return md
+
+    def test_title_in_selected_language(self, tmp_path):
+        t = self._table(tmp_path, '纬度,经度', self._metadata())
+        # The @language of the context selects the Chinese titles:
+        assert t.tableSchema.get_column('纬度').name == 'latitude'
+        assert t.tableSchema.get_column('经度').name == 'longitude'
+        assert list(t) == [collections.OrderedDict(latitude=1, longitude=2)]
+
+    def test_explicit_language(self, tmp_path):
+        t = self._table(tmp_path, '纬度,经度', self._metadata())
+        assert list(t.iterdicts(lang='zh'))[0]['latitude'] == 1
+        # A title in a language which was not selected is only used as a fallback:
+        with pytest.warns(UserWarning, match='Incompatible column titles'):
+            assert list(t.iterdicts(lang='en', strict=False))[0]['latitude'] == 1
+
+    def test_shared_title_requires_provider_confirmation(self, tmp_path):
+        # Both columns share the English abbreviation "Lat":
+        t = self._table(tmp_path, 'Lat,经度', self._metadata(lang='en'))
+        with pytest.raises(csvw.AmbiguousColumnError, match='Lat'):
+            t.tableSchema.get_column('Lat', lang='en')
+        # Selecting the language of unambiguous titles resolves the same header:
+        assert t.tableSchema.get_column('纬度', lang='zh').name == 'latitude'
+        assert t.tableSchema.get_column('经度', lang='zh').name == 'longitude'
+
+    def test_technical_name_always_matches(self, tmp_path):
+        t = self._table(tmp_path, 'latitude,longitude', self._metadata())
+        assert t.tableSchema.get_column('latitude').name == 'latitude'
+        assert list(t) == [collections.OrderedDict(latitude=1, longitude=2)]
+
+    def test_technical_name_beats_shared_title(self, tmp_path):
+        t = self._table(tmp_path, 'Lat,经度', self._metadata(
+            columns=[
+                {"name": "Lat", "titles": {"zh": "纬度", "en": "Lat"}, "datatype": "number"},
+                {"name": "longitude", "titles": {"zh": "经度", "en": "Lat"}, "datatype": "number"},
+            ]))
+        # Even though "Lat" is a title of both columns, it is the technical name of the first:
+        assert t.tableSchema.get_column('Lat').name == 'Lat'
+        assert list(t)[0]['Lat'] == 1
+
+    def test_ambiguous_title_requires_provider_confirmation(self, tmp_path):
+        t = self._table(tmp_path, 'Lat,经度', self._metadata())
+        with pytest.raises(csvw.AmbiguousColumnError, match='Lat'):
+            t.tableSchema.get_column('Lat')
+        with pytest.raises(csvw.AmbiguousColumnError, match='disambiguate'):
+            list(t)
+        # In non-strict mode, the conflict is reported and the header remains unspecified:
+        with pytest.warns(UserWarning, match='Ambiguous column header'):
+            rows = list(t.iterdicts(strict=False))
+        assert rows[0]['Lat'] == '1'
+        assert rows[0]['longitude'] == 2
+
+    def test_fixture(self):
+        tg = csvw.TableGroup.from_file(FIXTURES / 'zh-titles-metadata.json')
+        table = tg.tables[0]
+        assert table.effective_lang() == 'zh'
+        assert table.get_column('纬度').name == 'latitude'
+        assert table.get_column('经度').name == 'longitude'
+        with pytest.raises(csvw.AmbiguousColumnError):
+            table.get_column('Lat')
+        assert list(table)[0] == collections.OrderedDict(latitude=52.5, longitude=13.4)
+
+    def test_fixture_ambiguity_is_a_validation_error(self, tmp_path):
+        shutil.copy(FIXTURES / 'zh-titles-metadata.json', tmp_path)
+        (tmp_path / 'zh-titles.csv').write_text('Lat,经度\n52.5,13.4\n', encoding='utf8')
+        ds = csvw.CSVW(str(tmp_path / 'zh-titles-metadata.json'), validate=True)
+        assert not ds.is_valid
+        assert 'Ambiguous column header "Lat"' in str(ds.warnings[0].message)
+        # In standard mode, the API does not guess the column:
+        assert ds.to_json(minimal=True)[0]['longitude'] == 13.4
+
+
 class TestDialect:
 
     @staticmethod

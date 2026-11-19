@@ -197,6 +197,18 @@ probably never will) implement the full extent of this spec.
   re-ordered without invalidating the metadata. A stricter matching can be forced
   by specifying `"header": false` and `"skipRows": 1` in the table's dialect
   description.
+- Technical column names (`name`) always match, even if the same string is also
+  used as title of another column.
+- Column titles are matched case-sensitively. If a header matches titles of more
+  than one column, titles in the selected language - i.e. the inherited `lang`
+  property or the `@language` of the metadata's `@context` - take precedence.
+  The language can also be selected explicitly when reading the data, passing
+  `lang="..."` to `Table.iterdicts`.
+- If a header still matches titles of multiple columns in equally good languages,
+  `Schema.get_column` raises an `AmbiguousColumnError` in strict mode, so that the
+  conflict can be reported back to the metadata provider. In non-strict mode a
+  warning is issued and the column remains unspecified rather than being mapped
+  arbitrarily. This is also surfaced by `CSVW.is_valid`.
 
 However, `csvw.CSVW` works correctly for
 - 269 out of 270 [JSON tests](https://w3c.github.io/csvw/tests/#manifest-json),

@@ -216,6 +216,11 @@ class Adapter(Importer):
     def name(self):
         return self.importer.name()
 
+    @property
+    def receipt(self):
+        """Unresolved date cells reported by the adapted importer, if any."""
+        return getattr(self.importer, "receipt", None)
+
     def identify(self, filepath):
         return self.importer.identify(cache.get_file(filepath))
 

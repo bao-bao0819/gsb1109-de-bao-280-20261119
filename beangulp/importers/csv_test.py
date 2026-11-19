@@ -7,6 +7,7 @@ import unittest
 import warnings
 
 from pprint import pformat
+import datetime
 from beancount.core import data
 from beancount.parser import cmptest
 from beancount.utils import test_utils
@@ -611,6 +612,102 @@ class TestCSVImporter(cmptest.TestCase):
                 """,
                     entries,
                 )
+
+    @test_utils.docfile
+    def test_period_crosses_year_boundary(self, filename):
+        """\
+          Date,Description,Amount
+          12/31,End of year,1
+          01/05,Start of year,2
+        """
+        importer = csv.CSVImporter(
+            {Col.DATE: "Date", Col.NARRATION: "Description", Col.AMOUNT: "Amount"},
+            "Assets:Bank",
+            "EUR",
+            [],
+            period=("2023-12-15", "2024-01-15"),
+        )
+        entries = importer.extract(filename)
+        self.assertEqualEntries(
+            r"""
+          2023-12-31 * "End of year"
+            Assets:Bank  1 EUR
+
+          2024-01-05 * "Start of year"
+            Assets:Bank  2 EUR
+        """,
+            entries,
+        )
+        self.assertEqual([], importer.receipt)
+        self.assertEqual(datetime.date(2024, 1, 5), importer.date(filename))
+
+    @test_utils.docfile
+    def test_period_reports_out_of_period_date(self, filename):
+        """\
+          Date,Description,Amount
+          12/31,Out of period,1
+          01/05,In period,2
+        """
+        importer = csv.CSVImporter(
+            {Col.DATE: "Date", Col.NARRATION: "Description", Col.AMOUNT: "Amount"},
+            "Assets:Bank",
+            "EUR",
+            [],
+            period=("2024-01-01", "2024-01-31"),
+        )
+        entries = importer.extract(filename)
+        self.assertEqualEntries(
+            r"""
+          2024-01-05 * "In period"
+            Assets:Bank  2 EUR
+        """,
+            entries,
+        )
+        self.assertEqual(1, len(importer.receipt))
+        problem = importer.receipt[0]
+        self.assertEqual("12/31", problem.value)
+        self.assertEqual("12/31", problem.as_dict()["value"])
+        self.assertEqual(filename, problem.filename)
+        self.assertIn("[DATE]", str(problem))
+
+    @test_utils.docfile
+    def test_period_reports_ambiguous_date(self, filename):
+        """\
+          Date,Description,Amount
+          12/31,Ambiguous,1
+        """
+        importer = csv.CSVImporter(
+            {Col.DATE: "Date", Col.NARRATION: "Description", Col.AMOUNT: "Amount"},
+            "Assets:Bank",
+            "EUR",
+            [],
+            period=("2023-01-01", "2025-01-31"),
+        )
+        entries = importer.extract(filename)
+        self.assertEqual([], entries)
+        self.assertEqual(1, len(importer.receipt))
+        problem = importer.receipt[0]
+        self.assertEqual("12/31", problem.value)
+        self.assertEqual(
+            [datetime.date(2023, 12, 31), datetime.date(2024, 12, 31)],
+            problem.candidates,
+        )
+
+    @test_utils.docfile
+    def test_explicit_year_is_not_overridden_by_period(self, filename):
+        """\
+          Date,Description,Amount
+          2019-12-31,Explicit,1
+        """
+        importer = csv.CSVImporter(
+            {Col.DATE: "Date", Col.NARRATION: "Description", Col.AMOUNT: "Amount"},
+            "Assets:Bank",
+            "EUR",
+            [],
+            period=("2023-12-15", "2024-01-15"),
+        )
+        entries = importer.extract(filename)
+        self.assertEqual(datetime.date(2019, 12, 31), entries[0].date)
 
 
 # TODO: Test things out with/without payee and with/without narration.

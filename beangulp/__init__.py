@@ -112,6 +112,16 @@ def _extract(
             entries = extract.extract_from_file(importer, filename, existing_entries)
             account = importer.account(filename)
 
+            # Report date cells that could not be assigned a year. The
+            # rows are skipped by the importer and the original cell
+            # values are listed here instead of being guessed.
+            receipt = getattr(importer, "receipt", None)
+            if receipt:
+                log("")
+                log("  Unresolved dates (rows skipped):", fg="yellow")
+                for problem in receipt:
+                    log(f"    {problem}", fg="yellow")
+
             extracted.append((filename, entries, account, importer))
             log(" OK", fg="green")
 

@@ -215,6 +215,7 @@ class _CSVImporterBase:
         narration_sep: str = "; ",
         encoding: Optional[str] = None,
         invert_sign: Optional[bool] = False,
+        period=None,
         **kwds,
     ):
         """Constructor.
@@ -237,8 +238,15 @@ class _CSVImporterBase:
             narration fields of a source field.
           encoding: Encoding for the file, utf-8 if not specified or None.
           invert_sign: If true, invert the amount's sign unconditionally.
+          period: Statement period used to assign a year to dates that only
+            contain a month and a day. Accepts a date_utils.Period, a
+            (start, end) pair, a dict with start and end keys, or a callable
+            taking the file path and returning one of those. The
+            statement_period and date_window keyword arguments are
+            accepted as aliases.
           **kwds: Extra keyword arguments to provide to the base mixins.
         """
+        period = date_utils.pop_period_alias(kwds) or period
         assert isinstance(config, dict), "Invalid type: {}".format(config)
         self.config = config
 
@@ -253,7 +261,39 @@ class _CSVImporterBase:
         self.encoding = encoding or "utf-8"
         self.invert_sign = invert_sign
         self.categorizer = categorizer
+        self.period = period
+        self.receipt = date_utils.Receipt()
         super().__init__(**kwds)
+
+    def _period(self, file):
+        """Return the effective statement period for an input file."""
+        period = self.period
+        if callable(period):
+            period = period(file.name)
+        return date_utils.as_period(period)
+
+    def _parse_date(self, value, file, lineno=None, column=None):
+        """Parse a date cell, recording unresolvable values in the receipt.
+
+        Rows with dates that cannot be resolved are reported instead of
+        being assigned an arbitrary year. The caller must skip the row
+        when None is returned.
+
+        """
+        try:
+            return date_utils.parse_date(
+                value, self.dateutil_kwds, self._period(file)
+            )
+        except date_utils.DateResolutionError as error:
+            self.receipt.append(
+                date_utils.DateProblem.from_error(
+                    error,
+                    filename=file.name,
+                    line=lineno,
+                    column=column or Col.DATE.value,
+                )
+            )
+            return None
 
     def file_date(self, file):
         "Get the maximum date from the file."
@@ -277,13 +317,16 @@ class _CSVImporterBase:
                     if row[0].startswith("#"):
                         continue
                     date_str = row[iconfig[Col.DATE]]
-                    date = date_utils.parse_date(date_str, self.dateutil_kwds)
+                    date = self._parse_date(date_str, file)
+                    if date is None:
+                        continue
                     if max_date is None or date > max_date:
                         max_date = date
                 return max_date
 
     def _do_extract(self, file, account, existing_entries=None):
         entries = []
+        self.receipt = date_utils.Receipt()
 
         # Normalize the configuration to fetch by index.
         iconfig, has_header = normalize_config(
@@ -311,7 +354,7 @@ class _CSVImporterBase:
                     return None
 
             # Parse all the transactions.
-            first_row = last_row = None
+            line_offset = self.skip_lines + (1 if has_header else 0)
             for index, row in enumerate(reader, 1):
                 if not row:
                     continue
@@ -322,12 +365,17 @@ class _CSVImporterBase:
                 if self.debug:
                     print(row)
 
-                if first_row is None:
-                    first_row = row
-                last_row = row
+                # Resolve the transaction date before any other field is
+                # considered. Rows whose date cannot be assigned a year
+                # unambiguously are reported and skipped rather than being
+                # given an arbitrary year.
+                lineno = line_offset + index
+                date_str = get(row, Col.DATE)
+                date = self._parse_date(date_str, file, lineno)
+                if date is None:
+                    continue
 
                 # Extract the data we need from the row, based on the configuration.
-                date = get(row, Col.DATE)
                 txn_date = get(row, Col.TXN_DATE)
                 txn_time = get(row, Col.TXN_TIME)
 
@@ -359,9 +407,14 @@ class _CSVImporterBase:
                 currency = get(row, Col.CURRENCY) or self.currency
 
                 # Create a transaction
-                meta = data.new_metadata(file.name, index)
+                meta = data.new_metadata(file.name, lineno)
                 if txn_date is not None:
-                    meta["date"] = date_utils.parse_date(txn_date, self.dateutil_kwds)
+                    txn_date = self._parse_date(
+                        txn_date, file, lineno, column=Col.TXN_DATE.value
+                    )
+                    if txn_date is None:
+                        continue
+                    meta["date"] = txn_date
                 if txn_time is not None:
                     meta["time"] = str(dateutil.parser.parse(txn_time).time())
                 if balance is not None:
@@ -369,7 +422,6 @@ class _CSVImporterBase:
                 if last4:
                     last4_friendly = self.last4_map.get(last4.strip())
                     meta["card"] = last4_friendly if last4_friendly else last4
-                date = date_utils.parse_date(date, self.dateutil_kwds)
                 txn = data.Transaction(
                     meta, date, self.FLAG, payee, narration, tags, links, []
                 )
@@ -400,13 +452,14 @@ class _CSVImporterBase:
                 entries.append(txn)
 
         # Figure out if the file is in ascending or descending order.
-        first_date = date_utils.parse_date(get(first_row, Col.DATE), self.dateutil_kwds)
-        last_date = date_utils.parse_date(get(last_row, Col.DATE), self.dateutil_kwds)
-        is_ascending = first_date < last_date
+        if entries:
+            first_date = entries[0].date
+            last_date = entries[-1].date
+            is_ascending = first_date < last_date
 
-        # Reverse the list if the file is in descending order
-        if not is_ascending:
-            entries = list(reversed(entries))
+            # Reverse the list if the file is in descending order
+            if not is_ascending:
+                entries = list(reversed(entries))
 
         # Add a balance entry if possible. If more than one currency
         # can appear in the input, add one balance statement for each.
@@ -476,6 +529,7 @@ class Importer(_CSVImporterBase, identifier.IdentifyMixin, filing.FilingMixin):
         narration_sep: str = "; ",
         encoding: Optional[str] = None,
         invert_sign: Optional[bool] = False,
+        period=None,
         **kwds,
     ):
         warnings.warn(
@@ -502,6 +556,7 @@ class Importer(_CSVImporterBase, identifier.IdentifyMixin, filing.FilingMixin):
             narration_sep=narration_sep,
             encoding=encoding,
             invert_sign=invert_sign,
+            period=period,
             **kwds,
         )
 
@@ -535,9 +590,12 @@ class CSVImporter(importer.Importer):
         narration_sep: str = "; ",
         encoding: Optional[str] = None,
         invert_sign: Optional[bool] = False,
+        period=None,
         **kwds,
     ):
         """See _CSVImporterBase."""
+
+        period = date_utils.pop_period_alias(kwds) or period
 
         self.base = _CSVImporterBase(
             config,
@@ -554,6 +612,7 @@ class CSVImporter(importer.Importer):
             narration_sep,
             encoding,
             invert_sign,
+            period=period,
         )
 
         filing_kwds = prepare_for_filing(account, kwds.get("prefix", None), institution)
@@ -561,6 +620,11 @@ class CSVImporter(importer.Importer):
 
         ident_kwds = prepare_for_identifier(regexps, kwds.get("matchers"))
         self.ident = identifier.IdentifyMixin(**ident_kwds)
+
+    @property
+    def receipt(self):
+        """Unresolved date cells reported by the last extract() call."""
+        return self.base.receipt
 
     def identify(self, filepath):
         return self.ident.identify(cache.get_file(filepath))

@@ -10,6 +10,7 @@ from itertools import islice, tee
 from beancount.core import data
 
 import beangulp
+from beangulp import date_utils
 
 EMPTY = frozenset()
 
@@ -77,7 +78,7 @@ class Column:
         names = ", ".join(repr(i) for i in self.names)
         return f"{self.__class__.__module__}.{self.__class__.__name__}({names})"
 
-    def getter(self, names):
+    def getter(self, names, period=None):
         """Generate an attribute accessor for the column specification.
 
         The returned function is a getitem-like function that takes a
@@ -88,6 +89,8 @@ class Column:
 
         Args:
           names: A dict mapping column names to column indices.
+          period: Optional default statement period for columns that
+            need one (see Date).
 
         Returns:
           An accessor function.
@@ -141,19 +144,53 @@ class Date(Column):
     provided format specification. The format specification is the
     same understood by datetime.datetime.strptime().
 
+    When the format does not contain a year, a statement period can be
+    provided to assign one. The year is only assigned when exactly one
+    year within the period matches the month and day. Otherwise a
+    DateResolutionError is raised, whose original cell value can be
+    collected in an import receipt.
+
     Args:
       name: Column name or index.
       frmt: Date format specification.
       default: Value to return if the field is empty, if specified.
+      period: A date_utils.Period instance, a (start, end) pair, a
+        dict with start and end keys, or a callable returning one of
+        those. When omitted, the reader or importer period is used.
+        A callable is resolved by the reader, with the input file path.
 
     """
 
-    def __init__(self, name, frmt="%Y-%m-%d", default=NA):
+    def __init__(self, name, frmt="%Y-%m-%d", default=NA, period=None):
         super().__init__(name, default=default)
         self.frmt = frmt
+        self.period = period
+
+    def getter(self, names, period=None):
+        idx = _resolve(self.names[0], names)
+        if self.period is not None and not callable(self.period):
+            effective_period = self.period
+        else:
+            effective_period = period
+        effective_period = date_utils.as_period(effective_period)
+
+        def func(obj):
+            value = obj[idx]
+            if self.default is not NA and not value:
+                return self.default
+            # A subclass overriding parse() takes full control of parsing.
+            if type(self).parse is not Date.parse or effective_period is None:
+                return self.parse(value)
+            return self.parse_with_period(value, effective_period)
+
+        return func
 
     def parse(self, value):
         return datetime.datetime.strptime(value.strip(), self.frmt).date()
+
+    def parse_with_period(self, value, period):
+        """Parse a date, using a period to assign a year if needed."""
+        return date_utils.parse_date_format(value, self.frmt, period)
 
 
 class Amount(Column):
@@ -266,17 +303,52 @@ class CSVReader(metaclass=CSVMeta):
     """Comment character."""
     order = None
     """Order of entries in the CSV file. If None the order will be inferred from the file content."""
+    period = None
+    """Statement period used to assign a year to year-less dates.
+
+    Accepts a date_utils.Period, a (start, end) pair, a dict with
+    start and end keys, or a callable taking the input file path and
+    returning one of those. May alternatively be supplied with the
+    statement_period or date_window keyword argument to Importer().
+    """
 
     # This is populated by the CSVMeta metaclass.
     columns = {}
 
-    def __init__(self):
+    def __init__(self, **kwds):
+        period = kwds.pop("period", None)
+        period = date_utils.pop_period_alias(kwds) or period
+        if kwds:
+            unexpected = ", ".join(sorted(kwds))
+            raise TypeError(f"Unexpected keyword arguments: {unexpected}")
+        if period is not None:
+            self.period = (
+                period if callable(period) else date_utils.as_period(period)
+            )
         if hasattr(self, 'skiplines'):
             # Warn about use of deprecated class attribute, eventually.
             # warnings.warn('skiplines is deprecated, use header instead', DeprecationWarning)
             self.header = self.skiplines
+        self.receipt = date_utils.Receipt()
 
-    def read(self, filepath):
+    def _period(self, filepath, period=None):
+        """Return the effective statement period for an input file."""
+        period = self.period if period is None else period
+        if callable(period):
+            period = period(filepath)
+        return date_utils.as_period(period)
+
+    def _column_label(self, name):
+        """Return a human readable label for a configured column."""
+        column = self.columns.get(name)
+        if column is None:
+            return name
+        spec = column.names[0] if column.names else name
+        if isinstance(spec, int):
+            return f"column {spec}"
+        return str(spec)
+
+    def read(self, filepath, period=None):
         """Read CSV file according to class defined columns specification.
 
         Use the first rown in the data file to resolve columns
@@ -284,13 +356,20 @@ class CSVReader(metaclass=CSVMeta):
         accessors to access the data fields as defined by the class
         columns specification.
 
+        Rows whose date cannot be resolved unambiguously are skipped
+        and recorded in the receipt, together with the original cell
+        value. The receipt is available as the "receipt" attribute.
+
         Args:
           filepath: Filesystem path to the input file.
+          period: Optional statement period overriding the class one.
 
         Yields:
           Namedtuple-like objects.
 
         """
+        self.receipt = date_utils.Receipt()
+        effective_period = self._period(filepath, period)
 
         with open(filepath, encoding=self.encoding) as fd:
             # Skip header and footer lines.
@@ -314,12 +393,47 @@ class CSVReader(metaclass=CSVMeta):
             # configured columns that works similarly to a namedtuple.
             attrs = {}
             for name, column in self.columns.items():
-                attrs[name] = property(column.getter(names))
-            row = type("Row", (tuple,), attrs)
+                if isinstance(column, Date):
+                    column_period = column.period
+                    if callable(column_period):
+                        column_period = column_period(filepath)
+                    if column_period is None:
+                        column_period = effective_period
+                    attrs[name] = property(column.getter(names, column_period))
+                else:
+                    attrs[name] = property(column.getter(names))
+            row_type = type("Row", (tuple,), attrs)
+
+            # Number of the first data line. Comment lines are removed
+            # before parsing, so this can only be an approximation for
+            # files with interleaved comments.
+            lineno = int(self.header) + bool(self.names)
 
             # Return data rows.
             for x in reader:
-                yield row(x)
+                lineno += 1
+                row = row_type(x)
+                # Keep the source line number with the row so that it is
+                # preserved even when malformed rows are skipped.
+                row._lineno = lineno
+                for name, column in self.columns.items():
+                    if not isinstance(column, Date):
+                        continue
+                    try:
+                        # Force date resolution so that a bad date is
+                        # reported once, before the row is processed.
+                        getattr(row, name)
+                    except date_utils.DateResolutionError as error:
+                        problem = date_utils.DateProblem.from_error(
+                            error,
+                            filename=filepath,
+                            line=lineno,
+                            column=self._column_label(name),
+                        )
+                        self.receipt.append(problem)
+                        break
+                else:
+                    yield row
 
 
 class Importer(beangulp.Importer, CSVReader):
@@ -335,11 +449,15 @@ class Importer(beangulp.Importer, CSVReader):
       account: Importer default account.
       currency: Importer default currency.
       flag: Importer default flag for new transactions.
+      period: Statement period used to assign a year to year-less
+        dates. See CSVReader.period.
 
     """
 
-    def __init__(self, account, currency, flag="*"):
-        super().__init__()
+    def __init__(self, account, currency, flag="*", period=None, **kwds):
+        if period is not None:
+            kwds["period"] = period
+        super().__init__(**kwds)
         self.importer_account = account
         self.currency = currency
         self.flag = flag
@@ -349,7 +467,10 @@ class Importer(beangulp.Importer, CSVReader):
 
         Return the last date seen in the source file.
         """
-        return max(row.date for row in self.read(filepath) if row)
+        dates = [row.date for row in self.read(filepath) if row]
+        if not dates:
+            return None
+        return max(dates)
 
     def account(self, filepath):
         """Implement beangulp.Importer::account()"""
@@ -378,7 +499,9 @@ class Importer(beangulp.Importer, CSVReader):
         # Compute the line number of the first data line.
         offset = int(self.header) + bool(self.names) + 1
 
-        for lineno, row in enumerate(self.read(filepath), offset):
+        for row in self.read(filepath):
+            lineno = getattr(row, "_lineno", offset)
+
             # Skip empty lines.
             if not row:
                 continue

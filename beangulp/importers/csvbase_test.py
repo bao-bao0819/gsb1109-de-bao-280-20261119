@@ -6,6 +6,7 @@ import unittest
 from beancount.core import data
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
+from beangulp import date_utils
 from beangulp.importers.csvbase import (
     _chomp,
     Column,
@@ -98,6 +99,33 @@ class TestDateColumn(unittest.TestCase):
         func = column.getter(None)
         value = func(("",))
         self.assertIsNone(value)
+
+    def test_period_getter_resolves_year(self):
+        column = Date(0, "%m/%d")
+        func = column.getter(None, date_utils.Period("2023-12-15", "2024-01-15"))
+        self.assertEqual(func(("12/31",)), datetime.date(2023, 12, 31))
+        self.assertEqual(func(("01/05",)), datetime.date(2024, 1, 5))
+
+    def test_custom_parse_override_without_period(self):
+        class ShortDate(Date):
+            def parse(self, value):
+                month, day = value.split("/")
+                return datetime.date(1999, int(month), int(day))
+
+        column = ShortDate(0, "%m/%d")
+        func = column.getter(None)
+        self.assertEqual(func(("12/31",)), datetime.date(1999, 12, 31))
+
+    def test_column_period_overrides_reader_period(self):
+        column = Date(0, "%m/%d", period=("2020-12-15", "2021-01-15"))
+        func = column.getter(None, date_utils.Period("2023-12-15", "2024-01-15"))
+        self.assertEqual(func(("12/31",)), datetime.date(2020, 12, 31))
+
+    def test_wide_period_raises_ambiguous(self):
+        column = Date(0, "%m/%d")
+        func = column.getter(None, date_utils.Period("2023-01-01", "2025-01-31"))
+        with self.assertRaises(date_utils.AmbiguousDateError):
+            func(("12/31",))
 
 
 class TestColumnsColumn(unittest.TestCase):
@@ -794,6 +822,144 @@ class TestImporter(cmptest.TestCase):
         with self.assertRaisesRegex(RuntimeError, msg) as ctx:
             importer.extract(filename, [])
         self.assertIsInstance(ctx.exception.__cause__, decimal.InvalidOperation)
+
+    @docfile
+    def test_extract_period_crosses_year_boundary(self, filename):
+        """\
+        12/31, End of year, 1.00
+        01/05, Start of year, 2.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0, "%m/%d")
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+            period = ("2023-12-15", "2024-01-15")
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        self.assertEqualEntries(
+            entries,
+            """
+        2023-12-31 * "End of year"
+          Assets:CSV  1.00 EUR
+        2024-01-05 * "Start of year"
+          Assets:CSV  2.00 EUR
+        """,
+        )
+        self.assertEqual([], importer.receipt)
+
+    @docfile
+    def test_extract_period_from_callable(self, filename):
+        """\
+        12/31, End of year, 1.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0, "%m/%d")
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+            period = staticmethod(lambda path: ("2020-12-15", "2021-01-15"))
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        self.assertEqual(entries[0].date, datetime.date(2020, 12, 31))
+
+    @docfile
+    def test_extract_reports_out_of_period_date(self, filename):
+        """\
+        12/31, Out of period, 1.00
+        01/05, In period, 2.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0, "%m/%d")
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+            period = ("2024-01-01", "2024-01-31")
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        # The bad row is skipped, not silently assigned a year.
+        self.assertEqualEntries(
+            entries,
+            """
+        2024-01-05 * "In period"
+          Assets:CSV  2.00 EUR
+        """,
+        )
+        self.assertEqual(1, len(importer.receipt))
+        problem = importer.receipt[0]
+        self.assertEqual("12/31", problem.value)
+        self.assertEqual(1, problem.line)
+        self.assertEqual("column 0", problem.column)
+        self.assertEqual(filename, problem.filename)
+        self.assertIsInstance(
+            importer.receipt, date_utils.Receipt
+        )
+        self.assertIn("12/31", str(problem))
+
+    @docfile
+    def test_extract_reports_ambiguous_date(self, filename):
+        """\
+        12/31, Ambiguous, 1.00
+        01/05, Ambiguous too, 2.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0, "%m/%d")
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+            period = ("2023-01-01", "2025-01-31")
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        self.assertEqual([], entries)
+        self.assertEqual(2, len(importer.receipt))
+        self.assertEqual(["12/31", "01/05"], [p.value for p in importer.receipt])
+        self.assertEqual(
+            [2023, 2024],
+            [d.year for d in importer.receipt[0].candidates],
+        )
+
+    @docfile
+    def test_extract_without_period_keeps_explicit_years(self, filename):
+        """\
+        2021-05-17, Test, 1.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0)
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        self.assertEqual(datetime.date(2021, 5, 17), entries[0].date)
+        self.assertEqual([], importer.receipt)
+
+    @docfile
+    def test_extract_yearless_without_period_keeps_legacy_behavior(self, filename):
+        """\
+        05/17, Test, 1.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0, "%m/%d")
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        self.assertEqual(datetime.date(1900, 5, 17), entries[0].date)
+        self.assertEqual([], importer.receipt)
+
 
 
 class TestChomp(unittest.TestCase):

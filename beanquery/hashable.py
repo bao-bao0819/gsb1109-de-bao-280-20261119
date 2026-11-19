@@ -54,7 +54,9 @@ def make(columns):
         elif column.datatype is dict:
             parts.append(f'*self[{i}].keys(), *self[{i}].values()')
         elif column.datatype is set:
-            parts.append(f'*self[{i}]')
+            # A starred expression cannot be the sole element of a
+            # tuple literal, so wrap the expansion in its own tuple.
+            parts.append(f'(*self[{i}],)')
         else:
             func = REDUCERS.get(column.datatype, pickle.dumps)
             fname = f'func{i}'

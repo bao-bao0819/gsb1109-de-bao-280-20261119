@@ -23,6 +23,7 @@ from beanquery import query_compile as qc
 from beanquery import query_execute as qx
 from beanquery import tables
 from beanquery import compiler
+from beanquery import valuation
 
 
 class QueryBase(cmptest.TestCase):
@@ -1866,6 +1867,166 @@ class TestCSVTable(unittest.TestCase):
         self.assertEqual(names, ['id', 'name', 'check', 'date', 'value'])
         types = [column.dtype for column in self.conn.tables['test'].columns.values()]
         self.assertEqual(types, [int, str, bool, datetime.date, Decimal])
+
+
+class TestValuation(QueryBase):
+
+    INPUT = textwrap.dedent("""
+        2026-01-01 open Assets:A
+        2026-01-01 open Assets:B
+        2026-01-01 open Equity:Open
+
+        2026-01-01 commodity AAA
+        2026-01-01 commodity BBB
+        2026-01-01 commodity CCC
+
+        2026-01-01 *
+          Assets:A     10 AAA {100 USD}
+          Assets:A      5 BBB {20 USD}
+          Assets:B      7 CCC {50 USD}
+          Equity:Open
+
+        2026-11-19 price AAA 110 USD
+        2026-11-19 price BBB  25 USD
+    """)
+
+    def test_valuation_grouped_by_account(self):
+        # The fully priced account gets a complete subtotal while the
+        # account holding the unpriced CCC reports an empty subtotal,
+        # the missing commodity and an incomplete flag. The groups do
+        # not borrow prices from one another.
+        self.check_query(self.INPUT, """
+          SELECT account,
+                 valuation(sum(position)).total AS total,
+                 valuation(sum(position)).missing AS missing,
+                 valuation(sum(position)).complete AS complete
+          WHERE account ~ 'Assets'
+          GROUP BY account
+          ORDER BY account
+        """, [
+            ('account', str),
+            ('total', inventory.Inventory),
+            ('missing', set),
+            ('complete', bool),
+        ], [
+            ('Assets:A', I('1225 USD'), set(), True),
+            ('Assets:B', I(''), {'CCC'}, False),
+        ])
+
+    def test_valuation_whole_book_is_partial(self):
+        # A single valuation over every position keeps the priced
+        # subtotal and the single unpriced commodity.
+        self.check_query(self.INPUT, """
+          SELECT valuation(sum(position)).total AS total,
+                 valuation(sum(position)).missing AS missing,
+                 valuation(sum(position)).complete AS complete
+          WHERE account ~ 'Assets'
+        """, [
+            ('total', inventory.Inventory),
+            ('missing', set),
+            ('complete', bool),
+        ], [
+            (I('1225 USD'), {'CCC'}, False),
+        ])
+
+    def test_valuation_completes_once_price_is_available(self):
+        # Filling the missing CCC closing price removes the commodity
+        # from the missing list (7 * 60 = 420 USD) and marks the total
+        # as complete.
+        priced = self.INPUT + textwrap.dedent("""
+          2026-11-20 price CCC  60 USD
+        """)
+        self.check_query(priced, """
+          SELECT valuation(sum(position)).total AS total,
+                 valuation(sum(position)).missing AS missing,
+                 valuation(sum(position)).complete AS complete
+          WHERE account ~ 'Assets'
+        """, [
+            ('total', inventory.Inventory),
+            ('missing', set),
+            ('complete', bool),
+        ], [
+            (I('1645 USD'), set(), True),
+        ])
+
+    def test_valuation_does_not_borrow_future_prices(self):
+        # A price posted later than the valuation date must not cover
+        # the position: each date is valued on its own prices.
+        late_price = self.INPUT + textwrap.dedent("""
+          2026-12-15 price CCC  60 USD
+        """)
+        self.check_query(late_price, """
+          SELECT valuation(sum(position), 2026-11-30).missing AS missing,
+                 valuation(sum(position), 2026-11-30).complete AS complete
+          WHERE account ~ 'Assets'
+        """, [
+            ('missing', set),
+            ('complete', bool),
+        ], [
+            ({'CCC'}, False),
+        ])
+        self.check_query(late_price, """
+          SELECT valuation(sum(position), 2026-12-31).total AS total,
+                 valuation(sum(position), 2026-12-31).missing AS missing,
+                 valuation(sum(position), 2026-12-31).complete AS complete
+          WHERE account ~ 'Assets'
+        """, [
+            ('total', inventory.Inventory),
+            ('missing', set),
+            ('complete', bool),
+        ], [
+            (I('1645 USD'), set(), True),
+        ])
+
+    def test_value_function_path_is_unchanged(self):
+        # The pre-existing value() aggregate keeps returning an
+        # Inventory and is not affected by the valuation() addition.
+        curs = self.ctx.execute("""
+          SELECT value(sum(position))
+          WHERE account ~ 'Assets'
+        """)
+        self.assertIsInstance(curs.fetchone()[0], inventory.Inventory)
+
+    def test_valuation_returns_structured_type(self):
+        curs = self.ctx.execute("""
+          SELECT valuation(position) AS v
+          WHERE account ~ 'Assets'
+          LIMIT 1
+        """)
+        self.assertEqual(curs.description[0].datatype, valuation.Valuation)
+        result = curs.fetchone()[0]
+        self.assertIsInstance(result, valuation.Valuation)
+
+    def test_distinct_missing_sets(self):
+        # Two accounts share the empty missing set while the third has
+        # the unpriced CCC; DISTINCT collapses the duplicate empty sets.
+        ledger = self.INPUT + textwrap.dedent("""
+          2026-01-02 open Assets:C
+          2026-01-02 *
+            Assets:C      3 AAA {100 USD}
+            Equity:Open
+        """)
+        entries, errors, options = loader.load_string(textwrap.dedent(ledger))
+        ctx = beanquery.connect('beancount:', entries=entries, errors=errors, options=options)
+        curs = ctx.execute("""
+          SELECT DISTINCT valuation(sum(position)).missing AS missing
+          WHERE account ~ 'Assets'
+          GROUP BY account
+        """)
+        rows = curs.fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            sorted(frozenset(row[0]) for row in rows),
+            [frozenset(), frozenset({'CCC'})])
+
+    def test_having_filters_incomplete_groups(self):
+        curs = self.ctx.execute("""
+          SELECT account, valuation(sum(position)).missing AS missing
+          WHERE account ~ 'Assets'
+          GROUP BY account
+          HAVING NOT valuation(sum(position)).complete
+        """)
+        self.assertEqual(curs.fetchall(), [('Assets:B', {'CCC'})])
 
 
 class TestCSVSource(unittest.TestCase):

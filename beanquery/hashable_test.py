@@ -30,6 +30,18 @@ class TestHashable(unittest.TestCase):
         d = hash(wrap(objd))
         self.assertNotEqual(a, d)
 
+    def test_set(self):
+        # A set being the sole column must still produce valid code:
+        # a starred expression cannot be the sole element of a tuple.
+        wrap = hashable.make((Column('s', set),))
+        self.assertEqual(hash(wrap(({'a', 'b'},))), hash(wrap(({'b', 'a'},))))
+        self.assertNotEqual(hash(wrap(({'a'},))), hash(wrap(({'b'},))))
+
+    def test_set_mixed(self):
+        wrap = hashable.make((Column('i', int), Column('s', set)))
+        self.assertEqual(hash(wrap((1, {'a', 'b'}))), hash(wrap((1, {'b', 'a'}))))
+        self.assertNotEqual(hash(wrap((1, {'a'}))), hash(wrap((2, {'a'}))))
+
     def test_registered(self):
 
         @dataclasses.dataclass

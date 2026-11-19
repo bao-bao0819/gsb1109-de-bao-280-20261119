@@ -339,6 +339,50 @@ class TestInventoryRenderer(RendererTestBase):
         ])
 
 
+class TestValuationRenderer(RendererTestBase):
+
+    def render(self, values, **kwargs):
+        return super().render(query_render.valuation.Valuation, values, **kwargs)
+
+    def setUp(self):
+        super().setUp()
+        self.dcontext = display_context.DisplayContext()
+        self.dcontext.update(D('1.00'), 'USD')
+
+    def valuation(self, total='', missing=()):
+        return query_render.valuation.Valuation(I(total), set(missing))
+
+    def test_complete_valuation_renders_like_inventory(self):
+        self.assertEqual(self.render([self.valuation('1225 USD')]), [
+            '1225.00 USD',
+        ])
+
+    def test_missing_only_valuation(self):
+        self.assertEqual(self.render([self.valuation(missing=('CCC',))]), [
+            '(missing: CCC)',
+        ])
+
+    def test_subtotal_and_missing(self):
+        self.assertEqual(self.render([
+            self.valuation('1225 USD'),
+            self.valuation(missing=('CCC',)),
+            self.valuation('420 USD', ('DDD', 'EEE')),
+        ]), [
+            '1225.00 USD                    ',
+            '(missing: CCC)                 ',
+            '420.00 USD  (missing: DDD, EEE)',
+        ])
+
+    def test_missing_list_is_sorted(self):
+        renderer = query_render.ValuationRenderer(
+            query_render.RenderContext(self.dcontext))
+        value = self.valuation(missing=('ZZZ', 'AAA'))
+        renderer.update(value)
+        renderer.prepare()
+        self.assertEqual(renderer.format(value), '(missing: AAA, ZZZ)')
+
+
+
 class TestCostRenderer(RendererTestBase):
 
     def render(self, values, **kwargs):

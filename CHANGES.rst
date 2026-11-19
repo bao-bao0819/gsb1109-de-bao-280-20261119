@@ -1,6 +1,17 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- The ``valuation()`` BQL function has been added. It returns the
+  market value of a position or inventory together with the
+  commodities for which no price could be found. The result exposes
+  the valued subtotal in its ``total`` attribute, the unpriced
+  commodities in its ``missing`` attribute and a ``complete``
+  boolean, allowing valuation queries to report a partial subtotal
+  and the list of missing prices instead of silently dropping the
+  unpriced positions. Distinct groups and valuation dates only use
+  the prices relevant to them and never borrow prices from each
+  other.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

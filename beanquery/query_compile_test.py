@@ -348,6 +348,17 @@ class TestCompileSelect(CompileSelectBase):
               SELECT sum(number), balance GROUP BY balance;
             """)
 
+    def test_compile_attribute_on_aggregate(self):
+        # Accessing an attribute of an aggregate result must remain an
+        # aggregate: the structured-type getter is a static descriptor,
+        # not a column of the queried table.
+        query = self.compile("""
+          SELECT valuation(sum(position)).complete AS complete;
+        """)
+        target = query.c_targets[0]
+        self.assertEqual(target.name, 'complete')
+        self.assertTrue(compiler.is_aggregate(target.c_expr))
+
 
 class TestCompileSelectGroupBy(CompileSelectBase):
 

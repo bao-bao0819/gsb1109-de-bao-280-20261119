@@ -890,6 +890,10 @@ def _get_columns_and_aggregates(node, columns, aggregates):
         aggregates.append(node)
     elif isinstance(node, EvalColumn):
         columns.append(node)
+    elif isinstance(node, EvalGetter):
+        # The getter is a static descriptor of a structured type, not a
+        # column of the queried table: only the operand references data.
+        _get_columns_and_aggregates(node.operand, columns, aggregates)
     else:
         for child in node.childnodes():
             _get_columns_and_aggregates(child, columns, aggregates)

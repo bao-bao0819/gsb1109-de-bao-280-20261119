@@ -28,6 +28,7 @@ from beancount.core.account_types import get_account_sign, get_account_sort_key
 
 from beanquery import query_compile
 from beanquery import types
+from beanquery import valuation
 
 
 class ColumnsRegistry(dict):
@@ -515,6 +516,46 @@ def inventory_value(context, inv, date=None):
     return inv.reduce(convert.get_value, price_map, date)
 
 
+class Valuation(types.Structure):
+    """The market value of a set of positions and its price coverage."""
+    name = 'valuation'
+    columns = ColumnsRegistry()
+
+    @columns.register(inventory.Inventory)
+    def total(value):
+        """The subtotal of the positions that could be valued at market price."""
+        return value.total
+
+    @columns.register(set)
+    def missing(value):
+        """The commodities for which no market price was available."""
+        return value.missing
+
+    @columns.register(bool)
+    def complete(value):
+        """Whether every position could be valued at market price."""
+        return value.complete
+
+
+types.ALIASES[valuation.Valuation] = Valuation
+
+
+@function([position.Position], valuation.Valuation, pass_context=True, name='valuation')
+@function([position.Position, datetime.date], valuation.Valuation, pass_context=True, name='valuation')
+def position_valuation(context, pos, date=None):
+    """Value a position, reporting any missing market price."""
+    price_map = context.tables['prices'].price_map
+    return valuation.position_valuation(pos, price_map, date)
+
+
+@function([inventory.Inventory], valuation.Valuation, pass_context=True, name='valuation')
+@function([inventory.Inventory, datetime.date], valuation.Valuation, pass_context=True, name='valuation')
+def inventory_valuation(context, inv, date=None):
+    """Value an inventory, reporting any missing market price."""
+    price_map = context.tables['prices'].price_map
+    return valuation.inventory_valuation(inv, price_map, date)
+
+
 @function([str, str], Decimal, pass_context=True)
 @function([str, str, datetime.date], Decimal, pass_context=True, name='getprice')
 def getprice(context, base, quote, date=None):
@@ -837,6 +878,21 @@ class SumInventory(query_compile.EvalAggregator):
         value = self.operands[0](context)
         if value is not None:
             store[self.handle].add_inventory(value)
+
+
+@aggregator([valuation.Valuation], name='sum')
+class SumValuation(query_compile.EvalAggregator):
+    """Calculate the sum of valuations, keeping track of missing prices."""
+    def __init__(self, context, operands):
+        super().__init__(context, operands, valuation.Valuation)
+
+    def initialize(self, store):
+        store[self.handle] = valuation.Valuation()
+
+    def update(self, store, context):
+        value = self.operands[0](context)
+        if value is not None:
+            valuation.merge_valuations(store[self.handle], value)
 
 
 @aggregator([types.Any], name='first')

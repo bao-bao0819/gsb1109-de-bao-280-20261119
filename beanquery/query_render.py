@@ -16,6 +16,8 @@ from beancount.core import display_context
 from beancount.core import inventory
 from beancount.core import position
 
+from beanquery import valuation
+
 
 class Align(enum.Enum):
     LEFT = 0
@@ -436,6 +438,52 @@ class InventoryRenderer(ColumnRenderer):
             strings += [renderer.format(pos) for pos in positions[commodity]]
             strings += [''.ljust(renderer.width)] * (self.counts[commodity] - len(positions[commodity]))
         return self.listsep.join(strings)
+
+
+class ValuationRenderer(ColumnRenderer):
+    """Renderer for Valuation instances.
+
+    The valued subtotal is rendered like an inventory while the
+    commodities missing a price are listed after it, making incomplete
+    valuations visible at a glance::
+
+      1225.00 USD  (missing: CCC)
+
+    A complete valuation renders just the subtotal, exactly like an
+    inventory.
+    """
+    dtype = valuation.Valuation
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.inventory_renderer = InventoryRenderer(ctx)
+        self.sep = ctx.listsep
+        self.values = []
+
+    def update(self, value):
+        self.values.append(value)
+        self.inventory_renderer.update(value.total)
+
+    def prepare(self):
+        self.inventory_renderer.prepare()
+        self.maxwidth = max((len(self.format(value)) for value in self.values),
+                            default=0)
+        return super().prepare()
+
+    def format(self, value):
+        if value.total.is_empty():
+            text = ''
+        else:
+            rendered = self.inventory_renderer.format(value.total)
+            if isinstance(rendered, list):
+                rendered = self.sep.join(rendered)
+            # Drop the inner renderer's tabular alignment padding; the
+            # valuation cell owns its own column width.
+            text = ' '.join(rendered.split())
+        if value.missing:
+            suffix = '(missing: {})'.format(', '.join(sorted(value.missing)))
+            text = f'{text}{self.sep}{suffix}' if text else suffix
+        return text
 
 
 def render_rows(rows, renderers, ctx):

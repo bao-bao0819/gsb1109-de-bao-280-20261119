@@ -9,7 +9,7 @@ import pytest
 
 from csvw import TableGroup, Column, Table, ForeignKey
 from csvw.metadata import DATATYPES
-from csvw.db import Database
+from csvw.db import Database, SelfReferenceIntegrityError
 
 FIXTURES = pathlib.Path(__file__).parent / 'fixtures'
 
@@ -205,27 +205,195 @@ def test_foreign_keys(tg, translate):
     db._connection.close()
 
 
-def test_self_referential_foreign_keys(tg):
-    tg.tables[0].tableSchema.columns.append(Column.fromvalue({'name': 'id'}))
-    tg.tables[0].tableSchema.columns.append(Column.fromvalue({'name': 'ref'}))
-    tg.tables[0].tableSchema.primaryKey = ['id']
-    tg.tables[0].tableSchema.foreignKeys.append(
-        ForeignKey.fromdict(dict(
-            reference=dict(resource='data', columnReference=['id']),
-            columnReference=['ref']
-        )))
+def _self_referential_tg():
+    tg = TableGroup.fromvalue({'tables': [{'url': 'data', 'tableSchema': {
+        'columns': [{'name': 'id'}, {'name': 'ref'}],
+        'primaryKey': ['id'],
+        'foreignKeys': [{
+            'columnReference': ['ref'],
+            'reference': {'resource': 'data', 'columnReference': ['id']},
+        }],
+    }}]})
+    return tg
+
+
+def test_self_referential_foreign_keys():
+    tg = _self_referential_tg()
+    # Children may appear before their parents in the same file:
     db = Database(tg)
     db.write(data=[{'id': '1', 'ref': '2'}, {'id': '2', 'ref': None}])
     assert len(db.read()['data']) == 2
     db._connection.close()
 
-    db = Database(tg, drop_self_referential_fks=False)
-    with pytest.raises(sqlite3.IntegrityError):
-        db.write(data=[{'id': '1', 'ref': '2'}, {'id': '2', 'ref': None}])
+    # A missing parent is detected only once all rows have been written:
+    db = Database(tg)
+    with pytest.raises(SelfReferenceIntegrityError, match='unresolvable'):
+        db.write(data=[{'id': '1', 'ref': '2'}, {'id': '3', 'ref': None}])
+    # Nothing was committed to the in-memory db:
+    assert db.read()['data'] == []
     db._connection.close()
 
-    db = Database(tg, drop_self_referential_fks=False)
+    # Null-valued references are fine:
+    db = Database(tg)
     db.write(data=[{'id': '2', 'ref': None}, {'id': '1', 'ref': '2'}])
+    db._connection.close()
+
+    # Opting out drops both the SQL constraint and the deferred check:
+    db = Database(tg, enforce_self_referential_fks=False)
+    db.write(data=[{'id': '1', 'ref': 'missing'}])
+    db._connection.close()
+
+
+def test_self_referential_foreign_key_cycles():
+    tg = _self_referential_tg()
+    cyclic = [{'id': '1', 'ref': '2'}, {'id': '2', 'ref': '1'}]
+
+    db = Database(tg)
+    with pytest.raises(SelfReferenceIntegrityError, match='cyclic'):
+        db.write(data=cyclic)
+    db._connection.close()
+
+    # Cycles can be explicitly allowed when declared as acceptable:
+    db = Database(tg, allow_cycles=True)
+    db.write(data=cyclic)
+    assert len(db.read()['data']) == 2
+    db._connection.close()
+
+    # A self-row cycle is handled the same way:
+    db = Database(tg)
+    with pytest.raises(SelfReferenceIntegrityError, match='cyclic'):
+        db.write(data=[{'id': '1', 'ref': '1'}])
+    db._connection.close()
+    db = Database(tg, allow_cycles=True)
+    db.write(data=[{'id': '1', 'ref': '1'}])
+    db._connection.close()
+
+
+def test_self_referential_composite_key(tmp_path):
+    # Region nodes keyed by a composite of first-level fields; the parent
+    # reference repeats that composite key.
+    tg = TableGroup.fromvalue({'tables': [{'url': 'regions', 'tableSchema': {
+        'columns': [
+            {'name': 'country'}, {'name': 'code'},
+            {'name': 'parent_country'}, {'name': 'parent_code'},
+        ],
+        'primaryKey': ['country', 'code'],
+        'foreignKeys': [{
+            'columnReference': ['parent_country', 'parent_code'],
+            'reference': {
+                'resource': 'regions',
+                'columnReference': ['country', 'code'],
+            },
+        }],
+    }}]})
+    rows = [
+        # Child first, parent later in the same file:
+        {'country': 'CN', 'code': 'BJ', 'parent_country': 'CN', 'parent_code': 'CN'},
+        {'country': 'CN', 'code': 'CN', 'parent_country': None, 'parent_code': None},
+    ]
+    db = Database(tg)
+    db.write(regions=rows)
+    assert db.read()['regions'] == rows
+    db._connection.close()
+
+    # A dangling composite reference (partially null or unknown) fails the deferred check.
+    db = Database(tg)
+    with pytest.raises(SelfReferenceIntegrityError, match='unresolvable'):
+        db.write(regions=[
+            {'country': 'CN', 'code': 'BJ', 'parent_country': 'CN', 'parent_code': 'XX'},
+            {'country': 'CN', 'code': 'CN', 'parent_country': None, 'parent_code': None},
+        ])
+    db._connection.close()
+
+    # The same guarantee applies when writing to a database file: no half db is delivered.
+    fname = tmp_path / 'regions.sqlite'
+    db = Database(tg, fname=fname)
+    with pytest.raises(SelfReferenceIntegrityError):
+        db.write(regions=[
+            {'country': 'CN', 'code': 'BJ', 'parent_country': 'CN', 'parent_code': 'XX'},
+        ])
+    assert not fname.exists()
+
+
+def test_self_referential_composite_cycle():
+    # Foreign-key columns are named differently from the primary-key columns.
+    tg = TableGroup.fromvalue({'tables': [{'url': 'regions', 'tableSchema': {
+        'columns': [
+            {'name': 'country'}, {'name': 'code'},
+            {'name': 'pc'}, {'name': 'pcode'},
+        ],
+        'primaryKey': ['country', 'code'],
+        'foreignKeys': [{
+            'columnReference': ['pc', 'pcode'],
+            'reference': {
+                'resource': 'regions',
+                'columnReference': ['country', 'code'],
+            },
+        }],
+    }}]})
+    rows = [
+        {'country': 'CN', 'code': 'A', 'pc': 'CN', 'pcode': 'B'},
+        {'country': 'CN', 'code': 'B', 'pc': 'CN', 'pcode': 'A'},
+    ]
+    db = Database(tg)
+    with pytest.raises(SelfReferenceIntegrityError, match='cyclic'):
+        db.write(regions=rows)
+    db._connection.close()
+
+    db = Database(tg, allow_cycles=True)
+    db.write(regions=rows)
+    assert len(db.read()['regions']) == 2
+    db._connection.close()
+
+
+def test_failed_write_removes_database_file(tmp_path):
+    tg = _self_referential_tg()
+    fname = tmp_path / 'data.sqlite'
+    db = Database(tg, fname=fname)
+    with pytest.raises(SelfReferenceIntegrityError):
+        db.write(data=[{'id': '1', 'ref': 'missing'}])
+    assert not fname.exists()
+
+    # A later, valid write still produces a complete database file.
+    db = Database(tg, fname=fname)
+    db.write(data=[{'id': '1', 'ref': None}])
+    assert fname.exists()
+    with sqlite3.connect(str(fname)) as conn:
+        assert conn.execute('SELECT count(*) FROM data').fetchone()[0] == 1
+
+
+def test_self_referential_deep_hierarchy():
+    tg = _self_referential_tg()
+    depth = 3000
+    # Children before parents, far deeper than Python's default recursion limit would allow
+    # for a recursive cycle check.
+    rows = [{'id': str(i), 'ref': str(i + 1)} for i in range(depth)]
+    rows.append({'id': str(depth), 'ref': None})
+    db = Database(tg)
+    db.write(data=rows)
+    assert len(db.read()['data']) == depth + 1
+
+    # Closing the long chain into a cycle is still detected.
+    rows[-1] = {'id': str(depth), 'ref': '0'}
+    db = Database(tg)
+    with pytest.raises(SelfReferenceIntegrityError, match='cyclic'):
+        db.write(data=rows)
+    db._connection.close()
+
+
+def test_self_referential_sql_constraint_is_deferred():
+    tg = _self_referential_tg()
+    db = Database(tg)
+    db.write(data=[{'id': '1', 'ref': '2'}, {'id': '2', 'ref': None}])
+    conn = db.connection()
+    # A dangling reference is accepted within the transaction ...
+    conn.execute('BEGIN')
+    conn.execute("INSERT INTO data VALUES ('3', 'nope')")
+    # ... but the deferred constraint rejects it at commit time.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute('COMMIT')
+    conn.rollback()
+    assert conn.execute('SELECT count(*) FROM data').fetchone()[0] == 2
     db._connection.close()
 
 

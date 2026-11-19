@@ -46,6 +46,13 @@ def identity(s):  # pylint: disable=C0116
     return s
 
 
+class SelfReferenceIntegrityError(sqlite3.IntegrityError):
+    """
+    Raised when a self-referential foreign key cannot be resolved after all rows of a table group
+    have been written, or when the resulting references contain a cycle which was not allowed.
+    """
+
+
 @dataclasses.dataclass
 class DBType:
     """A DB datatype together with read/write converters."""
@@ -203,18 +210,22 @@ class TableSpec:
     many_to_many: collections.OrderedDict = dataclasses.field(
         default_factory=collections.OrderedDict)
     primary_key: Optional[list[str]] = None
+    self_referential: list = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_table_metadata(cls,
                             table: csvw.Table,
-                            drop_self_referential_fks: Optional[bool] = True) -> 'TableSpec':
+                            enforce_self_referential_fks: Optional[bool] = True) -> 'TableSpec':
         """
         Create a `TableSpec` from the schema description of a `csvw.metadata.Table`.
 
         :param table: `csvw.metadata.Table` instance.
-        :param drop_self_referential_fks: Flag signaling whether to drop self-referential foreign \
-        keys. This may be necessary, if the order of rows in a CSVW table does not guarantee \
-        referential integrity when inserted in order (e.g. an eralier row refering to a later one).
+        :param enforce_self_referential_fks: Flag signaling whether self-referential foreign keys \
+        are also created as SQL `FOREIGN KEY` constraints. Either way they are tracked, so that \
+        referential integrity can be checked after all rows of a table group have been written - \
+        which is necessary because rows in a CSVW table are not ordered to satisfy \
+        self-references (e.g. an earlier row may refer to a later one). Pass `False` to drop the \
+        constraints and skip the check entirely.
         :return: `TableSpec` instance.
         """
         spec = cls(name=table.local_name, primary_key=table.tableSchema.primaryKey)
@@ -236,12 +247,21 @@ class TableSpec:
                         fk.reference.resource.string,
                         fk.reference.columnReference[0],
                     )
-                elif not (drop_self_referential_fks and fk.reference.resource.string == spec.name):
-                    spec.foreign_keys.append((
+                else:
+                    constraint = (
                         list(fk.columnReference),
                         fk.reference.resource.string,
                         list(fk.reference.columnReference),
-                    ))
+                    )
+                    if fk.reference.resource.string == spec.name:
+                        # Self-referential foreign keys are always tracked, so referential
+                        # integrity can be validated after all rows have been inserted,
+                        # regardless of row order. They only become SQL constraints if requested.
+                        spec.self_referential.append(constraint)
+                        if enforce_self_referential_fks:
+                            spec.foreign_keys.append(constraint)
+                    else:
+                        spec.foreign_keys.append(constraint)
         for c in table.tableSchema.columns:
             if c.header not in spec.many_to_many:
                 datatype = c.inherit('datatype')
@@ -293,29 +313,123 @@ class TableSpec:
             fkcols = quoted(*[col_translate(c) for c in fk])
             rtable = quoted(translate(ref))
             pkcols = quoted(*[translate(ref, c) for c in refcols])
-            clauses.append(f'FOREIGN KEY({fkcols}) REFERENCES {rtable}({pkcols}) ON DELETE CASCADE')
+            # Self-referential constraints are deferred, so rows may be inserted out of order;
+            # they are checked when the write transaction is committed.
+            deferred = ' DEFERRABLE INITIALLY DEFERRED' if ref == self.name else ''
+            clauses.append(
+                f'FOREIGN KEY({fkcols}) REFERENCES {rtable}({pkcols}) ON DELETE CASCADE{deferred}')
 
         clauses = ',\n    '.join(clauses)
         return '\n'.join([
             f"CREATE TABLE IF NOT EXISTS `{translate(self.name)}` (", f"{clauses}", ")"])
 
+    def check_self_references(
+            self, db: sqlite3.Connection, translate: SchemaTranslator) -> list[tuple]:
+        """
+        Validate self-referential foreign keys against the rows already inserted.
+
+        The check runs only once all rows of the table have been inserted, so children may appear
+        before their parents in the CSVW source.
+
+        :return: A list of `(foreign_key_columns, foreign_key_values, referenced_columns)` tuples \
+        for every unresolvable, non-null reference. An empty list means all references resolve.
+        """
+        unresolved = []
+        tname = translate(self.name)
+        for fk, _, refcols in self.self_referential:
+            fkcols = [translate(self.name, c) for c in fk]
+            parent_cols = [translate(self.name, c) for c in refcols]
+            fkcol_sql = ','.join(f'child.`{c}`' for c in fkcols)
+            first_parent = parent_cols[0]
+            sql = (
+                f"SELECT {fkcol_sql} FROM `{tname}` child "
+                f"LEFT JOIN `{tname}` parent ON "
+                + ' AND '.join(f'child.`{f}` IS parent.`{r}`'
+                               for f, r in zip(fkcols, parent_cols))
+                + f" WHERE {' AND '.join(f'child.`{c}` IS NOT NULL' for c in fkcols)} "
+                f"AND parent.`{first_parent}` IS NULL")
+            for row in db.execute(sql):
+                unresolved.append((tuple(fk), tuple(row), tuple(refcols)))
+        return unresolved
+
+    def self_reference_cycles(self, db: sqlite3.Connection, translate: SchemaTranslator) -> list:
+        """
+        Detect cycles in the graph formed by self-referential foreign keys.
+
+        All references are assumed to resolve (see :meth:`check_self_references`). Rows whose
+        foreign-key columns do not all have values are treated as having no outgoing edge.
+
+        :return: A list of cycles, each represented as the list of primary-key tuples of the \
+        rows involved (with the first row repeated at the end).
+        """
+        if not self.primary_key:
+            return []
+        tname = translate(self.name)
+        pkcols = [translate(self.name, c) for c in self.primary_key]
+        edges = collections.defaultdict(list)
+        for fk, _, refcols in self.self_referential:
+            fkcols = [translate(self.name, c) for c in fk]
+            # Map each referenced PK column back to the FK column holding its value.
+            inverse = {translate(self.name, r): f
+                       for r, f in zip(refcols, fkcols)}
+            if any(c not in inverse for c in pkcols):
+                # The foreign key does not cover the whole primary key, so a reference cannot
+                # identify a single row for cycle traversal; skip it.
+                continue
+            col_sql = ','.join(f'`{c}`' for c in pkcols + fkcols)
+            for row in db.execute(f"SELECT {col_sql} FROM `{tname}`"):
+                values = tuple(row)
+                pk = values[:len(pkcols)]
+                fk_values = values[len(pkcols):]
+                if all(v is not None for v in fk_values):
+                    target = tuple(row[len(pkcols) + fkcols.index(inverse[c])] for c in pkcols)
+                    edges[pk].append(target)
+
+        # Iterative DFS coloring (0 = unvisited, 1 = on the current path, 2 = done), so deep
+        # region hierarchies do not hit Python's recursion limit.
+        cycles, color = [], {}
+        for root in list(edges):
+            if color.get(root, 0) != 0:
+                continue
+            stack = [(root, iter(edges[root]))]
+            color[root] = 1
+            path = [root]
+            while stack:
+                node, it = stack[-1]
+                advanced = False
+                for nxt in it:
+                    state = color.get(nxt, 0)
+                    if state == 0:
+                        color[nxt] = 1
+                        path.append(nxt)
+                        stack.append((nxt, iter(edges.get(nxt, []))))
+                        advanced = True
+                        break
+                    if state == 1:
+                        cycles.append(path[path.index(nxt):] + [nxt])
+                if not advanced:
+                    color[node] = 2
+                    path.pop()
+                    stack.pop()
+        return cycles
+
 
 def schema(tg: csvw.TableGroup,
-           drop_self_referential_fks: Optional[bool] = True) -> list[TableSpec]:
+           enforce_self_referential_fks: Optional[bool] = True) -> list[TableSpec]:
     """
     Convert the table and column descriptions of a `TableGroup` into specifications for the
     DB schema.
 
     :param tg: CSVW TableGroup.
-    :param drop_self_referential_fks: Flag signaling whether to drop self-referential foreign \
-    keys. This may be necessary, if the order of rows in a CSVW table does not guarantee \
-    referential integrity when inserted in order (e.g. an eralier row refering to a later one).
+    :param enforce_self_referential_fks: Flag signaling whether self-referential foreign keys are \
+    also created as SQL `FOREIGN KEY` constraints. Either way they are tracked for a deferred \
+    referential-integrity check; pass `False` to drop the constraints and skip the check.
     :return: A pair (tables, reference_tables).
     """
     tables = {}
     for table in tg.tabledict.values():
         t = TableSpec.from_table_metadata(
-            table, drop_self_referential_fks=drop_self_referential_fks)
+            table, enforce_self_referential_fks=enforce_self_referential_fks)
         tables[t.name] = t
         for at in t.many_to_many.values():
             tables[at.name] = at
@@ -346,35 +460,44 @@ class Database:
     :param tg: `TableGroup` instance defining the schema of the database.
     :param fname: Path to which to write the database file.
     :param translate: Schema object name translator.
-    :param drop_self_referential_fks: Flag signaling whether to drop or enforce self-referential \
-    foreign-key constraints.
+    :param enforce_self_referential_fks: Flag signaling whether self-referential foreign-key \
+    constraints are created as SQL constraints (and thus enforced by the database). Referential \
+    integrity of self-references is validated after all rows of all tables have been inserted \
+    either way, so out-of-order rows (e.g. an earlier row referring to a later one) do not cause \
+    spurious failures. Pass `False` to drop self-referential constraints and skip the check.
+    :param allow_cycles: Flag signaling whether cycles made up of self-referential foreign keys \
+    are accepted. If `False` (the default) such cycles are rejected even though they are valid \
+    under SQLite's deferred foreign-key semantics.
 
-    .. warning::
+    .. note::
 
         We write rows of a table to the database sequentially. Since CSVW does not require ordering
-        rows in tables such that self-referential foreign-key constraints are satisfied at each row,
-        we don't enforce self-referential foreign-keys by default in order to not trigger "false"
-        integrity errors. If data in a CSVW Table is known to be ordered appropriately, `False`
-        should be passed as `drop_self_referential_fks` keyword parameter to enforce
-        self-referential foreign-keys.
+        rows in tables such that self-referential foreign-key constraints are satisfied at each
+        row, self-referential foreign keys are checked only once all data has been written. A
+        failed check (or any other write error) rolls the whole transaction back, so no
+        half-populated database is left behind, including when writing to a file.
     """
     def __init__(
             self,
             tg: TableGroup,
             fname: Optional[Union[pathlib.Path, str]] = None,
             translate: Optional[SchemaTranslator] = None,
-            drop_self_referential_fks: Optional[bool] = True,
+            enforce_self_referential_fks: Optional[bool] = True,
+            allow_cycles: Optional[bool] = False,
     ):
         self.translate = translate or Database.name_translator
         self.fname = pathlib.Path(fname) if fname else None
-        self.init_schema(tg, drop_self_referential_fks=drop_self_referential_fks)
+        self.allow_cycles = allow_cycles
+        self.enforce_self_referential_fks = enforce_self_referential_fks
+        self.init_schema(tg, enforce_self_referential_fks=enforce_self_referential_fks)
         self._connection = None  # For in-memory dbs we need to keep the connection!
 
-    def init_schema(self, tg: TableGroup, drop_self_referential_fks: bool = True):
+    def init_schema(self, tg: TableGroup, enforce_self_referential_fks: bool = True):
         """Inititialize the db schema, possibly ignoring self-referential foreign keys."""
         self.tg = tg
         self.tables = schema(
-            self.tg, drop_self_referential_fks=drop_self_referential_fks) if self.tg else []
+            self.tg,
+            enforce_self_referential_fks=enforce_self_referential_fks) if self.tg else []
 
     @property
     def tdict(self) -> dict[str, TableSpec]:  # pylint: disable=C0116
@@ -526,9 +649,36 @@ class Database:
             rows.append(tuple(values[k] for k in keys))
         return rows, keys
 
+    def _validate_self_references(self, db: sqlite3.Connection):
+        """
+        Check all tracked self-referential foreign keys after the full table group has been
+        inserted, so the row order within a CSVW table cannot cause spurious integrity errors.
+        """
+        if not self.enforce_self_referential_fks:
+            return
+        for t in self.tables:
+            unresolved = t.check_self_references(db, self.translate)
+            if unresolved:
+                detail = '; '.join(
+                    f'{fk_cols}={values} -> {refcols}'
+                    for fk_cols, values, refcols in unresolved)
+                raise SelfReferenceIntegrityError(
+                    f'unresolvable self-referential foreign key(s) in table '
+                    f'{t.name!r}: {detail}')
+            if not self.allow_cycles:
+                cycles = t.self_reference_cycles(db, self.translate)
+                if cycles:
+                    raise SelfReferenceIntegrityError(
+                        f'cyclic self-reference(s) in table {t.name!r}: {cycles}')
+
     def write(self, *, force=False, _exists_ok=False, _skip_extra=False, **items):
         """
         Creates a db file with the core schema.
+
+        All rows are inserted in a single transaction and self-referential foreign keys are only
+        checked once every table has been written. Any failure rolls the transaction back; when
+        writing to a file the (half-populated) database file is removed as well, so a failed write
+        never leaves a usable-but-incomplete database behind.
 
         :param force: If `True` an existing db file will be overwritten.
         """
@@ -537,24 +687,35 @@ class Database:
                 raise ValueError('db file already exists, use force=True to overwrite')
             self.fname.unlink()
 
-        with self.connection() as db:
-            for table in self.tables:
-                db.execute(table.sql(translate=self.translate))
+        try:
+            with self.connection() as db:
+                for table in self.tables:
+                    db.execute(table.sql(translate=self.translate))
 
-            db.execute('PRAGMA foreign_keys = ON;')
-            db.commit()
+                db.execute('PRAGMA foreign_keys = ON;')
+                db.commit()  # Persist the (empty) schema before the data transaction.
 
-            refs = collections.defaultdict(list)  # collects rows in association tables.
-            for t in self.tables:
-                if t.name not in items:
-                    continue
-                rows, keys = self._get_rows(t, items[t.name], refs, _skip_extra)
-                insert(db, self.translate, t.name, keys, *rows)
+                # Self-referential constraints are DEFERRABLE INITIALLY DEFERRED, so out-of-order
+                # rows do not violate them until the transaction is committed.
+                db.execute('BEGIN')
+                refs = collections.defaultdict(list)  # collects rows in association tables.
+                for t in self.tables:
+                    if t.name not in items:
+                        continue
+                    rows, keys = self._get_rows(t, items[t.name], refs, _skip_extra)
+                    insert(db, self.translate, t.name, keys, *rows)
 
-            for atkey, rows in refs.items():
-                insert(db, self.translate, atkey[0], atkey[1:], *rows)
+                for atkey, rows in refs.items():
+                    insert(db, self.translate, atkey[0], atkey[1:], *rows)
 
-            db.commit()
+                self._validate_self_references(db)
+                db.commit()  # Deferred foreign-key constraints are enforced here.
+        except:
+            # The connection's context manager has already rolled back the transaction.
+            if self.fname and self.fname.exists():
+                # Never deliver a half-populated database file.
+                self.fname.unlink()
+            raise
 
 
 @dataclasses.dataclass

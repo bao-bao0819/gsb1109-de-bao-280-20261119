@@ -2,6 +2,21 @@ Changelog
 =========
 
 
+Unreleased
+----------
+
+- Self-referential foreign keys are now preserved when writing to SQLite. They are created as
+  `DEFERRABLE INITIALLY DEFERRED` constraints and additionally validated in Python only after all
+  rows of all tables have been inserted, so rows referring to later rows no longer trigger
+  spurious integrity errors. Composite (multi-column) self-references are supported as well.
+- `Database` gained an `allow_cycles` flag to accept cyclic self-references explicitly; cycles are
+  rejected by default.
+- The `drop_self_referential_fks` keyword was replaced by `enforce_self_referential_fks`
+  (default `True`). Passing `False` drops the SQL constraints and skips the deferred check.
+- A failed write now rolls back the whole transaction and removes a half-populated database file
+  instead of leaving it behind.
+
+
 Version 4.2.0
 -------------
 

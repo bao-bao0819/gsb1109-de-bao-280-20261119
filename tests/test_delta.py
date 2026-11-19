@@ -1242,6 +1242,63 @@ DELTA_IGNORE_ORDER_CASES_PARAMS = parameterize_cases(
     'test_name, t1, t2, deepdiff_kwargs, to_delta_kwargs, expected_delta_dict, expected_t1_plus_delta', DELTA_IGNORE_ORDER_CASES)
 
 
+class TestDeltaFlatRowsBidirectional:
+
+    @staticmethod
+    def _make_lists():
+        t1 = [
+            {'id': 1, 'name': 'alpha'},
+            {'id': 2, 'name': 'bravo'},
+            {'id': 3, 'name': 'charlie'},
+        ]
+        # id=1 is deleted, id=3 is moved to the front and its name is modified.
+        t2 = [
+            {'id': 3, 'name': 'CHARLIE'},
+            {'id': 2, 'name': 'bravo'},
+        ]
+        return t1, t2
+
+    def test_flat_rows_file_roundtrip_restores_original_order(self, tmp_path):
+        t1, t2 = self._make_lists()
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        flat_rows = delta.to_flat_dicts()
+
+        rows_file = tmp_path / 'flat_rows.jsonl'
+        with open(rows_file, 'w') as the_file:
+            for row in flat_rows:
+                the_file.write(json.dumps(row, default=str) + '\n')
+
+        with open(rows_file) as the_file:
+            loaded_rows = [json.loads(line) for line in the_file]
+
+        assert {'values_changed', 'iterable_item_removed'} == {row['action'] for row in loaded_rows}
+        removed_rows = [row for row in loaded_rows if row['action'] == 'iterable_item_removed']
+        assert [{'id': 3, 'name': 'charlie'}] == [row['value'] for row in removed_rows]
+
+        rebuilt = Delta(flat_dict_list=loaded_rows, bidirectional=True)
+        forward = t1 + rebuilt
+        assert t2 == forward
+        assert t1 == forward - rebuilt
+
+    def test_flat_rows_missing_old_value_refused_for_bidirectional(self):
+        t1, t2 = self._make_lists()
+        directed_delta = Delta(DeepDiff(t1, t2))
+        flat_rows = directed_delta.to_flat_dicts()
+        values_changed_rows = [row for row in flat_rows if row['action'] == 'values_changed']
+        assert values_changed_rows
+        assert all(row['old_value'] == 'unknown___' for row in values_changed_rows)
+
+        with pytest.raises(DeltaError, match='required to reverse the delta'):
+            Delta(flat_dict_list=flat_rows, bidirectional=True)
+
+    def test_flat_dict_missing_old_value_refused_for_bidirectional(self):
+        flat_dict_list = [
+            {'path': [0, 'name'], 'action': 'values_changed', 'value': 'CHARLIE'},
+        ]
+        with pytest.raises(DeltaError, match="missing the 'old_value'"):
+            Delta(flat_dict_list=flat_dict_list, bidirectional=True)
+
+
 class TestIgnoreOrderDelta:
 
     @pytest.mark.parametrize(**DELTA_IGNORE_ORDER_CASES_PARAMS)

@@ -37,6 +37,12 @@ DELTA_NUMPY_OPERATOR_OVERRIDE_MSG = (
     'and NOT ndarray + delta')
 BINIARY_MODE_NEEDED_MSG = "Please open the file in the binary mode and pass to Delta by passing 'b' in open(..., 'b'): {}"
 DELTA_AT_LEAST_ONE_ARG_NEEDED = 'At least one of the diff, delta_path or delta_file arguments need to be passed.'
+BIDIRECTIONAL_MISSING_INFO_MSG = (
+    "Unable to create the bidirectional delta. The {} at {} is missing the '{}' "
+    "which is required to reverse the delta. If this delta is built from flat_rows_list, "
+    "flat_dict_list or a delta file, make sure the old values are included, for example "
+    "by creating the original delta with bidirectional=True before exporting it."
+)
 INVALID_ACTION_WHEN_CALLING_GET_ELEM = 'invalid action of {} when calling _get_elem_and_compare_to_old_value'
 INVALID_ACTION_WHEN_CALLING_SIMPLE_SET_ELEM = 'invalid action of {} when calling _simple_set_elem_value'
 INVALID_ACTION_WHEN_CALLING_SIMPLE_DELETE_ELEM = 'invalid action of {} when calling _simple_set_elem_value'
@@ -151,6 +157,9 @@ class Delta:
             self.diff = self._from_flat_rows(copy.deepcopy(flat_rows_list))
         else:
             raise ValueError(DELTA_AT_LEAST_ONE_ARG_NEEDED)
+
+        if self.bidirectional:
+            self._validate_bidirectional_diff()
 
         self.mutate = mutate
         self.raise_errors = raise_errors
@@ -846,6 +855,28 @@ class Delta:
             # and we had to turn it into a mutable one. In such cases the object has a new id.
             self._simple_set_elem_value(obj=parent, path_for_err_reporting=path, elem=parent_to_obj_elem,
                                         value=new_obj, action=parent_to_obj_action)
+
+    def _validate_bidirectional_diff(self):
+        """
+        Make sure the diff includes everything that is needed to reverse the delta.
+        """
+        action_to_required_keys = {
+            'values_changed': ('old_value',),
+            'type_changes': ('old_type',),
+            'iterable_item_moved': ('new_path',),
+        }
+        for action, info in self.diff.items():
+            if action == '_iterable_opcodes':
+                for path, op_codes in info.items():
+                    for op_code in op_codes:
+                        if op_code.tag in {'delete', 'replace'} and op_code.old_values is None:
+                            raise DeltaError(BIDIRECTIONAL_MISSING_INFO_MSG.format(
+                                f"{op_code.tag} opcode", path, 'old_values'))
+            elif action in action_to_required_keys and isinstance(info, Mapping):
+                for path, path_info in info.items():
+                    for key in action_to_required_keys[action]:
+                        if not isinstance(path_info, Mapping) or key not in path_info:
+                            raise DeltaError(BIDIRECTIONAL_MISSING_INFO_MSG.format(action, path, key))
 
     def _get_reverse_diff(self):
         if not self.bidirectional:

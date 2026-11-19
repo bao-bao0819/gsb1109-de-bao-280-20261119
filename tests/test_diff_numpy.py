@@ -1,6 +1,8 @@
+import re
+
 import pytest
-from deepdiff import DeepDiff
-from deepdiff.helper import np
+from deepdiff import DeepDiff, Delta
+from deepdiff.helper import np, np_ndarray
 from tests import parameterize_cases
 
 """
@@ -168,9 +170,163 @@ NUMPY_CASES = {
 NUMPY_CASES_PARAMS = parameterize_cases('test_name, t1, t2, deepdiff_kwargs, expected_result', NUMPY_CASES)
 
 
+PATH_INDEXES = re.compile(r'\[(\d+)\]')
+
+
+def _path_axes(path):
+    """The axes a reported array path points at, e.g. root[1][0] -> (1, 0)."""
+    return tuple(int(index) for index in PATH_INDEXES.findall(path))
+
+
+# Same data, different shape. The diff must reopen the data along t1's axes instead of
+# flattening it, and the replay must rebuild t2 with t2's shape.
+ARRAY_SHAPE_CASES = {
+    '2x2_to_4': {
+        't1': np.array([[1, 2], [3, 4]], np.int8),
+        't2': np.array([1, 2, 3, 4], np.int8),
+        'deepdiff_kwargs': {},
+        'expected_axes': {'root[0]', 'root[1]', 'root[2]', 'root[3]'},
+        'expected_row_paths': {'root[0]', 'root[1]'},
+    },
+    '2x3_to_6': {
+        't1': np.array([[1, 2, 3], [4, 5, 6]], np.int8),
+        't2': np.array([1, 2, 3, 4, 5, 6], np.int8),
+        'deepdiff_kwargs': {},
+        'expected_axes': {'root[0]', 'root[1]', 'root[2]', 'root[3]', 'root[4]', 'root[5]'},
+        'expected_row_paths': {'root[0]', 'root[1]'},
+    },
+    '1x2x2_to_4': {
+        't1': np.array([[[1, 2], [3, 4]]], np.int8),
+        't2': np.array([1, 2, 3, 4], np.int8),
+        'deepdiff_kwargs': {},
+        'expected_axes': {'root[0]', 'root[1]', 'root[2]', 'root[3]'},
+        'expected_row_paths': {'root[0]'},
+    },
+    '2x3_to_3x2': {
+        't1': np.array([[1, 2, 3], [4, 5, 6]], np.int8),
+        't2': np.array([[1, 2], [3, 4], [5, 6]], np.int8),
+        'deepdiff_kwargs': {},
+        'expected_axes': {'root[1][0]', 'root[1][1]', 'root[2]', 'root[0][2]', 'root[1][2]'},
+        'expected_row_paths': {'root[2]'},
+        'replayable': False,
+    },
+}
+
+ARRAY_DTYPE_CASES = {
+    'int8_to_int32_same_values': {
+        't1': np.array([[1, 2], [3, 4]], np.int8),
+        't2': np.array([[1, 2], [3, 4]], np.int32),
+        'deepdiff_kwargs': {},
+    },
+    'int8_to_int32_with_value_change': {
+        't1': np.array([[1, 2], [3, 4]], np.int8),
+        't2': np.array([[1, 2], [3, 5]], np.int32),
+        'deepdiff_kwargs': {},
+    },
+}
+
+ARRAY_TRANSPOSE_CASES = {
+    'square_2x2': {
+        't1': np.array([[1, 2], [3, 4]], np.int8),
+        't2': np.array([[1, 3], [2, 4]], np.int8),
+        'deepdiff_kwargs': {},
+        'expected_axes': {'root[0][1]', 'root[1][0]'},
+    },
+    'square_3x3': {
+        't1': np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], np.int8),
+        't2': np.array([[1, 4, 7], [2, 5, 8], [3, 6, 9]], np.int8),
+        'deepdiff_kwargs': {},
+        'expected_axes': {'root[0][1]', 'root[0][2]', 'root[1][0]',
+                          'root[1][2]', 'root[2][0]', 'root[2][1]'},
+    },
+    'square_2x2_ignore_order': {
+        't1': np.array([[1, 2], [3, 4]], np.int8),
+        't2': np.array([[1, 3], [2, 4]], np.int8),
+        'deepdiff_kwargs': {'ignore_order': True, 'report_repetition': True},
+        'expected_axes': {'root[0][1]', 'root[1][0]'},
+        'replay_kwargs': {'ignore_order': True},
+    },
+    # A transposed permutation matrix has the same rows as the original, so an unordered
+    # row comparison used to return {} and silently made the axes interchangeable.
+    'permutation_3x3_ignore_order': {
+        't1': np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], np.int8),
+        't2': np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], np.int8),
+        'deepdiff_kwargs': {'ignore_order': True, 'report_repetition': True},
+        'expected_axes': {'root[0][1]', 'root[0][2]', 'root[1][0]',
+                          'root[1][2]', 'root[2][0]', 'root[2][1]'},
+        'replay_kwargs': {'ignore_order': True},
+    },
+}
+
+
+def _reported_paths(diff):
+    return {path for paths in diff.values() for path in paths}
+
+
 class TestNumpy:
 
     @pytest.mark.parametrize(**NUMPY_CASES_PARAMS)
     def test_numpy(self, test_name, t1, t2, deepdiff_kwargs, expected_result):
         diff = DeepDiff(t1, t2, **deepdiff_kwargs)
         assert expected_result == diff, f"test_numpy {test_name} failed."
+
+    @pytest.mark.parametrize('test_name', ARRAY_SHAPE_CASES, ids=ARRAY_SHAPE_CASES)
+    def test_different_shape_same_data(self, test_name):
+        case = ARRAY_SHAPE_CASES[test_name]
+        t1, t2, deepdiff_kwargs = case['t1'], case['t2'], case['deepdiff_kwargs']
+        diff = DeepDiff(t1, t2, **deepdiff_kwargs)
+
+        assert _reported_paths(diff) == case['expected_axes'], \
+            f"{test_name}: the diff does not point at the changed axes."
+        # Rows are reported where they are, not flattened into scalars at some other axis.
+        type_change_paths = set(diff.get('type_changes') or {})
+        assert type_change_paths <= case['expected_row_paths'], \
+            f"{test_name}: a row was reported outside its axis."
+
+        if not case.get('replayable', True):
+            return  # Delta cannot yet remove an axis of an existing ndarray in place.
+
+        replay = Delta(diff, bidirectional=False, raise_errors=True) + t1
+        assert isinstance(replay, np_ndarray), f"{test_name}: replay must stay a numpy array."
+        assert replay.shape == t2.shape, f"{test_name}: replay has the wrong shape."
+        assert np.array_equal(replay, t2), f"{test_name}: replay did not reproduce t2."
+        assert not DeepDiff(replay, t2, **deepdiff_kwargs), f"{test_name}: replay != t2."
+
+    @pytest.mark.parametrize('test_name', ARRAY_DTYPE_CASES, ids=ARRAY_DTYPE_CASES)
+    def test_dtype_change_same_shape(self, test_name):
+        case = ARRAY_DTYPE_CASES[test_name]
+        t1, t2, deepdiff_kwargs = case['t1'], case['t2'], case['deepdiff_kwargs']
+        diff = DeepDiff(t1, t2, **deepdiff_kwargs)
+
+        assert set(diff) == {'type_changes'}, f"{test_name}: a dtype change is a root type change."
+        assert _reported_paths(diff) == {'root'}, f"{test_name}: the dtype change must be at the array root."
+        assert diff['type_changes']['root']['old_type'] == np.int8
+        assert diff['type_changes']['root']['new_type'] == np.int32
+
+        replay = Delta(diff, bidirectional=False, raise_errors=True) + t1
+        assert isinstance(replay, np_ndarray), f"{test_name}: replay must stay a numpy array."
+        assert replay.shape == t1.shape and replay.dtype == np.int32, \
+            f"{test_name}: replay has the wrong shape or dtype."
+        assert np.array_equal(replay, t2), f"{test_name}: replay did not reproduce t2."
+
+    @pytest.mark.parametrize('test_name', ARRAY_TRANSPOSE_CASES, ids=ARRAY_TRANSPOSE_CASES)
+    def test_transpose_points_at_swapped_axes(self, test_name):
+        case = ARRAY_TRANSPOSE_CASES[test_name]
+        t1, t2, deepdiff_kwargs = case['t1'], case['t2'], case['deepdiff_kwargs']
+        diff = DeepDiff(t1, t2, **deepdiff_kwargs)
+
+        assert _reported_paths(diff) == case['expected_axes'], \
+            f"{test_name}: the diff does not point at the transposed cells."
+        for path, change in diff['values_changed'].items():
+            row, column = _path_axes(path)
+            assert t1[row, column] == change['old_value'], f"{test_name}: {path} is not a t1 axis."
+            assert t2[row, column] == change['new_value'], f"{test_name}: {path} is not a t2 axis."
+            assert t1[row, column] == t2[column, row], f"{test_name}: {path} is not a transposed axis."
+
+        replay_kwargs = case.get('replay_kwargs', {})
+        replay = Delta(diff, bidirectional=False, raise_errors=True) + t1
+        assert isinstance(replay, np_ndarray), f"{test_name}: replay must stay a numpy array."
+        assert replay.shape == t2.shape, f"{test_name}: replay changed the array shape."
+        assert np.array_equal(replay, t2), f"{test_name}: replay did not reproduce t2."
+        assert not DeepDiff(replay, t2, **replay_kwargs), f"{test_name}: replay != t2."
+

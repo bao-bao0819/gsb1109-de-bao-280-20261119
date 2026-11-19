@@ -31,6 +31,11 @@ SECTION = "**** {}"
 # Metadata field that indicates the entry is a likely duplicate.
 DUPLICATE = "__duplicate__"
 
+# Metadata field that indicates the entry is a possible duplicate
+# that could not be matched unequivocally and requires human review.
+# The field value is the list of candidate matching entries.
+REVIEW = "__review__"
+
 ExtractedEntry = Tuple[str, data.Entries, data.Account, "Importer"]
 
 
@@ -187,6 +192,21 @@ def mark_duplicate_entries(
     Entries that are determined to be duplicates of existing entries
     are marked setting the "__duplicate__" metadata field.
 
+    Each existing entry can only be matched to at most one of the
+    newly extracted entries: an existing entry can only cancel its
+    own replay. This ensures that identical transactions recorded
+    more than once, for example two purchases of the same amount at
+    the same store on the same day, are not incorrectly deduplicated
+    when a statement is downloaded twice and only some of the entries
+    it contains are already present in the ledger.
+
+    When an entry matches multiple existing entries and the correct
+    match cannot be established, for example because neither entry
+    carries a reconciliation link, the entry is marked setting the
+    "__review__" metadata field to the list of candidate matches so
+    that a human can review the relationship instead of the entry
+    being silently deduplicated.
+
     Args:
       entries: Entries to be deduplicated.
       existing: Existing entries.
@@ -207,16 +227,64 @@ def mark_duplicate_entries(
         for i in range(lo, hi):
             yield existing[i]
 
+    def links(entry):
+        return getattr(entry, "links", None) or frozenset()
+
+    # Keep track of the existing entries that already cancelled one
+    # of the newly extracted entries.
+    matched = set()
+
     for entry in entries:
+        elinks = links(entry)
+
+        # Find the existing entries the entry could be a replay of.
+        candidates = []
         for target in entries_date_window_iterator(entry.date):
-            if compare(entry, target):
-                entry.meta[DUPLICATE] = target
+            if not compare(entry, target):
+                continue
+            # When both entries carry reconciliation links, they
+            # identify the transaction unequivocally: if the links do
+            # not agree, the two entries are distinct transactions.
+            tlinks = links(target)
+            if elinks and tlinks and elinks.isdisjoint(tlinks):
+                continue
+            candidates.append(target)
+
+        if not candidates:
+            continue
+
+        # An existing entry can only cancel its own replay.
+        unmatched = [target for target in candidates if id(target) not in matched]
+        if not unmatched:
+            # All the candidates already cancelled a replay. Whether
+            # the entry is a further replay or a distinct transaction
+            # cannot be determined automatically. Flag it for review
+            # instead of silently marking it as a duplicate.
+            entry.meta[REVIEW] = candidates
+            continue
+
+        # When there is more than one candidate, reconciliation
+        # links, when available, establish the correct match.
+        if elinks and len(unmatched) > 1:
+            linked = [target for target in unmatched if not elinks.isdisjoint(links(target))]
+            if linked:
+                unmatched = linked
+
+        entry.meta[DUPLICATE] = unmatched[0]
+        matched.add(id(unmatched[0]))
+        if len(unmatched) > 1:
+            # The entry matches multiple existing entries and the
+            # correct one cannot be determined automatically. Record
+            # the candidates so a human can review the relationship.
+            entry.meta[REVIEW] = unmatched
 
 
 def print_extracted_entries(extracted: List[ExtractedEntry], output: io.TextIOBase) -> None:
     """Print extracted entries.
 
-    Entries marked as duplicates are printed as comments.
+    Entries marked as duplicates are printed as comments. Entries
+    marked for review are preceded by a comment reporting the
+    candidate matches.
 
     Args:
       extracted: List of (filepath, entries, account, importer) tuples
@@ -234,6 +302,7 @@ def print_extracted_entries(extracted: List[ExtractedEntry], output: io.TextIOBa
 
         for entry in entries:
             duplicate = entry.meta.pop(DUPLICATE, False)
+            review = entry.meta.pop(REVIEW, None)
             string = printer.format_entry(entry)
             # If the entry is a duplicate, comment it out and report
             # of which other entry this is a duplicate.
@@ -244,6 +313,27 @@ def print_extracted_entries(extracted: List[ExtractedEntry], output: io.TextIOBa
                     if filename and lineno:
                         output.write(f"; duplicate of {filename}:{lineno}\n")
                 string = textwrap.indent(string, "; ")
+            if review:
+                # The entry could not be matched unequivocally to one
+                # of the existing entries. Report the candidates so a
+                # human can review the relationship.
+                locations = []
+                for candidate in review:
+                    if candidate is duplicate:
+                        continue
+                    filename = candidate.meta.get("filename")
+                    lineno = candidate.meta.get("lineno")
+                    if filename and lineno:
+                        locations.append(f"{filename}:{lineno}")
+                if duplicate:
+                    if locations:
+                        output.write("; review: also matches " + ", ".join(locations) + "\n")
+                elif locations:
+                    output.write(
+                        "; review: possible duplicate of " + ", ".join(locations) + "\n"
+                    )
+                else:
+                    output.write("; review: possible duplicate\n")
             output.write(string)
             output.write("\n")
 

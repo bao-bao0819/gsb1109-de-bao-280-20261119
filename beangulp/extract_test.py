@@ -70,6 +70,108 @@ class TestDuplicates(unittest.TestCase):
         self.assertTrue(entries[0].meta[extract.DUPLICATE])
         self.assertNotIn(extract.DUPLICATE, entries[1].meta)
 
+    def test_mark_duplicate_entries_one_replay_one_existing(self):
+        # An existing entry can only cancel its own replay. Of two
+        # identical extracted entries, only one can be a duplicate of
+        # the existing entry. The other one may be a legitimate
+        # transaction, for example a second purchase of the same
+        # amount at the same store, and is flagged for review instead
+        # of being silently discarded.
+        existing, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+        """)
+        )
+        entries, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+        """)
+        )
+        compare = similar.heuristic_comparator()
+        extract.mark_duplicate_entries(entries, existing, timedelta(days=2), compare)
+        self.assertIs(entries[0].meta[extract.DUPLICATE], existing[0])
+        self.assertNotIn(extract.DUPLICATE, entries[1].meta)
+        self.assertEqual(entries[1].meta[extract.REVIEW], [existing[0]])
+
+    def test_mark_duplicate_entries_two_replays_two_existing(self):
+        # Two identical legitimate transactions in the ledger can each
+        # be cancelled by a replay brought in by a statement that has
+        # been downloaded twice.
+        existing, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+        """)
+        )
+        entries, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+
+          1970-01-01 * "Test"
+            Assets:Tests  10.00 USD
+        """)
+        )
+        compare = similar.heuristic_comparator()
+        extract.mark_duplicate_entries(entries, existing, timedelta(days=2), compare)
+        self.assertIs(entries[0].meta[extract.DUPLICATE], existing[0])
+        self.assertIs(entries[1].meta[extract.DUPLICATE], existing[1])
+        # The first match is ambiguous: the entry could be a replay of
+        # either of the two identical existing entries.
+        self.assertEqual(entries[0].meta[extract.REVIEW], existing)
+        self.assertNotIn(extract.REVIEW, entries[1].meta)
+
+    def test_mark_duplicate_entries_reconciliation_links(self):
+        # Reconciliation links, when available, establish the correct
+        # match unequivocally.
+        existing, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test" ^one
+            Assets:Tests  10.00 USD
+
+          1970-01-01 * "Test" ^two
+            Assets:Tests  10.00 USD
+        """)
+        )
+        entries, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test" ^two
+            Assets:Tests  10.00 USD
+        """)
+        )
+        compare = similar.heuristic_comparator()
+        extract.mark_duplicate_entries(entries, existing, timedelta(days=2), compare)
+        self.assertIs(entries[0].meta[extract.DUPLICATE], existing[1])
+        self.assertNotIn(extract.REVIEW, entries[0].meta)
+
+    def test_mark_duplicate_entries_mismatched_links(self):
+        # When both entries carry reconciliation links and they do not
+        # agree, the entries are distinct transactions.
+        existing, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test" ^one
+            Assets:Tests  10.00 USD
+        """)
+        )
+        entries, errors, options = parser.parse_string(
+            textwrap.dedent("""
+          1970-01-01 * "Test" ^three
+            Assets:Tests  10.00 USD
+        """)
+        )
+        compare = similar.heuristic_comparator()
+        extract.mark_duplicate_entries(entries, existing, timedelta(days=2), compare)
+        self.assertNotIn(extract.DUPLICATE, entries[0].meta)
+        self.assertNotIn(extract.REVIEW, entries[0].meta)
+
 
 class TestPrint(unittest.TestCase):
     def test_print_extracted_entries(self):
@@ -134,6 +236,90 @@ class TestPrint(unittest.TestCase):
             1970-01-01 * "Test"
               Assets:Tests  10.00 USD
 
+            ; 1970-01-01 * "Test"
+            ;   Assets:Tests  10.00 USD
+
+
+            """),
+        )
+
+    def test_print_extracted_entries_review(self):
+        entries, error, options = parser.parse_string(
+            textwrap.dedent("""
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD""")
+        )
+
+        # Flag the second entry for review.
+        entries[1].meta[extract.REVIEW] = [entries[0]]
+
+        extracted = [
+            ("/path/to/test.csv", entries, None, None),
+        ]
+
+        output = io.StringIO()
+        extract.print_extracted_entries(extracted, output)
+
+        self.assertEqual(
+            output.getvalue(),
+            textwrap.dedent("""\
+            ;; -*- mode: beancount -*-
+
+            **** /path/to/test.csv
+
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+            ; review: possible duplicate of <string>:2
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+
+            """),
+        )
+
+    def test_print_extracted_entries_duplicate_and_review(self):
+        entries, error, options = parser.parse_string(
+            textwrap.dedent("""
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD""")
+        )
+
+        # Mark the third entry as an ambiguous duplicate.
+        entries[2].meta[extract.DUPLICATE] = entries[0]
+        entries[2].meta[extract.REVIEW] = [entries[0], entries[1]]
+
+        extracted = [
+            ("/path/to/test.csv", entries, None, None),
+        ]
+
+        output = io.StringIO()
+        extract.print_extracted_entries(extracted, output)
+
+        self.assertEqual(
+            output.getvalue(),
+            textwrap.dedent("""\
+            ;; -*- mode: beancount -*-
+
+            **** /path/to/test.csv
+
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+            1970-01-01 * "Test"
+              Assets:Tests  10.00 USD
+
+            ; duplicate of <string>:2
+            ; review: also matches <string>:5
             ; 1970-01-01 * "Test"
             ;   Assets:Tests  10.00 USD
 

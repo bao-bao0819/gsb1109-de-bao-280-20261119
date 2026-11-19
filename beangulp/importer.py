@@ -135,7 +135,11 @@ class Importer(abc.ABC):
 
         Duplicated entries are marked setting the "__duplicate__"
         entry metadata field to the entry of which the entry is a
-        duplicate.
+        duplicate. Each existing entry can only be matched to at most
+        one of the newly extracted entries. Matches that cannot be
+        established unequivocally are marked setting the "__review__"
+        entry metadata field to the list of candidate matches so that
+        a human can review the relationship.
 
         Args:
           entries: Entries extracted from the document being processed.

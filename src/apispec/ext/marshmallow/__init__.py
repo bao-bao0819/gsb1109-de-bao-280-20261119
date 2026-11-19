@@ -141,6 +141,14 @@ class MarshmallowPlugin(BasePlugin):
             openapi_version=spec.openapi_version, converter=self.converter
         )
 
+    def begin_transaction(self) -> dict:
+        assert self.converter is not None, "init_spec has not yet been called"
+        return dict(self.converter.refs)
+
+    def rollback_transaction(self, snapshot: dict) -> None:
+        assert self.converter is not None, "init_spec has not yet been called"
+        self.converter.refs = dict(snapshot)
+
     def map_to_openapi_type(self, field_cls, *args):
         """Set mapping for custom field class.
 

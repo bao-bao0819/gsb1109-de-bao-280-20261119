@@ -85,6 +85,38 @@ class Components:
             if v != {}
         }
 
+    def snapshot(self) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]]:
+        """Return shallow copies of all component sections.
+
+        The returned object can be passed to :meth:`restore` to undo every
+        component registration made after the snapshot was taken. Component
+        dictionaries themselves are not mutated during path registration, so
+        copying the section mappings is enough.
+        """
+        return (
+            {
+                obj_type: dict(section)
+                for obj_type, section in self._subsections.items()
+            },
+            {
+                obj_type: dict(section)
+                for obj_type, section in self._subsections_lazy.items()
+            },
+        )
+
+    def restore(
+        self,
+        snapshot: tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]],
+    ) -> None:
+        """Restore the component sections from a :meth:`snapshot` result."""
+        sections_snapshot, lazy_snapshot = snapshot
+        for obj_type, section in self._subsections.items():
+            section.clear()
+            section.update(sections_snapshot[obj_type])
+        for obj_type, section in self._subsections_lazy.items():
+            section.clear()
+            section.update(lazy_snapshot[obj_type])
+
     def _register_component(
         self,
         obj_type: str,
@@ -532,7 +564,51 @@ class APISpec:
         :param str description: long description relevant to all operations in this path
         :param list|None parameters: list of parameters relevant to all operations in this path
         :param kwargs: parameters used by any path helpers see :meth:`register_path_helper`
+
+        The call is wrapped in a transaction. If anything fails while building
+        the path, every path, component or plugin reference registered during
+        the call is rolled back, leaving the spec untouched. The failed call can
+        then be retried on the same ``APISpec`` instance with corrected
+        parameters.
         """
+        paths_snapshot = deepcopy(self._paths)
+        tags_snapshot = deepcopy(self._tags)
+        components_snapshot = self.components.snapshot()
+        plugin_snapshots = [
+            (plugin, plugin.begin_transaction()) for plugin in self.plugins
+        ]
+        try:
+            self._path(
+                path,
+                operations=operations,
+                summary=summary,
+                description=description,
+                parameters=parameters,
+                **kwargs,
+            )
+        except BaseException:
+            self._paths.clear()
+            self._paths.update(paths_snapshot)
+            self._tags.clear()
+            self._tags.extend(tags_snapshot)
+            self.components.restore(components_snapshot)
+            for plugin, snapshot in plugin_snapshots:
+                plugin.rollback_transaction(snapshot)
+            raise
+        for plugin, snapshot in plugin_snapshots:
+            plugin.commit_transaction(snapshot)
+        return self
+
+    def _path(
+        self,
+        path: str | None,
+        *,
+        operations: dict[str, typing.Any] | None,
+        summary: str | None,
+        description: str | None,
+        parameters: list[dict] | None,
+        **kwargs: typing.Any,
+    ) -> None:
         # operations and parameters must be deepcopied because they are mutated
         # in _clean_operations and operation helpers and path may be called twice
         operations = deepcopy(operations) or {}
@@ -574,8 +650,6 @@ class APISpec:
             self._paths[path]["parameters"] = parameters
 
         self.components.resolve_refs_in_path(self._paths[path])
-
-        return self
 
     def _clean_parameters(
         self,

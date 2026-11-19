@@ -17,6 +17,32 @@ class BasePlugin:
         :param APISpec spec: APISpec object this plugin instance is attached to
         """
 
+    def begin_transaction(self) -> typing.Any:
+        """Snapshot the plugin state before a spec-wide transaction.
+
+        Called by :meth:`APISpec.path` before it mutates the spec. Returning
+        an object is optional. When the transaction fails,
+        :meth:`rollback_transaction` is called with the returned object so the
+        plugin can restore any state it registered during the failed call.
+
+        The default implementation is a no-op.
+        """
+
+    def rollback_transaction(self, snapshot: typing.Any) -> None:
+        """Restore plugin state from the object returned by
+        :meth:`begin_transaction`.
+
+        Called when a spec-wide transaction fails. The default implementation
+        is a no-op.
+        """
+
+    def commit_transaction(self, snapshot: typing.Any) -> None:
+        """Discard the snapshot returned by :meth:`begin_transaction`.
+
+        Called after a spec-wide transaction succeeds. The default
+        implementation is a no-op.
+        """
+
     def schema_helper(
         self, name: str, definition: dict, **kwargs: typing.Any
     ) -> dict | None:

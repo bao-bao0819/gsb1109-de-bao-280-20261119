@@ -89,6 +89,38 @@ The ``init_spec`` Method
 
 A typical use case is conditional code depending on the OpenAPI version, which is stored as ``openapi_version`` on the `spec` object. See source code for `apispec.ext.marshmallow.MarshmallowPlugin </_modules/apispec/ext/marshmallow.html>`_ for an example.
 
+
+Transaction Hooks
+-----------------
+
+Every call to :meth:`apispec.APISpec.path` runs inside a transaction. If building the path fails, the spec restores the paths, tags and components it held before the call, so the failed call can be retried on the same `apispec.APISpec` instance with corrected arguments.
+
+A plugin that keeps its own state may need to undo changes made during a failed call. It can do so by overriding the transaction hooks:
+
+* ``begin_transaction`` is called before the path is built. It may return any snapshot object.
+* ``rollback_transaction`` is called with that object when the path build fails; the plugin must restore its previous state.
+* ``commit_transaction`` is called with that object when the path build succeeds; the snapshot may simply be discarded.
+
+The default implementations are no-ops, so plugins without extra state have nothing to do. The built-in `MarshmallowPlugin` uses these hooks to roll back the schema references it caches while resolving nested schemas.
+
+Example: ::
+
+    class StatefulPlugin(BasePlugin):
+        def init_spec(self, spec):
+            self.spec = spec
+            self.known_schemas = set()
+
+        def begin_transaction(self):
+            return set(self.known_schemas)
+
+        def rollback_transaction(self, snapshot):
+            self.known_schemas = snapshot
+
+        def operation_helper(self, path=None, operations=None, **kwargs):
+            # Registering state here is safe: it is undone on failure.
+            ...
+
+
 Example: Docstring-parsing Plugin
 ---------------------------------
 

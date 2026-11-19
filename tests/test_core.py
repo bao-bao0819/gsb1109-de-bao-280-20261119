@@ -643,6 +643,43 @@ class TestComponents(RefsSchemaTestMixin):
         assert links["GetUser"] == link
 
 
+class TransactionTestPlugin(BasePlugin):
+    """Plugin that registers a component from its operation helper and can
+    be told to fail, mimicking a plugin error while building a path."""
+
+    def init_spec(self, spec):
+        super().init_spec(spec)
+        self.spec = spec
+        self.events = []
+
+    def begin_transaction(self):
+        self.events.append("begin")
+        return "snapshot"
+
+    def rollback_transaction(self, snapshot):
+        self.events.append(("rollback", snapshot))
+
+    def commit_transaction(self, snapshot):
+        self.events.append(("commit", snapshot))
+
+    def operation_helper(self, path=None, operations=None, **kwargs):
+        if kwargs.get("fail"):
+            self.spec.tag({"name": "ResidualTag"})
+            self.spec.components.schema("Residual", {"type": "object"})
+            raise APISpecError("operation helper failed")
+
+
+def make_transaction_spec(openapi_version="3.0.0"):
+    plugin = TransactionTestPlugin()
+    spec = APISpec(
+        title="Swagger Petstore",
+        version="1.0.0",
+        openapi_version=openapi_version,
+        plugins=[plugin],
+    )
+    return spec, plugin
+
+
 class TestPath(RefsSchemaTestMixin):
     paths = {
         "/pet/{petId}": {
@@ -1107,6 +1144,107 @@ class TestPath(RefsSchemaTestMixin):
         resp = get_paths(spec)["/pet/{petId}"]["get"]["responses"]["200"]
         schema = resp["content"]["application/json"]["schema"]
         self.assert_schema_refs(spec, schema)
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_path_failure_rolls_back_new_path_and_components(self, openapi_version):
+        spec, plugin = make_transaction_spec(openapi_version)
+        spec.path(path="/existing")
+        spec.components.schema("Existing", {"type": "object"})
+
+        state_before = copy.deepcopy(spec.to_dict())
+        events_before = len(plugin.events)
+        with pytest.raises(APISpecError, match="operation helper failed"):
+            spec.path(path="/new", fail=True)
+
+        # Nothing from the failed call remains
+        assert "/new" not in get_paths(spec)
+        assert "Residual" not in get_schemas(spec)
+        assert spec.to_dict().get("tags", []) == []
+        # State predating the failed call is untouched
+        assert spec.to_dict() == state_before
+        # Plugin transaction hooks were invoked for the failed call only
+        failed_events = plugin.events[events_before:]
+        assert failed_events[0] == "begin"
+        assert ("rollback", "snapshot") in failed_events
+        assert not any(
+            isinstance(event, tuple) and event[0] == "commit" for event in failed_events
+        )
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_path_failure_does_not_roll_back_preexisting_paths(self, openapi_version):
+        spec, _ = make_transaction_spec(openapi_version)
+        spec.path(path="/existing")
+        spec.path(
+            path="/existing",
+            operations={"get": {"responses": {"200": {"description": "ok"}}}},
+        )
+
+        with pytest.raises(APISpecError):
+            spec.path(path="/new", fail=True)
+
+        paths = get_paths(spec)
+        assert list(paths) == ["/existing"]
+        assert "get" in paths["/existing"]
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_path_failure_keeps_preexisting_tags_and_drops_new_ones(
+        self, openapi_version
+    ):
+        spec, _ = make_transaction_spec(openapi_version)
+        spec.tag({"name": "ExistingTag"})
+
+        with pytest.raises(APISpecError):
+            spec.path(path="/new", fail=True)
+
+        assert spec.to_dict()["tags"] == [{"name": "ExistingTag"}]
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_path_can_be_retried_on_same_spec_after_failure(self, openapi_version):
+        spec, _ = make_transaction_spec(openapi_version)
+        spec.path(path="/existing")
+
+        with pytest.raises(APISpecError):
+            spec.path(path="/new", fail=True)
+
+        # Retry with corrected parameters on the same APISpec instance
+        spec.path(
+            path="/new",
+            operations={"get": {"responses": {"200": {"description": "ok"}}}},
+        )
+
+        assert list(get_paths(spec)) == ["/existing", "/new"]
+        assert "Residual" not in spec.components.schemas
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_successful_path_commits_plugin_transaction(self, openapi_version):
+        spec, plugin = make_transaction_spec(openapi_version)
+        spec.path(path="/ok")
+        assert plugin.events[0] == "begin"
+        assert ("commit", "snapshot") in plugin.events
+        assert not any(
+            isinstance(event, tuple) and event[0] == "rollback"
+            for event in plugin.events
+        )
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_retried_path_matches_one_shot_generation(self, openapi_version):
+        def build(spec):
+            spec.path(path="/existing")
+            spec.path(
+                path="/new",
+                operations={"get": {"responses": {"200": {"description": "ok"}}}},
+            )
+
+        failed_spec, _ = make_transaction_spec(openapi_version)
+        failed_spec.path(path="/existing")
+        with pytest.raises(APISpecError):
+            failed_spec.path(path="/new", fail=True)
+        build(failed_spec)
+
+        fresh_spec, _ = make_transaction_spec(openapi_version)
+        build(fresh_spec)
+
+        assert failed_spec.to_dict() == fresh_spec.to_dict()
 
 
 class TestPlugins:

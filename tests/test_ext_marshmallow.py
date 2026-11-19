@@ -1229,6 +1229,103 @@ class TestOperationHelper:
         assert schema == build_ref(spec, "schema", "SomeSpecificPetSchema")
 
 
+class TestPathTransaction:
+    @staticmethod
+    def _make_schemas():
+        class NestedSchema(Schema):
+            value = String()
+
+        class BrokenSchema(Schema):
+            nested = Nested(NestedSchema)
+            bad = String(metadata={"x_broken": True})
+
+        class FixedSchema(Schema):
+            nested = Nested(NestedSchema)
+            good = String()
+
+        return NestedSchema, BrokenSchema, FixedSchema
+
+    def _make_spec(self, openapi_version="3.0.0"):
+        ma_plugin = MarshmallowPlugin()
+        spec = APISpec(
+            title="Test",
+            version="1",
+            openapi_version=openapi_version,
+            plugins=[ma_plugin],
+        )
+
+        def fail_if_marked(converter, field, **kwargs):
+            if field.metadata.get("x_broken"):
+                raise APISpecError("broken field during response schema build")
+            return {}
+
+        ma_plugin.converter.add_attribute_function(fail_if_marked)
+        return spec, ma_plugin
+
+    @staticmethod
+    def _response(spec, schema):
+        if spec.openapi_version.major < 3:
+            return {"200": {"schema": schema}}
+        return {"200": {"content": {"application/json": {"schema": schema}}}}
+
+    def _add_existing_pet(self, spec):
+        spec.path(
+            path="/pets",
+            operations={"get": {"responses": self._response(spec, PetSchema)}},
+        )
+
+    def _add_fixed_thing(self, spec, fixed_schema):
+        spec.path(
+            path="/things",
+            operations={"post": {"responses": self._response(spec, fixed_schema)}},
+        )
+
+    def _add_broken_thing(self, spec, broken_schema):
+        spec.path(
+            path="/things",
+            operations={"post": {"responses": self._response(spec, broken_schema)}},
+        )
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_failed_path_leaves_no_residual_schemas_or_refs(self, openapi_version):
+        _, broken_schema, _ = self._make_schemas()
+        spec, ma_plugin = self._make_spec(openapi_version)
+        self._add_existing_pet(spec)
+
+        refs_before = dict(ma_plugin.converter.refs)
+        state_before = spec.to_dict()
+
+        with pytest.raises(APISpecError, match="broken field"):
+            self._add_broken_thing(spec, broken_schema)
+
+        # No residual path or components from the failed attempt
+        assert list(get_paths(spec)) == ["/pets"]
+        assert list(get_schemas(spec)) == ["Pet"]
+        assert ma_plugin.converter.refs == refs_before
+        # Pre-existing spec state is untouched
+        assert spec.to_dict() == state_before
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_failed_path_can_be_retried_on_same_spec(self, openapi_version):
+        _, broken_schema, fixed_schema = self._make_schemas()
+        spec, ma_plugin = self._make_spec(openapi_version)
+        self._add_existing_pet(spec)
+
+        with pytest.raises(APISpecError, match="broken field"):
+            self._add_broken_thing(spec, broken_schema)
+
+        # Correct the parameters and retry on the same APISpec object
+        self._add_fixed_thing(spec, fixed_schema)
+
+        fresh_spec, _ = self._make_spec(openapi_version)
+        self._add_existing_pet(fresh_spec)
+        self._add_fixed_thing(fresh_spec, fixed_schema)
+
+        assert spec.to_dict() == fresh_spec.to_dict()
+        assert set(get_schemas(spec)) == {"Pet", "Nested", "Fixed"}
+        assert set(ma_plugin.converter.refs.values()) == {"Pet", "Nested", "Fixed"}
+
+
 class TestCircularReference:
     def test_circular_referencing_schemas(self, spec):
         spec.components.schema("Analysis", schema=AnalysisSchema)

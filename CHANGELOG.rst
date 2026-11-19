@@ -1,6 +1,18 @@
 Changelog
 ---------
 
+Unreleased
+**********
+
+Features:
+
+- Wrap ``APISpec.path`` in a transaction. If building a path fails, the paths,
+  tags, components and plugin references registered during that call are rolled
+  back, so the call can be retried on the same ``APISpec`` instance with
+  corrected arguments without leaving residual state. Plugins may implement
+  ``begin_transaction``, ``rollback_transaction`` and ``commit_transaction`` to
+  participate in the transaction.
+
 6.10.1 (2026-11-03)
 *******************
 

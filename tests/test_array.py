@@ -149,7 +149,7 @@ class TestCreation:
         with pytest.raises(ValueError):
             b.dtype = "hello_everyone"
         with pytest.raises(ValueError):
-            b.dtype = "u12_le"
+            b.dtype = "bytes4_le"
             _ = b[0]
         with pytest.raises(ValueError):
             b.dtype = "float17"

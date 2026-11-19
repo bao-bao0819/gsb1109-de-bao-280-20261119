@@ -231,8 +231,6 @@ def test_endianness_errors():
     with pytest.raises(ValueError):
         _ = Dtype("u16_ne")
     with pytest.raises(ValueError):
-        _ = DtypeSingle.from_params(DtypeKind.UINT, 15, endianness=Endianness.BIG)
-    with pytest.raises(ValueError):
         _ = DtypeSingle.from_params(DtypeKind.BOOL, endianness=Endianness.LITTLE)
     with pytest.raises(ValueError):
         _ = DtypeSingle.from_params(DtypeKind.BYTES, 16, endianness=Endianness.LITTLE)
@@ -417,9 +415,31 @@ def test_dtype_single_endianness():
 
 def test_dtype_single_invalid_endianness():
     with pytest.raises(ValueError):
-        Dtype("u7_le") # Endianness only for whole bytes
-    with pytest.raises(ValueError):
         Dtype("bytes16_le") # Bytes type does not support endianness
+
+def test_dtype_single_non_whole_byte_endianness():
+    d_le = Dtype("u12_le")
+    d_be = Dtype("u12_be")
+    val = 0xABC
+    packed_le = d_le.pack(val)
+    # The low byte is stored first, followed by the high nibble.
+    assert packed_le == Tibs("0b101111001010")
+    assert d_le.unpack(packed_le) == val
+    # Big-endian is the default bit ordering, so u12_be matches u12.
+    assert d_be.pack(val) == Dtype("u12").pack(val)
+    assert d_be.unpack(Dtype("u12").pack(val)) == val
+    # Round trips for other non-whole-byte sizes and signed values.
+    for size in [1, 7, 9, 12, 15, 20, 31]:
+        d = Dtype(f"u{size}_le")
+        v = (1 << size) - 1
+        packed = d.pack(v)
+        assert len(packed) == size
+        assert d.unpack(packed) == v
+    d_i = Dtype("i12_le")
+    assert d_i.unpack(d_i.pack(-123)) == -123
+    # Whole-byte behaviour is unchanged.
+    assert Dtype("u16_le").pack(0x1234) == Tibs("0x3412")
+    assert Dtype("u16_le").unpack(Tibs("0x3412")) == 0x1234
 
 def test_dtype_single_pack_invalid_value():
     d = Dtype("u8")

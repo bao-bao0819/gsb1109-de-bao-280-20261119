@@ -12,6 +12,33 @@ from bitformat._tibs import Mutibs, Tibs, TibsLike, tibs_from_any
 __all__ = ["Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "DtypeDefinition", "Register", "DtypeTransformer"]
 
 
+def _bits_to_little_endian(bits: Tibs) -> Tibs:
+    """Reverse the order of the 8-bit chunks of ``bits``, counted from the least significant end.
+
+    For whole-byte data this is equivalent to ``Tibs.byte_swapped``. For other lengths the most
+    significant partial byte forms a single chunk, so for example a 12-bit value is stored as its
+    low byte followed by its high nibble.
+    """
+    if len(bits) % 8 == 0:
+        return bits.byte_swapped()
+    r = len(bits) % 8
+    chunks = [bits[:r]]
+    chunks.extend(bits[i:i + 8] for i in range(r, len(bits), 8))
+    return Tibs.from_joined(reversed(chunks))
+
+
+def _bits_from_little_endian(bits: Tibs) -> Tibs:
+    """The inverse of :func:`_bits_to_little_endian`.
+
+    Here the partial byte is the final chunk, as the most significant bits of the value are
+    stored last in little-endian order.
+    """
+    if len(bits) % 8 == 0:
+        return bits.byte_swapped()
+    chunks = [bits[i:i + 8] for i in range(0, len(bits), 8)]
+    return Tibs.from_joined(reversed(chunks))
+
+
 class DtypeTransformer(Transformer):
 
     @staticmethod
@@ -339,6 +366,9 @@ class DtypeSingle(Dtype):
         tibs_dtype_str = None
         if x._bit_length is not None and definition.kind in {DtypeKind.UINT, DtypeKind.INT, DtypeKind.FLOAT}:
             tibs_supports_length = definition.kind is DtypeKind.FLOAT or x._bit_length <= 128
+            if endianness is not Endianness.UNSPECIFIED and x._bit_length % 8 != 0:
+                # The tibs byte-order modifiers need a whole number of bytes.
+                tibs_supports_length = False
             if tibs_supports_length:
                 suffix = "" if endianness is Endianness.UNSPECIFIED else "_" + endianness.value
                 tibs_dtype_str = f"{definition.kind}{x._bit_length}{suffix}"
@@ -349,7 +379,7 @@ class DtypeSingle(Dtype):
             x._get_fn = get_fn_tibs
         elif little_endian:
             def get_fn_le(bits, start, length):
-                swapped = tibs_from_any(bits)[start:start + length].byte_swapped()
+                swapped = _bits_from_little_endian(tibs_from_any(bits)[start:start + length])
                 return definition.get_fn(swapped, 0, length)
             x._get_fn = get_fn_le
         else:
@@ -361,7 +391,7 @@ class DtypeSingle(Dtype):
             return x._set_fn(v, length=x._bit_length)
 
         def create_bits_le(v):
-            return x._set_fn(v, length=x._bit_length).byte_swapped()
+            return _bits_to_little_endian(x._set_fn(v, length=x._bit_length))
 
         if tibs_dtype_str is not None:
             def create_bits_tibs(v):
@@ -894,7 +924,7 @@ class DtypeDefinition:
         if endianness is not Endianness.UNSPECIFIED:
             if not self.endianness_variants:
                 raise ValueError(f"The '{self.kind}' dtype does not support endianness variants, but '{endianness.value}' was specified.")
-            if size.evaluate() is not None and size.evaluate() % 8 != 0:
+            if self.kind not in (DtypeKind.UINT, DtypeKind.INT) and size.evaluate() is not None and size.evaluate() % 8 != 0:
                 raise ValueError(f"Endianness can only be specified for whole-byte dtypes, but '{self.kind}' has a size of {size} bits.")
         return size, endianness
 

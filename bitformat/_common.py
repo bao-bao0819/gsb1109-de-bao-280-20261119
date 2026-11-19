@@ -335,9 +335,10 @@ NONE = Expression('{None}')
 
 @enum_tools.documentation.document_enum
 class Endianness(Enum):
-    """For whole-byte data types, the endianness can be specified as big-endian or little-endian.
+    """The endianness can be specified as big-endian or little-endian.
 
-    If the data type is not a whole number of bytes, the endianness should be set to ``UNSPECIFIED``.
+    For integer data types this can be used with any bit length; for other data types the
+    endianness can only be specified when the data type is a whole number of bytes.
     """
     BIG = "be"  # doc: Big-endian byte order.
     LITTLE = "le"  # doc: Little-endian byte order.

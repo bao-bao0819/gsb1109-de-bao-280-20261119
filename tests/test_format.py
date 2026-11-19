@@ -387,6 +387,29 @@ def test_partial_parse():
         _ = f.parse(b[:-16])
 
 
+def test_non_whole_byte_little_endian_field():
+    # A 12-bit counter stored little-endian after a packet header, with adjacent 3-bit flags.
+    f = Format.from_params(["header: u8", "flag_a: u3", "counter: u12_le", "flag_b: u3"])
+    f.pack([0x55, 0b101, 0xABC, 0b011])
+    b = f.to_tibs()
+    # The counter starts mid-byte (bit 11) and crosses into the next byte. It is stored
+    # low byte first, then its high nibble, leaving the neighbouring flags untouched.
+    expected = "01010101" + "101" + "10111100" + "1010" + "011"
+    assert b.to_bin() == expected
+    assert f.unpack(b) == [0x55, 0b101, 0xABC, 0b011]
+    # Parsing and rewriting the counter leaves the adjacent flags at their original values.
+    g = Format.from_params(["header: u8", "flag_a: u3", "counter: u12_le", "flag_b: u3"])
+    g.parse(b)
+    assert g["flag_a"].value == 0b101
+    assert g["counter"].value == 0xABC
+    assert g["flag_b"].value == 0b011
+    g["counter"].value = 0x123
+    assert g["flag_a"].value == 0b101
+    assert g["flag_b"].value == 0b011
+    assert g["counter"].to_tibs() == Dtype("u12_le").pack(0x123)
+    assert g.unpack(g.to_tibs()) == [0x55, 0b101, 0x123, 0b011]
+
+
 def test_from_string():
     s = "header: (u8,u4, bool)"
     f = Format.from_string(s)

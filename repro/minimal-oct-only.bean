@@ -1,0 +1,13 @@
+; Minimal ledger: the same October close, without today's price.
+; Explicit-date and default-date queries should agree here (10.00 / 1000.00).
+option "operating_currency" "CNY"
+
+2026-10-01 open Assets:Broker AAA
+2026-10-01 open Assets:Cash CNY
+2026-10-01 open Equity:Opening-Balances CNY
+
+2026-10-01 * "Buy 100 AAA"
+  Assets:Broker   100 AAA {10.00 CNY}
+  Assets:Cash   -1000 CNY
+
+2026-10-31 price AAA 10.00 CNY

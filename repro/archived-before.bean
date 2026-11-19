@@ -1,0 +1,6 @@
+include "minimal-two-sources.bean"
+
+; Archived reports. The Query date only supplies a default CLOSE date; it is
+; not passed to getprice()/value() unless the SQL spells the date out.
+2026-10-31 query "month_end" "SELECT getprice('AAA','CNY') AS rate, value(sum(position)) AS mv FROM postings WHERE account='Assets:Broker'"
+2026-10-31 query "month_end_pinned" "SELECT getprice('AAA','CNY',2026-10-31) AS rate, value(sum(position),2026-10-31) AS mv FROM postings WHERE account='Assets:Broker'"

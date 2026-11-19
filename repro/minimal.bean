@@ -1,0 +1,14 @@
+; Minimal ledger: one October source quote, one November close quote.
+; Used to isolate when the query date participates in price lookup.
+option "operating_currency" "CNY"
+
+2026-10-01 open Assets:Broker AAA
+2026-10-01 open Assets:Cash CNY
+2026-10-01 open Equity:Opening-Balances CNY
+
+2026-10-01 * "Buy 100 AAA"
+  Assets:Broker   100 AAA {10.00 CNY}
+  Assets:Cash   -1000 CNY
+
+2026-10-31 price AAA 10.00 CNY
+2026-11-20 price AAA 12.00 CNY

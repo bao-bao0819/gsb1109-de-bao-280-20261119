@@ -1,0 +1,5 @@
+include "minimal-two-sources-today.bean"
+
+; Same archived reports, after today's close was appended to the same ledger.
+2026-10-31 query "month_end" "SELECT getprice('AAA','CNY') AS rate, value(sum(position)) AS mv FROM postings WHERE account='Assets:Broker'"
+2026-10-31 query "month_end_pinned" "SELECT getprice('AAA','CNY',2026-10-31) AS rate, value(sum(position),2026-10-31) AS mv FROM postings WHERE account='Assets:Broker'"

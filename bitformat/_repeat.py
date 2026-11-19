@@ -8,6 +8,20 @@ from ._bits import Tibs
 __all__ = ["Repeat"]
 
 
+def _is_repeat_count(value: Any) -> bool:
+    if isinstance(value, int):
+        return True
+    if isinstance(value, Expression):
+        return True
+    if isinstance(value, str):
+        try:
+            expression = Expression.from_string(value)
+        except ValueError:
+            return False
+        return expression.has_const_value and isinstance(expression.const_value, int)
+    return False
+
+
 class Repeat(FieldType):
 
     field: FieldType
@@ -20,7 +34,9 @@ class Repeat(FieldType):
 
     @classmethod
     @override
-    def from_params(cls, count: int | str | Expression, fieldtype: FieldType | str, value: Iterable[Any] | None = None) -> Repeat:
+    def from_params(cls, count: Any = None, fieldtype: Any = None, value: Iterable[Any] | None = None,
+                    /, *, until: Any = None, marker: Any = None, terminator: Any = None,
+                    consume: bool = True, discard: bool | None = None, keep: bool | None = None) -> FieldType:
         """
         Create a Repeat instance.
 
@@ -28,7 +44,29 @@ class Repeat(FieldType):
         :param fieldtype: The FieldType to repeat.
         :param value: The list of values for the FieldType, one for each repetition.
         :return: The Repeat instance.
+
+        If any of ``until``, ``marker`` or ``terminator`` is supplied then a
+        :class:`RepeatUntil` instance is returned instead. In this case the first
+        positional argument is the field to repeat, and no count can be given.
+
         """
+        marker_value = None
+        for candidate in (until, marker, terminator):
+            if candidate is not None:
+                marker_value = candidate
+                break
+        if marker_value is not None:
+            from ._repeat_until import RepeatUntil
+            if _is_repeat_count(count):
+                if fieldtype is None:
+                    raise TypeError("Repeat.from_params() needs a field to repeat when 'until' is used.")
+                raise TypeError("Use RepeatUntil rather than Repeat when a marker is given: "
+                                "a RepeatUntil field has no count.")
+            if fieldtype is not None:
+                raise TypeError("Repeat.from_params() got more than one field when 'until' was used. "
+                                "Pass the field and the marker, or use the 'field' and 'marker' keywords.")
+            return RepeatUntil.from_params(count, marker_value, consume=consume,
+                                           discard=discard, keep=keep, value=value)
         x = super().__new__(cls)
         if isinstance(count, str):
             count = Expression.from_string(count)

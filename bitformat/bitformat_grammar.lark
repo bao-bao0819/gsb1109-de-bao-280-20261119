@@ -47,9 +47,20 @@ mutable_field.0: [field_name ":"] field_dtype ["=" value] -> mutable_field
 
 if_: "if" expression ":" field_type ["else" ":" field_type]
 
+// A repeat that stops when a marker is found. The marker is only checked at record
+// boundaries and is matched bit by bit, so it doesn't have to be byte aligned.
+// Use the optional 'keep' keyword to leave the marker for the next field to parse.
+repeat_until.2: ("repeat" "until" | "until") MARKER [KEEP] ":" field_type
+
+KEEP: "keep"
+
 repeat: "repeat" expression ":" field_type ["=" value]
 
 while_: "while" expression ":" field_type
+
+// A marker is a bit literal, a quoted string, or a dtype=value pair. It can't contain
+// whitespace, so the optional 'keep' keyword and the ':' separator are unambiguous.
+MARKER: /[^:\s]+/
 
 let: "let" field_name "=" expression
 
@@ -59,7 +70,7 @@ pass_: ["pass"]
 
 format: [field_name ":"] "(" [field_type]  (("," | _NEWLINE) field_type)* ")"
 
-?field_type: [_WS] (field | format | if_ | repeat | while_ | pass_ | let) [_WS]
+?field_type: [_WS] (field | format | if_ | repeat_until | repeat | while_ | pass_ | let) [_WS]
 
 %import common.INT -> INT
 %import python.NAME -> NAME

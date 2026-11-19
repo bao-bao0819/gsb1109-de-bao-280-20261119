@@ -54,6 +54,10 @@ The source of truth for the string parsing is contained in the `Lark grammar fil
       - ``repeat`` ``Expression`` ``:`` ``FieldType``
     * -
       - e.g. ``'repeat {x + 1}: u8'``, ``repeat 10: (bool, f16)``
+    * - :class:`RepeatUntil` (FieldType)
+      - ``repeat until`` ``marker`` ``<keep>`` ``:`` ``FieldType``
+    * -
+      - e.g. ``'repeat until 0xffff: u16'``, ``'until 0xff keep: u8'``
     * - :class:`Pass` (FieldType)
       - ``pass``
 

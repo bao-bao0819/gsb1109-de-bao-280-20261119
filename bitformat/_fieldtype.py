@@ -47,6 +47,23 @@ class FieldTypeTransformer(DtypeTransformer):
         return fieldtype_classes['Repeat'].from_params(count, field, value)
 
     @staticmethod
+    def repeat_until(items) -> 'RepeatUntil':
+        marker = None
+        keep = False
+        field = None
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, lark.Token):
+                if item.type == "MARKER":
+                    marker = str(item)
+                elif str(item) == "keep":
+                    keep = True
+                continue
+            field = item
+        return fieldtype_classes['RepeatUntil'].from_params(field, marker, consume=not keep)
+
+    @staticmethod
     def while_(items) -> 'While':
         return fieldtype_classes['While'].from_params(items[0], items[1])
 

@@ -2,6 +2,10 @@
 
 ### November 2025; version 0.9.
 
+* Added the `RepeatUntil` field type, which repeats a field type until a marker is found. The marker is only
+  checked at repetition boundaries, so the same bit pattern inside a repeated item won't end the loop. It is
+  matched bit by bit, so it can cross byte boundaries. The marker is consumed by default; use `keep` (or
+  `consume=False`) to leave it for the next field. A truncated marker is treated as an incomplete packet.
 * Allowing upper-case 0B, 0X and 0O prefixes as they are allowable in Python.
 * Internal changes to make integration with bitstring easier.
 

@@ -122,6 +122,7 @@ These classes build upon those above to provide richer and more complex data str
 * :ref:`Field <field>` -- A well-defined amount of binary data with a single data type, and optionally a name.
 * :ref:`If <if>` -- A pair of :class:`FieldType` obejcts, one of which is selected based on a condition.
 * :ref:`Repeat <repeat>` -- Used to repeat another :class:`FieldType` a number of times.
+* :ref:`RepeatUntil <repeat_until>` -- Used to repeat another :class:`FieldType` until a marker is found.
 * :ref:`Let <let>` - Creates or modifies a variable using an :class:`Expression`.
 * :ref:`Pass <pass>` -- An empty :class:`FieldType` used as a placeholder.
 
@@ -154,6 +155,11 @@ These classes build upon those above to provide richer and more complex data str
             + int n
             + FieldType field
         }
+        class RepeatUntil{
+            + Tibs marker
+            + bool consume
+            + FieldType field
+        }
         class Format{
             + List[FieldType] fields
         }
@@ -161,6 +167,7 @@ These classes build upon those above to provide richer and more complex data str
         Format --|> FieldType
         If --|> FieldType
         Repeat --|> FieldType
+        RepeatUntil --|> FieldType
         Field --* "1" Dtype : contains
         Field --* "0..1" Tibs : contains
 

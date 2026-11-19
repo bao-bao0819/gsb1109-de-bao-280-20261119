@@ -51,6 +51,12 @@ Some of these types will usually be used as part of a larger structure, where th
    * -
      -
      - ``'repeat {10}: f64'``
+   * - :ref:`repeat_until_quick_reference`
+     - ✓
+     - Repeat another field type until a marker is found.
+   * -
+     -
+     - ``'repeat until 0xffff: u16'``
 
 
 .. _fieldtype_quick_reference:
@@ -137,4 +143,21 @@ Repeat
 A `Repeat` field repeats another field type a given number of times.
 
 ``Repeat('repeat {count}: fieldtype')`` or ``Repeat.from_params(count, fieldtype, value=None)``
+
+.. _repeat_until_quick_reference:
+
+RepeatUntil
+-----------
+
+A `RepeatUntil` field repeats another field type until a marker bit pattern is found.
+
+``RepeatUntil('repeat until marker: fieldtype')`` or ``RepeatUntil.from_params(fieldtype, marker, consume=True)``
+
+The marker is only checked between repetitions, so the same bits inside a repeated
+item don't end the loop. It is matched bit by bit, so it can cross byte boundaries.
+The marker is consumed by default. Add ``keep`` to the string form (or pass
+``consume=False``) to leave it for the next field to parse.
+
+If the data ends with only part of the marker, the input is treated as an incomplete
+packet and a ``ValueError`` is raised.
 

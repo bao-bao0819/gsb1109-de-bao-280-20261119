@@ -12,12 +12,13 @@ import decimal
 import re
 import textwrap
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 import dateutil.parser
 from dateutil.relativedelta import relativedelta, weekday
 
-from beancount.core.number import ZERO
+from beancount.core.number import ONE, ZERO
 from beancount.core import amount
 from beancount.core import position
 from beancount.core import inventory
@@ -451,6 +452,236 @@ def has_account(context, pattern):
 # Operation on inventories, positions and amounts.
 
 
+@dataclass(frozen=True)
+class Quote:
+    """A single exchange rate used to perform a currency conversion.
+
+    Attributes:
+      date: The date of the price directive the rate was taken from, or
+        None if the rate is the identity rate (the source currency is
+        already the target currency).
+      base: The base currency of the price pair the rate was quoted for.
+      quote: The quote currency of the price pair the rate was quoted
+        for.
+      rate: The rate applied to the converted amount, expressed in the
+        quote currency for one unit of the base currency.
+      inverted: Whether the price pair stored in the price database is the
+        inverse of the pair actually used for the conversion.
+    """
+
+    date: datetime.date
+    base: str
+    quote: str
+    rate: Decimal
+    inverted: bool
+
+    def __str__(self):
+        date = '' if self.date is None else f'{self.date:%Y-%m-%d} '
+        inverse = ' (inverted)' if self.inverted else ''
+        return f'{date}{self.base}/{self.quote} {self.rate}{inverse}'
+
+    __repr__ = __str__
+
+
+class QuoteInventory(inventory.Inventory):
+    """An inventory carrying the quotes used to build its positions.
+
+    The quote records are held alongside the (currency, lot) positions.
+    Positions whose value could not be converted carry no quote, which
+    makes the unconverted values explicit without dropping them.
+    """
+
+    def __init__(self, positions=None, quotes=None):
+        super().__init__(positions)
+        self.quotes = list(quotes) if quotes is not None else []
+
+    def add_quote(self, quote):
+        if quote is not None:
+            self.quotes.append(quote)
+
+    def add_inventory(self, other):
+        super().add_inventory(other)
+        self.quotes.extend(getattr(other, 'quotes', ()))
+        return self
+
+
+class QuoteType(types.Structure):
+    name = 'quote'
+    columns = ColumnsRegistry()
+
+    @columns.register(datetime.date)
+    def date(x):
+        """The date of the price used for the conversion."""
+        return x.date
+
+    @columns.register(str)
+    def base(x):
+        """The base currency of the price pair."""
+        return x.base
+
+    @columns.register(str)
+    def quote(x):
+        """The quote currency of the price pair."""
+        return x.quote
+
+    @columns.register(Decimal)
+    def rate(x):
+        """The applied exchange rate."""
+        return x.rate
+
+    @columns.register(bool)
+    def inverted(x):
+        """Whether the applied rate is the inverse of the stored quote."""
+        return x.inverted
+
+
+class ConversionType(types.Structure):
+    name = 'conversion'
+    columns = ColumnsRegistry()
+
+    @staticmethod
+    def _quote(x):
+        return x.quotes[0] if len(x.quotes) == 1 else None
+
+    @columns.register(amount.Amount)
+    def amount(x):
+        """The converted amount. Unchanged when no rate was available."""
+        return x.amount
+
+    @columns.register(datetime.date)
+    def date(x):
+        """The date of the price used, or NULL if none or a multi-step conversion."""
+        quote = ConversionType._quote(x)
+        return quote.date if quote is not None else None
+
+    @columns.register(str)
+    def base(x):
+        """The base currency of the used price pair, or NULL."""
+        quote = ConversionType._quote(x)
+        return quote.base if quote is not None else None
+
+    @columns.register(str)
+    def quote(x):
+        """The quote currency of the used price pair, or NULL."""
+        quote = ConversionType._quote(x)
+        return quote.quote if quote is not None else None
+
+    @columns.register(bool)
+    def inverted(x):
+        """Whether the used quote was inverted, or NULL."""
+        quote = ConversionType._quote(x)
+        return quote.inverted if quote is not None else None
+
+    @columns.register(QuoteType)
+    def price(x):
+        """The single price used, or NULL if none or a multi-step conversion."""
+        return ConversionType._quote(x)
+
+    @columns.register(list)
+    def quotes(x):
+        """The ordered price records the conversion went through."""
+        return list(x.quotes)
+
+
+@dataclass(frozen=True)
+class Conversion:
+    """An amount together with the quotes used to convert it."""
+
+    amount: amount.Amount
+    # Stored as a tuple to keep the value hashable for GROUP BY/DISTINCT;
+    # exposed as a list through the structured type and ``quotes()``.
+    quotes: tuple
+
+    def __str__(self):
+        # Values that could not be converted are left in their original
+        # currency and carry no quote. Make that explicit when rendering.
+        if not self.quotes:
+            return f'{self.amount} (no price)'
+        return str(self.amount)
+
+
+types.ALIASES[Conversion] = ConversionType
+types.ALIASES[Quote] = QuoteType
+
+
+def _get_quote(price_map, base_currency, quote_currency, date):
+    """Find the rate converting one unit of base_currency to quote_currency.
+
+    Returns a Quote describing the rate applied and the price pair it was
+    taken from, or None if no rate is available. The rate is always the
+    rate to multiply the source amount with. The price map transparently
+    synthesizes inverse pairs: ``forward_pairs`` is used to tell rates
+    quoted directly apart from rates obtained by inverting a stored quote.
+    """
+    if base_currency == quote_currency:
+        return Quote(None, base_currency, quote_currency, ONE, False)
+
+    pair = (base_currency, quote_currency)
+    price_date, rate = prices.get_price(price_map, pair, date)
+    if rate is None:
+        return None
+
+    forward_pairs = getattr(price_map, 'forward_pairs', None)
+    inverted = forward_pairs is not None and pair not in forward_pairs
+    return Quote(price_date, base_currency, quote_currency, rate, inverted)
+
+
+def convert_with_quotes(value, target_currency, price_map, date=None, via=()):
+    """Convert a value recording every exchange rate used.
+
+    Mirrors beancount.core.convert conversion rules (direct quote first,
+    then implied rates through the via currencies) but returns, alongside
+    the converted amount or inventory, the quotes applied. Values that
+    cannot be converted are left untouched and carry no quote.
+    """
+    if isinstance(value, amount.Amount):
+        if value.currency == target_currency:
+            quote = Quote(None, value.currency, target_currency, ONE, False)
+            return Conversion(value, (quote,)), [quote]
+
+        quote = _get_quote(price_map, value.currency, target_currency, date)
+        if quote is not None:
+            converted = amount.Amount(value.number * quote.rate, target_currency)
+            return Conversion(converted, (quote,)), [quote]
+
+        # A direct rate is unavailable. Attempt to synthesize one through
+        # the implied (cost/price) currencies.
+        for implied_currency in via:
+            if implied_currency == target_currency:
+                continue
+            first = _get_quote(price_map, value.currency, implied_currency, date)
+            if first is None:
+                continue
+            second = _get_quote(price_map, implied_currency, target_currency, date)
+            if second is None:
+                continue
+            rate = first.rate * second.rate
+            converted = amount.Amount(value.number * rate, target_currency)
+            chain = [first, second]
+            return Conversion(converted, tuple(chain)), chain
+
+        # No rate could be found: leave the amount untouched, without quotes.
+        return Conversion(value, ()), []
+
+    if isinstance(value, position.Position):
+        cost = value.cost
+        value_currency = cost.currency if isinstance(cost, position.Cost) else None
+        return convert_with_quotes(
+            value.units, target_currency, price_map, date,
+            (value_currency,) if value_currency is not None else ())
+
+    # Inventory.
+    result = QuoteInventory()
+    all_quotes = []
+    for pos in value:
+        converted, quotes = convert_with_quotes(pos, target_currency, price_map, date)
+        result.add_amount(converted.amount)
+        all_quotes.extend(quotes)
+        for quote in quotes:
+            result.add_quote(quote)
+    return result, all_quotes
+
+
 @function([position.Position], amount.Amount, name='units')
 def position_units(pos):
     """Get the number of units of a position (stripping cost)."""
@@ -480,7 +711,8 @@ def inventory_cost(inv):
 def convert_amount(context, amount_, currency, date=None):
     """Coerce an amount to a particular currency."""
     price_map = context.tables['prices'].price_map
-    return convert.convert_amount(amount_, currency, price_map, date)
+    converted, _ = convert_with_quotes(amount_, currency, price_map, date)
+    return converted.amount
 
 
 @function([position.Position, str], amount.Amount, pass_context=True, name='convert')
@@ -488,15 +720,63 @@ def convert_amount(context, amount_, currency, date=None):
 def convert_position(context, pos, currency, date=None):
     """Coerce an amount to a particular currency."""
     price_map = context.tables['prices'].price_map
-    return convert.convert_position(pos, currency, price_map, date)
+    converted, _ = convert_with_quotes(pos, currency, price_map, date)
+    return converted.amount
 
 
 @function([inventory.Inventory, str], inventory.Inventory, pass_context=True, name='convert')
 @function([inventory.Inventory, str, datetime.date], inventory.Inventory, pass_context=True, name='convert')
 def convert_inventory(context, inv, currency, date=None):
-    """Coerce an inventory to a particular currency."""
+    """Coerce an inventory to a particular currency.
+
+    The returned inventory keeps track of the price records used to
+    convert each of its positions. They can be retrieved with the
+    ``quotes()`` function.
+    """
     price_map = context.tables['prices'].price_map
-    return inv.reduce(convert.convert_position, currency, price_map, date)
+    result, _ = convert_with_quotes(inv, currency, price_map, date)
+    return result
+
+
+@function([amount.Amount, str], Conversion, pass_context=True, name='conversion')
+@function([amount.Amount, str, datetime.date], Conversion, pass_context=True, name='conversion')
+@function([position.Position, str], Conversion, pass_context=True, name='conversion')
+@function([position.Position, str, datetime.date], Conversion, pass_context=True, name='conversion')
+def conversion_amount(context, value, currency, date=None):
+    """Convert an amount and record the price used.
+
+    The returned structured value exposes the converted amount together
+    with the price date and currency pair the rate was taken from. A
+    value that cannot be converted is returned unchanged and its price
+    fields are NULL.
+    """
+    price_map = context.tables['prices'].price_map
+    converted, _ = convert_with_quotes(value, currency, price_map, date)
+    return converted
+
+
+@function([inventory.Inventory, str], inventory.Inventory, pass_context=True, name='conversion')
+@function([inventory.Inventory, str, datetime.date], inventory.Inventory, pass_context=True, name='conversion')
+def conversion_inventory(context, inv, currency, date=None):
+    """Convert an inventory recording the prices used.
+
+    The returned inventory carries the price records used to convert
+    each of its positions, retrievable with the ``quotes()`` function.
+    Positions that cannot be converted are left untouched and produce
+    no price record.
+    """
+    price_map = context.tables['prices'].price_map
+    result, _ = convert_with_quotes(inv, currency, price_map, date)
+    return result
+
+
+@function([Conversion], list, name='quotes')
+@function([inventory.Inventory], list, name='quotes')
+def quotes_(value):
+    """Get the price records used to perform a conversion."""
+    if isinstance(value, Conversion):
+        return list(value.quotes)
+    return list(getattr(value, 'quotes', ()))
 
 
 @function([position.Position], amount.Amount, pass_context=True, name='value')
@@ -832,6 +1112,10 @@ class SumInventory(query_compile.EvalAggregator):
     """Calculate the sum of the inventories. The result is an Inventory."""
     def __init__(self, context, operands):
         super().__init__(context, operands, inventory.Inventory)
+
+    def initialize(self, store):
+        store[self.handle] = QuoteInventory()
+        self.value = None
 
     def update(self, store, context):
         value = self.operands[0](context)

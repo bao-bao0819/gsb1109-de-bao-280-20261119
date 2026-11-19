@@ -1,6 +1,20 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- The ``conversion()`` BQL function has been added. It performs the same
+  currency conversions as ``convert()`` but returns a structured value
+  that also reports the price used for the conversion. The structure
+  exposes the converted ``amount``, the price ``date``, the ``base`` and
+  ``quote`` currency pair, the ``inverted`` flag and the underlying
+  ``price`` (or the full list of ``quotes`` for multi-step conversions).
+  Values that cannot be converted are returned unchanged, with NULL
+  price fields and an empty quote list.
+
+- The ``quotes()`` BQL function has been added. It returns the list of
+  price records used by a ``conversion()`` or ``convert()`` applied to an
+  inventory, making the rates used by aggregated balance reports
+  inspectable.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

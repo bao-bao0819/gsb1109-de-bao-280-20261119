@@ -9,6 +9,7 @@ from decimal import Decimal
 from dateutil.relativedelta import relativedelta
 
 from beancount.core.amount import from_string as A
+from beancount.core import amount
 from beancount.core.number import D
 from beancount.core import inventory
 from beancount.core.inventory import from_string as I
@@ -20,9 +21,11 @@ import beanquery
 
 from beanquery import CompilationError
 from beanquery import query_compile as qc
+from beanquery import query_env
 from beanquery import query_execute as qx
 from beanquery import tables
 from beanquery import compiler
+from beanquery import types
 
 
 class QueryBase(cmptest.TestCase):
@@ -465,6 +468,165 @@ class TestBeancountFunctions(QueryBase):
         self.assertResult('''SELECT convert(position, 'USD') LIMIT 1''', A('5.0 USD'))
         self.assertResult('''SELECT convert(sum(position), 'USD')''', I('0.0 USD'))
         self.assertResult('''SELECT convert(only('TEST', sum(position)), 'USD')''', A('0.0 USD'))
+
+
+class TestConversion(QueryBase):
+    INPUT = textwrap.dedent("""
+      2024-01-01 open Assets:Bank
+      2024-01-01 open Expenses:Misc
+
+      2024-01-01 price EUR 2 USD
+      2024-02-01 price EUR 3 USD
+      2024-01-01 price GBP 1.25 USD
+      2024-01-01 price HOOL 50 USD
+      2024-01-01 price CAD 0.75 USD
+
+      2024-03-01 * "euros"
+        Assets:Bank  100 EUR
+        Expenses:Misc
+
+      2024-03-01 * "dollars"
+        Assets:Bank  100 USD
+        Expenses:Misc
+
+      2024-03-01 * "unpriced"
+        Assets:Bank  1 XAU
+        Expenses:Misc
+
+      2024-03-01 * "at cost"
+        Assets:Bank  10 HOOL {50 USD}
+        Expenses:Misc
+    """)
+
+    def fetch(self, query):
+        return self.ctx.execute(query).fetchall()
+
+    def test_direct_quote(self):
+        rows = self.fetch("""
+            SELECT conversion(position, 'USD').amount,
+                   conversion(position, 'USD').base,
+                   conversion(position, 'USD').quote,
+                   conversion(position, 'USD').inverted,
+                   conversion(position, 'USD').price.rate
+            WHERE account = 'Assets:Bank' AND currency = 'EUR'
+        """)
+        # The latest EUR/USD price (3, dated 2024-02-01) is used by default.
+        self.assertEqual(rows, [(A('300 USD'), 'EUR', 'USD', False, D('3'))])
+
+    def test_inverse_quote(self):
+        rows = self.fetch("""
+            SELECT conversion(position, 'GBP').amount,
+                   conversion(position, 'GBP').base,
+                   conversion(position, 'GBP').quote,
+                   conversion(position, 'GBP').inverted
+            WHERE account = 'Assets:Bank' AND currency = 'USD'
+        """)
+        self.assertEqual(rows, [(A('80.0 GBP'), 'USD', 'GBP', True)])
+
+    def test_identity_quote(self):
+        rows = self.fetch("""
+            SELECT conversion(position, 'USD').amount,
+                   conversion(position, 'USD').base,
+                   conversion(position, 'USD').quote,
+                   conversion(position, 'USD').date,
+                   conversion(position, 'USD').inverted
+            WHERE account = 'Assets:Bank' AND currency = 'USD'
+        """)
+        self.assertEqual(rows, [(A('100 USD'), 'USD', 'USD', None, False)])
+
+    def test_missing_quote(self):
+        rows = self.fetch("""
+            SELECT conversion(position, 'USD').amount,
+                   conversion(position, 'USD').date,
+                   conversion(position, 'USD').base,
+                   conversion(position, 'USD').quote,
+                   conversion(position, 'USD').inverted,
+                   conversion(position, 'USD').price,
+                   length(conversion(position, 'USD').quotes)
+            WHERE account = 'Assets:Bank' AND currency = 'XAU'
+        """)
+        self.assertEqual(rows, [(A('1 XAU'), None, None, None, None, None, 0)])
+
+    def test_as_of_date(self):
+        rows = self.fetch("""
+            SELECT conversion(position, 'USD', 2024-01-15).amount,
+                   conversion(position, 'USD', 2024-01-15).date,
+                   conversion(position, 'USD', 2024-03-01).amount,
+                   conversion(position, 'USD', 2024-03-01).date
+            WHERE account = 'Assets:Bank' AND currency = 'EUR'
+        """)
+        self.assertEqual(rows, [(
+            A('200 USD'), datetime.date(2024, 1, 1),
+            A('300 USD'), datetime.date(2024, 2, 1))])
+
+    def test_implied_two_step_conversion(self):
+        rows = self.fetch("""
+            SELECT conversion(position, 'CAD').amount,
+                   conversion(position, 'CAD').date,
+                   conversion(position, 'CAD').price,
+                   length(conversion(position, 'CAD').quotes),
+                   conversion(position, 'CAD').quotes
+            WHERE account = 'Assets:Bank' AND currency = 'HOOL'
+        """)
+        amount_, date_, price_, length_, quotes_ = rows[0]
+        self.assertEqual(amount_.currency, 'CAD')
+        # 10 HOOL * 50 USD * (1 / 0.75 USD per CAD), rounded at 28 digits.
+        self.assertEqual(amount_.number.quantize(D('0.000001')), D('666.666667'))
+        self.assertIsNone(date_)
+        self.assertIsNone(price_)
+        self.assertEqual(length_, 2)
+        self.assertEqual([(q.base, q.quote) for q in quotes_], [('HOOL', 'USD'), ('USD', 'CAD')])
+
+    def test_inventory_mixed_group_quotes(self):
+        rows = self.fetch("""
+            SELECT convert(sum(position), 'USD'),
+                   quotes(conversion(sum(position), 'USD'))
+            WHERE account = 'Assets:Bank'
+        """)
+        inventory_, quotes_ = rows[0]
+        # The unpriced commodity is kept, in its original currency.
+        self.assertEqual(inventory_.get_currency_units('XAU'), A('1 XAU'))
+        # EUR at the latest price (100 * 3), USD (identity) and HOOL (10 * 50).
+        self.assertEqual(inventory_.get_currency_units('USD'), A('900 USD'))
+        # Only converted positions produced a quote; XAU produced none.
+        self.assertTrue(all(q.base != 'XAU' for q in quotes_))
+        pairs = {(q.base, q.quote) for q in quotes_}
+        self.assertIn(('EUR', 'USD'), pairs)
+        self.assertIn(('USD', 'USD'), pairs)
+        self.assertIn(('HOOL', 'USD'), pairs)
+
+    def test_sum_aggregation_preserves_quotes(self):
+        rows = self.fetch("""
+            SELECT account, length(quotes(convert(sum(position), 'USD')))
+            GROUP BY account
+            ORDER BY account
+        """)
+        counts = dict(rows)
+        # Bank holds four positions, all but the unpriced XAU convertible.
+        self.assertEqual(counts['Assets:Bank'], 3)
+        # The cost-denominated HOOL leg is booked in USD and merges with
+        # the USD balance: one fewer distinct converted position.
+        self.assertEqual(counts['Expenses:Misc'], 2)
+
+    def test_convert_remains_amount_only(self):
+        curs = self.ctx.execute("SELECT convert(position, 'USD') WHERE currency = 'EUR' LIMIT 1")
+        self.assertEqual(curs.description[0].datatype, amount.Amount)
+        self.assertEqual(curs.fetchall(), [(A('300 USD'),)])
+
+        curs = self.ctx.execute("SELECT convert(sum(position), 'USD')")
+        self.assertEqual(curs.description[0].datatype, inventory.Inventory)
+
+    def test_conversion_structure_types(self):
+        self.assertEqual(set(types.TYPES['quote'].columns),
+                         {'date', 'base', 'quote', 'rate', 'inverted'})
+        self.assertEqual(set(types.TYPES['conversion'].columns),
+                         {'amount', 'date', 'base', 'quote', 'inverted', 'price', 'quotes'})
+
+        curs = self.ctx.execute("SELECT conversion(position, 'USD') WHERE currency = 'EUR' LIMIT 1")
+        self.assertEqual(types.name(curs.description[0].datatype), 'conversion')
+        value = curs.fetchone()[0]
+        self.assertIsInstance(value, query_env.Conversion)
+        self.assertIsInstance(value.quotes[0], query_env.Quote)
 
 
 class TestBeancountMetadataFunctions(QueryBase):

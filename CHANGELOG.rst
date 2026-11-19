@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+Unreleased
+**********
+
+Features:
+
+- ``APISpec.to_dict`` and ``APISpec.to_yaml`` accept an ``openapi_version``
+  argument to render the same components for another OpenAPI 3 minor version.
+  ``Components.to_dict`` accepts the same argument. Nullable fields, including
+  nested ones, are translated between the 3.0 and 3.1 representations, and
+  rendering does not mutate the spec.
+
 6.10.1 (2026-11-03)
 *******************
 

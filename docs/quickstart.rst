@@ -104,6 +104,52 @@ Use `to_yaml <apispec.APISpec.to_yaml>` to export your spec to YAML.
 .. seealso::
     For a full reference of the `APISpec <apispec.APISpec>` class, see the :doc:`Core API Reference <api_core>`.
 
+Rendering a Different OpenAPI 3 Version
+---------------------------------------
+
+An `APISpec <apispec.APISpec>` is created for one OpenAPI version, but the same
+components can be rendered for another OpenAPI 3 minor version. Pass the target
+version to `to_dict <apispec.APISpec.to_dict>` or
+`to_yaml <apispec.APISpec.to_yaml>`:
+
+.. code-block:: python
+
+    spec = APISpec(
+        title="Gisty",
+        version="1.0.0",
+        openapi_version="3.1.0",
+        plugins=[MarshmallowPlugin()],
+    )
+    # ... register components and paths ...
+
+    document_31 = spec.to_dict("3.1.0")
+    document_30 = spec.to_dict("3.0.0")
+    assert spec.to_dict("3.1.0") == document_31
+
+`Components.to_dict <apispec.core.Components.to_dict>` accepts the same target
+version to translate only the registered components.
+
+Rendering does not modify the spec, so components registered once can be
+exported repeatedly and in any order. This makes it possible to serve a 3.1
+document to one consumer and a 3.0 document to another.
+
+Nullable fields are translated across versions, including nested fields inside
+arrays, dictionaries and combinators:
+
+- 3.1 ``{"type": ["string", "null"]}`` becomes
+  3.0 ``{"type": "string", "nullable": true}``.
+- 3.1 ``{"anyOf": [{"$ref": "..."}, {"type": "null"}]}`` becomes
+  3.0 ``{"anyOf": [{"type": "object", "nullable": true}, {"$ref": "..."}]}``.
+- 3.0 ``{"$ref": "...", "description": "..."}`` becomes
+  3.1 ``{"$ref": "...", "description": "..."}``. Sibling keywords next to a
+  ``$ref`` are only allowed in 3.1.
+
+.. note::
+    Versions 3.0 and 3.1 describe some values differently, so translating a
+    document is lossy in a few edge cases (for example, a nullable
+    ``fields.Raw``). Translation between major versions (2 and 3) is not
+    supported.
+
 
 Next Steps
 ----------

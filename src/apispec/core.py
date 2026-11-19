@@ -16,6 +16,7 @@ from .exceptions import (
     InvalidParameterError,
     PluginMethodNotImplementedError,
 )
+from .openapi_version import convert_components, convert_document, get_target_minor
 from .utils import COMPONENT_SUBSECTIONS, build_reference, deepupdate
 
 if typing.TYPE_CHECKING:
@@ -78,12 +79,42 @@ class Components:
             "link": self.links_lazy,
         }
 
-    def to_dict(self) -> dict[str, dict]:
-        return {
+    def to_dict(
+        self,
+        openapi_version: str | Version | None = None,
+        *,
+        target_version: str | Version | None = None,
+    ) -> dict[str, dict]:
+        """Return the components as a dictionary.
+
+        :param str|Version|None openapi_version: OpenAPI 3 version to render
+            the component schemas for. Defaults to the components' version.
+        :param str|Version|None target_version: Alias for ``openapi_version``.
+        """
+        if openapi_version is not None and target_version is not None:
+            raise APISpecError(
+                "Pass either openapi_version or target_version, not both."
+            )
+        target = openapi_version if openapi_version is not None else target_version
+        target_openapi_version = (
+            self.openapi_version if target is None else Version(str(target))
+        )
+        if target_openapi_version.major != self.openapi_version.major:
+            raise APISpecError(
+                "Exporting to a different OpenAPI major version is not supported: "
+                f"{target_openapi_version}"
+            )
+        ret = {
             COMPONENT_SUBSECTIONS[self.openapi_version.major][k]: v
             for k, v in self._subsections.items()
             if v != {}
         }
+        if target is not None:
+            ret = deepcopy(ret)
+            convert_components(
+                ret, self.openapi_version.minor, target_openapi_version.minor
+            )
+        return ret
 
     def _register_component(
         self,
@@ -477,32 +508,111 @@ class APISpec:
         for plugin in self.plugins:
             plugin.init_spec(self)
 
-    def to_dict(self) -> dict[str, typing.Any]:
+    def to_dict(
+        self,
+        openapi_version: str | Version | None = None,
+        *,
+        target_version: str | Version | None = None,
+        version: str | Version | None = None,
+    ) -> dict[str, typing.Any]:
+        """Return the OpenAPI document as a dictionary.
+
+        :param str|Version|None openapi_version: OpenAPI 3 version to render.
+            Defaults to the version the spec was created with. The spec itself
+            is not modified, so the same components may be rendered to
+            several versions.
+        :param str|Version|None target_version: Alias for ``openapi_version``.
+        :param str|Version|None version: Alias for ``openapi_version``.
+        """
+        targets = [
+            value
+            for value in (openapi_version, target_version, version)
+            if value is not None
+        ]
+        if len(targets) > 1:
+            raise APISpecError(
+                "Pass only one of openapi_version, target_version or version."
+            )
+        target = targets[0] if targets else None
+        target_openapi_version = (
+            self.openapi_version if target is None else Version(str(target))
+        )
+        if target_openapi_version.major != self.openapi_version.major:
+            raise APISpecError(
+                "Exporting to a different OpenAPI major version is not supported: "
+                f"{target_openapi_version}"
+            )
+        target_minor = (
+            get_target_minor(target_openapi_version)
+            if target_openapi_version.major == 3
+            else self.openapi_version.minor
+        )
+        # An explicitly rendered document is detached from the spec so that
+        # rendering another version never contaminates the registered
+        # components.
+        should_copy = (
+            self.openapi_version.major == 3
+            and target is not None
+            and target_openapi_version.minor != self.openapi_version.minor
+        )
+
+        def copy_if_needed(obj):
+            return deepcopy(obj) if should_copy else obj
+
         ret: dict[str, typing.Any] = {
-            "paths": self._paths,
+            "paths": copy_if_needed(self._paths),
             "info": {"title": self.title, "version": self.version},
         }
         if self._tags:
-            ret["tags"] = self._tags
+            ret["tags"] = copy_if_needed(self._tags)
         if self.openapi_version.major < 3:
             ret["swagger"] = str(self.openapi_version)
-            ret.update(self.components.to_dict())
+            ret.update(copy_if_needed(self.components.to_dict()))
         else:
             ret["openapi"] = str(self.openapi_version)
-            components_dict = self.components.to_dict()
+            components_dict = copy_if_needed(self.components.to_dict())
             if components_dict:
                 ret["components"] = components_dict
-        ret = deepupdate(ret, self.options)
+        ret = deepupdate(ret, deepcopy(self.options))
+
+        convert_document(ret, self.openapi_version.minor, target_minor)
+        if self.openapi_version.major >= 3:
+            ret["openapi"] = str(target_openapi_version)
         return ret
 
-    def to_yaml(self, yaml_dump_kwargs: typing.Any | None = None) -> str:
+    def to_yaml(
+        self,
+        yaml_dump_kwargs: typing.Any | None = None,
+        *,
+        openapi_version: str | Version | None = None,
+        target_version: str | Version | None = None,
+        version: str | Version | None = None,
+    ) -> str:
         """Render the spec to YAML. Requires PyYAML to be installed.
 
         :param dict yaml_dump_kwargs: Additional keyword arguments to pass to `yaml.dump`
+        :param str|Version|None openapi_version: OpenAPI 3 version to render.
+            Defaults to the version the spec was created with.
+        :param str|Version|None target_version: Alias for ``openapi_version``.
+        :param str|Version|None version: Alias for ``openapi_version``.
         """
         from .yaml_utils import dict_to_yaml
 
-        return dict_to_yaml(self.to_dict(), yaml_dump_kwargs)
+        return dict_to_yaml(
+            self.to_dict(
+                openapi_version, target_version=target_version, version=version
+            ),
+            yaml_dump_kwargs,
+        )
+
+    def to_openapi_version(
+        self, openapi_version: str | Version
+    ) -> dict[str, typing.Any]:
+        """Return the document rendered for the given OpenAPI 3 version.
+
+        This is a convenience alias for ``to_dict(openapi_version)``.
+        """
+        return self.to_dict(openapi_version)
 
     def tag(self, tag: dict) -> APISpec:
         """Store information about a tag.

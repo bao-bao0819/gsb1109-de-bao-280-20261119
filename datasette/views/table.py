@@ -21,7 +21,7 @@ from datasette.events import (
     UpsertRowsEvent,
 )
 from datasette.extras import ExtraScope, extra_names_from_request
-from datasette.filters import Filters
+from datasette.filters import Filters, filter_key_matches_column
 from datasette.plugins import pm
 from datasette.renderer import apply_column_type_transforms
 from datasette.resources import DatabaseResource, TableResource
@@ -2337,6 +2337,40 @@ async def _table_filters(datasette, request, database_name, table_name):
     )
 
 
+def make_facet_sql_without_column(
+    datasette, request, database_name, table_name, select_all_columns
+):
+    """
+    Return an async callable(column) that builds the SQL for the current
+    page with the filters that apply to ``column`` left out.
+
+    Facets use this to keep showing counts for the other values in their
+    column when one of them is selected. Every other filter, such as a date
+    or source filter, still applies.
+    """
+
+    async def inner(column):
+        args = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                request.query_string, keep_blank_values=True
+            )
+            if not filter_key_matches_column(key, column)
+        ]
+        filtered_request = _request_with_query_string(
+            request, urllib.parse.urlencode(args)
+        )
+        _, where_clauses, params, _, _ = await _table_filters(
+            datasette, filtered_request, database_name, table_name
+        )
+        sql = f"select {select_all_columns} from {escape_sqlite(table_name)}"
+        if where_clauses:
+            sql += " where " + " and ".join(where_clauses)
+        return sql, params
+
+    return inner
+
+
 async def table_view_data(
     datasette,
     request,
@@ -2667,6 +2701,13 @@ async def table_view_data(
         extra_registry=table_extra_registry,
         display_columns_and_rows=display_columns_and_rows,
         run_sequential=run_sequential,
+        facet_sql_without_column=make_facet_sql_without_column(
+            datasette,
+            request,
+            database_name,
+            table_name,
+            select_all_columns,
+        ),
     )
 
     data = {

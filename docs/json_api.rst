@@ -1607,6 +1607,9 @@ Special table arguments
 ``?_facet_size=100``
     Increase the number of facet results returned for each facet. Use ``?_facet_size=max`` for the maximum available size, determined by :ref:`setting_max_returned_rows`.
 
+``?_facet_ignore_filters=1``
+    Calculate each facet without the filters for its own column, so the other values for that column keep their counts when one of them is selected. Every other filter still applies, and ``NULL`` values are included as their own option. See :ref:`facets_other_values`.
+
 ``?_nofacet=1``
     Disable all facets and facet suggestions for this page, including any defined by :ref:`facets_metadata`.
 

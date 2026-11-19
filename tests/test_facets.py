@@ -1014,3 +1014,287 @@ async def test_facet_suggest_total_time_limit(
             assert suggestion_queries == 4
     finally:
         ds.close()
+
+
+async def _ignore_filters_ds():
+    ds = Datasette()
+    db = ds.add_memory_database("inspection")
+    await db.execute_write_script(
+        """
+        create table inspections (
+            id integer primary key,
+            day text,
+            source text,
+            region text
+        );
+        insert into inspections (day, source, region) values
+            ('2026-01-01', 'a', 'east'),
+            ('2026-01-01', 'a', 'east'),
+            ('2026-01-01', 'a', 'west'),
+            ('2026-01-01', 'a', null),
+            ('2026-01-01', 'b', 'east'),
+            ('2026-01-02', 'a', 'east'),
+            ('2026-01-02', 'a', 'west'),
+            ('2026-01-02', 'a', null);
+        """
+    )
+    return ds
+
+
+def _region_counts(facet):
+    return {row["value"]: row["count"] for row in facet["results"]}
+
+
+async def test_facet_ignore_filters_shows_other_values():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections.json?_facet=region&_facet_ignore_filters=1"
+            "&day=2026-01-01&source=a"
+        )
+        assert response.status_code == 200
+        facet = response.json()["facet_results"]["results"]["region"]
+        # NULL is its own option, after the other values
+        assert [(r["value"], r["count"]) for r in facet["results"]] == [
+            ("east", 2),
+            ("west", 1),
+            (None, 1),
+        ]
+        assert [r["selected"] for r in facet["results"]] == [False, False, False]
+        # The table itself still honors every filter
+        assert [row["region"] for row in response.json()["rows"]] == [
+            "east",
+            "east",
+            "west",
+            None,
+        ]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_selected_value_replaces_filter():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections.json?_facet=region&_facet_ignore_filters=1"
+            "&day=2026-01-01&source=a&region=east"
+        )
+        assert response.status_code == 200
+        facet = response.json()["facet_results"]["results"]["region"]
+        # Other regions keep their counts, calculated under day/source only
+        assert _region_counts(facet) == {"east": 2, "west": 1, None: 1}
+        selected = {
+            row["value"]: row["selected"] for row in facet["results"]
+        }
+        assert selected == {"east": True, "west": False, None: False}
+        # Following another region replaces region=east rather than adding to it
+        west = next(r for r in facet["results"] if r["value"] == "west")
+        assert parse_qsl(urlsplit(west["toggle_url"]).query) == [
+            ("_facet", "region"),
+            ("_facet_ignore_filters", "1"),
+            ("day", "2026-01-01"),
+            ("source", "a"),
+            ("region", "west"),
+        ]
+        # The table still only shows rows that match the original filters
+        assert [row["region"] for row in response.json()["rows"]] == ["east", "east"]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_null_option_selected():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections.json?_facet=region&_facet_ignore_filters=1"
+            "&day=2026-01-01&source=a&region__isnull=1"
+        )
+        assert response.status_code == 200
+        facet = response.json()["facet_results"]["results"]["region"]
+        assert _region_counts(facet) == {"east": 2, "west": 1, None: 1}
+        null_row = next(r for r in facet["results"] if r["value"] is None)
+        assert null_row["selected"] is True
+        assert parse_qsl(urlsplit(null_row["toggle_url"]).query) == [
+            ("_facet", "region"),
+            ("_facet_ignore_filters", "1"),
+            ("day", "2026-01-01"),
+            ("source", "a"),
+        ]
+        assert [row["region"] for row in response.json()["rows"]] == [None]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_default_unchanged():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections.json?_facet=region&day=2026-01-01&source=a"
+        )
+        facet = response.json()["facet_results"]["results"]["region"]
+        # Without the option NULL values stay hidden
+        assert _region_counts(facet) == {"east": 2, "west": 1}
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_named_column_only():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections.json?_facet=region&_facet=source"
+            "&_facet_ignore_filters=region&day=2026-01-01&source=a"
+        )
+        results = response.json()["facet_results"]["results"]
+        assert _region_counts(results["region"]) == {"east": 2, "west": 1, None: 1}
+        # Other facets are unaffected
+        assert _region_counts(results["source"]) == {"a": 4}
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_per_column_config():
+    ds = Datasette()
+    db = ds.add_memory_database("inspection_config")
+    await db.execute_write_script(
+        """
+        create table inspections (id integer primary key, region text, source text);
+        insert into inspections (region, source) values
+            ('east', 'a'), ('east', 'b'), ('west', 'a'), (null, 'a');
+        """
+    )
+    try:
+        response = await ds.client.get(
+            '/inspection_config/inspections.json?_facet={"column":'
+            '{"simple": "region", "ignore_filters": true}}&region=east'
+        )
+        assert response.status_code == 200
+        facet = response.json()["facet_results"]["results"]["region"]
+        assert [(r["value"], r["count"]) for r in facet["results"]] == [
+            ("east", 2),
+            ("west", 1),
+            (None, 1),
+        ]
+        assert [r["selected"] for r in facet["results"]] == [True, False, False]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_table_config():
+    ds = Datasette(
+        config={
+            "databases": {
+                "inspection_config": {
+                    "tables": {"inspections": {"facet_mode": "all"}}
+                }
+            }
+        }
+    )
+    db = ds.add_memory_database("inspection_config")
+    await db.execute_write_script(
+        """
+        create table inspections (id integer primary key, region text);
+        insert into inspections (region) values ('east'), ('west'), (null);
+        """
+    )
+    try:
+        response = await ds.client.get(
+            "/inspection_config/inspections.json?_facet=region&region=east"
+        )
+        facet = response.json()["facet_results"]["results"]["region"]
+        assert [(r["value"], r["count"]) for r in facet["results"]] == [
+            ("east", 1),
+            ("west", 1),
+            (None, 1),
+        ]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_html_null_renders_dash():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections?_facet=region&_facet_ignore_filters=1"
+            "&day=2026-01-01&source=a"
+        )
+        assert response.status_code == 200
+        from bs4 import BeautifulSoup as Soup
+
+        soup = Soup(response.text, "html.parser")
+        items = soup.select('#facet-region a[data-facet-value="None"]')
+        assert len(items) == 1
+        assert items[0].get_text() == "-"
+        assert "region__isnull=1" in items[0]["href"]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_from_table_metadata():
+    ds = Datasette(
+        metadata={
+            "databases": {
+                "inspection_metadata": {
+                    "tables": {
+                        "inspections": {
+                            "facets": [
+                                "region",
+                                {
+                                    "column": {
+                                        "simple": "region",
+                                        "ignore_filters": True,
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    )
+    db = ds.add_memory_database("inspection_metadata")
+    await db.execute_write_script(
+        """
+        create table inspections (id integer primary key, region text);
+        insert into inspections (region) values ('east'), ('west'), (null);
+        """
+    )
+    try:
+        response = await ds.client.get(
+            "/inspection_metadata/inspections.json?region=east&_extra=facet_results"
+        )
+        assert response.status_code == 200
+        results = response.json()["facet_results"]["results"]
+        # The plain "region" facet keeps the old behavior
+        assert [(r["value"], r["count"]) for r in results["region"]["results"]] == [
+            ("east", 1)
+        ]
+        # The configured facet shows the other values, with NULL included
+        assert [
+            (r["value"], r["count"])
+            for r in results["region_2"]["results"]
+        ] == [("east", 1), ("west", 1), (None, 1)]
+    finally:
+        ds.close()
+
+
+async def test_facet_ignore_filters_does_not_hide_other_facets():
+    ds = await _ignore_filters_ds()
+    try:
+        response = await ds.client.get(
+            "/inspection/inspections.json?_facet=region&_facet=source"
+            "&_facet_ignore_filters=1&day=2026-01-01&region=east"
+        )
+        results = response.json()["facet_results"]["results"]
+        # region ignores only its own filter; day still applies
+        assert _region_counts(results["region"]) == {"east": 3, "west": 1, None: 1}
+        # source keeps its own filters: day and region still apply to it
+        assert _region_counts(results["source"]) == {"a": 2, "b": 1}
+        # Table rows still use every filter: day and region
+        assert [row["region"] for row in response.json()["rows"]] == [
+            "east",
+            "east",
+            "east",
+        ]
+    finally:
+        ds.close()

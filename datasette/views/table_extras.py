@@ -52,6 +52,7 @@ class TableExtraContext:
     extra_registry: ExtraRegistry
     display_columns_and_rows: object
     run_sequential: object
+    facet_sql_without_column: object = None
     query_name: str | None = None
     scope: ExtraScope = ExtraScope.TABLE
 
@@ -180,19 +181,29 @@ class FacetInstancesProvider(Provider):
         facet_classes = list(
             itertools.chain.from_iterable(pm.hook.register_facet_classes())
         )
+
+        async def ignore_filters(column):
+            """
+            SQL for this page with the filters for ``column`` left out.
+
+            Used by facets that keep showing the other values for their column
+            when one of them is selected.
+            """
+            return await context.facet_sql_without_column(column)
+
         for facet_class in facet_classes:
-            facet_instances.append(
-                facet_class(
-                    context.datasette,
-                    context.request,
-                    context.database_name,
-                    sql=context.sql_no_order_no_limit,
-                    params=context.from_sql_params,
-                    table=context.table_name,
-                    table_config=context.table_metadata,
-                    row_count=count,
-                )
+            facet_instance = facet_class(
+                context.datasette,
+                context.request,
+                context.database_name,
+                sql=context.sql_no_order_no_limit,
+                params=context.from_sql_params,
+                table=context.table_name,
+                table_config=context.table_metadata,
+                row_count=count,
             )
+            facet_instance.ignore_filters = ignore_filters
+            facet_instances.append(facet_instance)
         return facet_instances
 
 

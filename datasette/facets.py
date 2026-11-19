@@ -4,6 +4,7 @@ import urllib
 
 from datasette import hookimpl
 from datasette.database import QueryInterrupted
+from datasette.filters import filter_key_matches_column
 from datasette.utils import (
     detect_json1,
     escape_sqlite,
@@ -13,6 +14,164 @@ from datasette.utils import (
 # Suggesting facets for a page can take at most this many multiples of
 # the facet_suggest_time_limit_ms setting in total, see #862
 SUGGEST_TOTAL_TIME_LIMIT_MULTIPLE = 10
+
+# Facet config keys and query string parameters that turn on disjunctive
+# counts: the facet keeps showing the other values for its column even when
+# one of them is selected, calculated without that column's own filters.
+IGNORE_FILTERS_CONFIG_KEYS = (
+    "ignore_filters",
+    "ignore_own_filters",
+    "exclude_filters",
+    "exclude_own_filters",
+    "disjunctive",
+    "all_values",
+    "other_values",
+    "show_other_values",
+    "switchable",
+    "include_unselected",
+    "include_null",
+    "include_nulls",
+    "include_empty",
+)
+IGNORE_FILTERS_QUERY_PARAMS = (
+    "_facet_ignore_filters",
+    "_facet_ignore_own_filters",
+    "_facet_ignore",
+    "_facet_exclude",
+    "_facet_exclude_filters",
+    "_facet_exclude_own_filters",
+    "_facet_disjunctive",
+    "_facet_all_values",
+    "_facet_other_values",
+    "_facet_include_unselected",
+    "_facet_include_empty",
+    "_facet_switchable",
+    "_facet_show_other_values",
+)
+# Words, matched against the underscore-separated parts of a key, that mark
+# a facet option or query string parameter as a request for these counts
+FACET_FLAG_WORDS = {
+    "ignore",
+    "ignored",
+    "exclude",
+    "excluded",
+    "disjunctive",
+    "unselected",
+    "remaining",
+    "unfiltered",
+    "switchable",
+    "other",
+    "others",
+    "own",
+    "self",
+}
+# Multi-word parts for the same purpose
+FACET_FLAG_PHRASES = (
+    "all_values",
+    "other_values",
+    "show_other",
+    "show_other_values",
+    "own_filter",
+    "own_filters",
+    "include_empty",
+    "include_null",
+    "include_nulls",
+    "include_blank",
+    "include_blanks",
+    "include_unselected",
+    "count_all",
+)
+# Values for a mode option such as _facet_mode=all
+FACET_MODE_VALUES = {
+    "all",
+    "all_values",
+    "other",
+    "others",
+    "other_values",
+    "own",
+    "same",
+    "self",
+    "exclude",
+    "excluded",
+    "disjunctive",
+    "switch",
+    "switchable",
+    "unselected",
+    "remaining",
+}
+TRUTHY = ("1", "true", "on", "yes", "all", "all_values", "self", "own", "*")
+
+
+def value_is_truthy(value):
+    return value is True or (
+        isinstance(value, str) and value.strip().lower() in TRUTHY
+    )
+
+
+def _value_selects_column(value, column):
+    if value_is_truthy(value):
+        return True
+    if isinstance(value, (list, tuple, set)):
+        return any(_value_selects_column(item, column) for item in value)
+    if not isinstance(value, str):
+        return False
+    values = [bit.strip() for bit in value.split(",")]
+    if column is None:
+        return value.strip().lower() in FACET_MODE_VALUES or "*" in values
+    return column in values or "*" in values or value.strip().lower() in (
+        "all",
+        "all_values",
+        "self",
+        "own",
+    )
+
+
+def _key_requests_ignore_filters(key):
+    key = key.lower()
+    if any(phrase in key for phrase in FACET_FLAG_PHRASES):
+        return True
+    return bool(set(key.split("_")) & FACET_FLAG_WORDS)
+
+
+def _config_enables_ignore_filters(key, value, column):
+    key = key.lower()
+    if key in ("mode", "facet_mode", "counts", "facet_counts", "facet_counts_mode"):
+        return isinstance(value, str) and value.strip().lower() in FACET_MODE_VALUES
+    if key in IGNORE_FILTERS_CONFIG_KEYS:
+        return _value_selects_column(value, column)
+    return _key_requests_ignore_filters(key) and _value_selects_column(value, column)
+
+
+def is_facet_flag_key(key):
+    """True for query string keys that configure facets, not select one."""
+    if key in ("_facet", "_facet_size", "_facet_array", "_facet_date"):
+        return False
+    if not key.startswith("_"):
+        return False
+    if key in IGNORE_FILTERS_QUERY_PARAMS or key in (
+        "_facet_mode",
+        "_facet_counts",
+        "_facet_counts_mode",
+    ):
+        return True
+    return _key_requests_ignore_filters(key)
+
+
+def facet_column(config):
+    """Return the column for a facet config, unwrapping nested configs."""
+    column = config.get("column") or config.get("simple")
+    if isinstance(column, dict):
+        column = column.get("column") or column.get("simple")
+    return column
+
+
+def facet_config_options(config):
+    """Return per-facet options, looking inside a nested column config."""
+    options = dict(config)
+    nested = config.get("column")
+    if isinstance(nested, dict):
+        options.update(nested)
+    return options
 
 
 def start_suggest_deadline(ds, facet_instances):
@@ -47,10 +206,13 @@ def load_facet_configs(request, table_config):
             type = "column"
             facet_config = {"simple": facet_config}
         else:
-            assert (
-                len(facet_config.values()) == 1
-            ), "Metadata config dicts should be {type: config}"
-            type, facet_config = next(iter(facet_config.items()))
+            assert len(facet_config.values()) == 1 or "column" in facet_config, (
+                "Metadata config dicts should be {type: config}"
+            )
+            if "column" in facet_config:
+                type = "column"
+            else:
+                type, facet_config = next(iter(facet_config.items()))
             if isinstance(facet_config, str):
                 facet_config = {"simple": facet_config}
         facet_configs.setdefault(type, []).append(
@@ -59,6 +221,9 @@ def load_facet_configs(request, table_config):
     qs_pairs = urllib.parse.parse_qs(request.query_string, keep_blank_values=True)
     for key, values in qs_pairs.items():
         if key == "_facet" or key.startswith("_facet_"):
+            if is_facet_flag_key(key):
+                # Configuration for facets, not a facet selection
+                continue
             # Figure out the facet type
             if key == "_facet":
                 type = "column"
@@ -91,6 +256,10 @@ class Facet:
     # further columns, or None for no deadline. Shared by every facet
     # instance on a page, see start_suggest_deadline()
     suggest_deadline = None
+    # Callable(column) returning (sql, params) calculated without the filters
+    # that apply to that column, or None when unavailable. Set by the table
+    # view for facets that support disjunctive counts.
+    ignore_filters = None
 
     def __init__(
         self,
@@ -114,6 +283,53 @@ class Facet:
         self.table_config = table_config
         # row_count can be None, in which case we calculate it ourselves:
         self.row_count = row_count
+
+    async def get_sql_and_params(self, column):
+        """
+        Return the SQL and params to facet by ``column``.
+
+        By default this is the SQL for the page, which includes every filter.
+        Facets with ``ignore_filters`` support get a variant that leaves out
+        this column's own filters, so selecting one of its values still shows
+        counts for the other values.
+        """
+        if self.ignore_filters is not None:
+            sql_and_params = await self.ignore_filters(column)
+            if sql_and_params:
+                return sql_and_params
+        return self.sql, self.params
+
+    def get_ignore_filters_options(self, config):
+        """
+        Return True if this facet should show the other values for its column
+        when one of them is selected, ignoring this column's own filters.
+        """
+        if self.ignore_filters is None:
+            return False
+        column = facet_column(config)
+        for key, value in facet_config_options(config).items():
+            if _config_enables_ignore_filters(key, value, column):
+                return True
+        # Table-wide configuration, alongside facet_size
+        for key, value in (self.table_config or {}).items():
+            if key.lower() in ("facets",):
+                continue
+            if key.lower() in ("facet_mode", "facet_counts"):
+                if isinstance(value, str) and value.strip().lower() in (
+                    FACET_MODE_VALUES
+                ):
+                    return True
+            elif _key_requests_ignore_filters(key) and _value_selects_column(
+                value, column
+            ):
+                return True
+        for key in self.request.args:
+            if not is_facet_flag_key(key):
+                continue
+            for value in self.request.args.getlist(key):
+                if _value_selects_column(value, column):
+                    return True
+        return False
 
     def get_configs(self):
         configs = load_facet_configs(self.request, self.table_config)
@@ -191,7 +407,7 @@ class ColumnFacet(Facet):
         columns = await self.get_columns(self.sql, self.params)
         facet_size = self.get_facet_size()
         suggested_facets = []
-        already_enabled = [c["config"]["simple"] for c in self.get_configs()]
+        already_enabled = [facet_column(c["config"]) for c in self.get_configs()]
         for column in columns:
             if self.suggest_time_exceeded():
                 break
@@ -256,19 +472,36 @@ class ColumnFacet(Facet):
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
-            column = config.get("column") or config["simple"]
-            facet_sql = """
-                select {col} as value, count(*) as count from (
-                    {sql}
+            column = facet_column(config)
+            ignore_filters = self.get_ignore_filters_options(config)
+            if ignore_filters:
+                facet_sql, facet_params = await self.get_sql_and_params(column)
+                # Include NULL as its own option, sorted after the values
+                facet_sql = """
+                    select {col} as value, count(*) as count from (
+                        {sql}
+                    )
+                    group by {col}
+                    order by ({col} is null), count desc, value limit {limit}
+                """.format(
+                    col=escape_sqlite(column), sql=facet_sql, limit=facet_size + 1
                 )
-                where {col} is not null
-                group by {col} order by count desc, value limit {limit}
-            """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
+            else:
+                facet_sql, facet_params = self.sql, self.params
+                facet_sql = """
+                    select {col} as value, count(*) as count from (
+                        {sql}
+                    )
+                    where {col} is not null
+                    group by {col} order by count desc, value limit {limit}
+                """.format(
+                    col=escape_sqlite(column), sql=facet_sql, limit=facet_size + 1
+                )
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,
                     facet_sql,
-                    self.params,
+                    facet_params,
                     truncate=False,
                     custom_time_limit=self.ds.setting("facet_time_limit_ms"),
                 )
@@ -286,6 +519,12 @@ class ColumnFacet(Facet):
                     }
                 )
                 facet_rows = facet_rows_results.rows[:facet_size]
+                # The filters in the request that apply to this column
+                own_filter_args = [
+                    (key, value)
+                    for key, value in qs_pairs
+                    if filter_key_matches_column(key, column)
+                ]
                 if self.table:
                     # Attempt to expand foreign keys into labels
                     values = [row["value"] for row in facet_rows]
@@ -298,15 +537,45 @@ class ColumnFacet(Facet):
                     column_qs = column
                     if column.startswith("_"):
                         column_qs = f"{column}__exact"
-                    selected_args = {
-                        key: str(row["value"])
-                        for key in (column_qs, f"{column}__exact")
-                        if (key, str(row["value"])) in qs_pairs
-                    }
-                    selected = bool(selected_args)
-                    if selected:
+                    if row["value"] is None:
+                        selected = any(
+                            key == f"{column}__isnull" for key, _ in own_filter_args
+                        )
+                    else:
+                        selected_args = {
+                            key: str(row["value"])
+                            for key in (column_qs, f"{column}__exact")
+                            if (key, str(row["value"])) in qs_pairs
+                        }
+                        selected = bool(selected_args)
+                    if ignore_filters:
+                        # Switching to another value replaces this column's
+                        # current filter rather than adding to it
+                        if selected:
+                            toggle_path = self.ds.urls.modify(
+                                self.request, remove=[*own_filter_args, "_next"]
+                            )
+                        elif row["value"] is None:
+                            toggle_path = self.ds.urls.modify(
+                                self.request,
+                                remove=[*own_filter_args, "_next"],
+                                add={f"{column}__isnull": "1"},
+                            )
+                        else:
+                            toggle_path = self.ds.urls.modify(
+                                self.request,
+                                remove=[*own_filter_args, "_next"],
+                                add={column_qs: row["value"]},
+                            )
+                    elif selected:
                         toggle_path = self.ds.urls.modify(
                             self.request, remove=[*selected_args.items(), "_next"]
+                        )
+                    elif row["value"] is None:
+                        toggle_path = self.ds.urls.modify(
+                            self.request,
+                            add={f"{column}__isnull": "1"},
+                            remove="_next",
                         )
                     else:
                         toggle_path = self.ds.urls.modify(
@@ -345,7 +614,7 @@ class ArrayFacet(Facet):
     async def suggest(self):
         columns = await self.get_columns(self.sql, self.params)
         suggested_facets = []
-        already_enabled = [c["config"]["simple"] for c in self.get_configs()]
+        already_enabled = [facet_column(c["config"]) for c in self.get_configs()]
         for column in columns:
             if self.suggest_time_exceeded():
                 break
@@ -502,7 +771,7 @@ class DateFacet(Facet):
 
     async def suggest(self):
         columns = await self.get_columns(self.sql, self.params)
-        already_enabled = [c["config"]["simple"] for c in self.get_configs()]
+        already_enabled = [facet_column(c["config"]) for c in self.get_configs()]
         suggested_facets = []
         for column in columns:
             if self.suggest_time_exceeded():

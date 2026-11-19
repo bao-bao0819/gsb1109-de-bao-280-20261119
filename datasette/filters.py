@@ -310,6 +310,24 @@ class NotInFilter(InFilter):
         return f"{column} not in {json.dumps(self.split_value(value))}"
 
 
+def filter_key_matches_column(key, column):
+    """
+    Return True if a query string key applies a filter to ``column``.
+
+    ``region``, ``region__exact`` and ``region__isnull`` all match ``region``,
+    while an unrelated key such as ``region_name`` does not. Keys such as
+    ``_search`` are special parameters rather than column filters.
+    """
+    if key.startswith("_") and "__" not in key:
+        return False
+    if key == column:
+        return True
+    prefix = f"{column}__"
+    if key.startswith(prefix):
+        return key[len(prefix) :] in Filters._filters_by_key
+    return False
+
+
 class Filters:
     _filters = (
         [

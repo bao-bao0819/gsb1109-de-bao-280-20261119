@@ -98,6 +98,35 @@ If Datasette detects that a column is a foreign key, the ``"label"`` property wi
 The default number of facet results returned is 30, controlled by the :ref:`setting_default_facet_size` setting.
 You can increase this on an individual page by adding ``?_facet_size=100`` to the query string, up to a maximum of :ref:`setting_max_returned_rows` (which defaults to 1000).
 
+.. _facets_other_values:
+
+Counting the other values for a column
+--------------------------------------
+
+By default a facet counts values against every filter on the page, including the filter for its own column.
+Selecting ``state=MI`` therefore leaves just ``MI`` in the ``state`` facet, so there is no count to show for the other states you could switch to.
+
+Add ``?_facet_ignore_filters=1`` to request counts calculated without the filters for each facet's own column:
+
+    /dbname/tablename?_facet=state&state=MI&_facet_ignore_filters=1
+
+Every other filter still applies.
+If the page also filters on a date and a source, those rows are still counted, but the ``state=MI`` filter is left out when counting states.
+The value you selected for a column still appears in its facet, and links for the other values replace that filter rather than adding a second one.
+
+Rows where the column is ``NULL`` are included as their own option, with a ``null`` value and a count, so empty values can be selected and cleared like any other value.
+This only changes the facet counts - the rows in the table itself are still those matching the original filters.
+
+The mode can also be applied per column, using a ``{"column": {...}}`` facet configuration or the table's ``facets`` configuration:
+
+.. code-block:: yaml
+
+    facets:
+    - state
+    - column:
+        simple: region
+        ignore_filters: true
+
 .. _facets_metadata:
 
 Facets in configuration

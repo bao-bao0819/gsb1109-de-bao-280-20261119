@@ -99,6 +99,7 @@ Features
 - The select boxes used to filter a table now look the same across different browsers. (:issue:`3060`)
 - New ``?_extra=expanded_columns`` extra for table JSON, listing the foreign key columns that were expanded using ``?_labels=on``.
 - The total time spent calculating suggested facets for a page is now capped at ten times the :ref:`setting_facet_suggest_time_limit_ms` setting, so tables with a large number of columns can no longer spend several seconds suggesting facets. (:issue:`862`)
+- New ``?_facet_ignore_filters=1`` option for calculating each facet without the filters for its own column, so the other values for that column keep their counts when one of them is selected. Every other filter still applies, and ``NULL`` values are included as their own option. See :ref:`facets_other_values`.
 - The default :ref:`setting_max_post_body_bytes` limit has been increased from 2MB to 10MB (``10485760`` bytes), allowing larger JSON API requests.
 - The ``allow_facet`` and ``allow_download`` settings have been renamed to :ref:`setting_default_allow_facet` and :ref:`setting_default_allow_download`, matching :ref:`setting_default_allow_sql`. The previous names continue to work. (:issue:`1410`)
 - ``datasette publish`` and ``datasette package`` now install the same version of Datasette as the one used to run the command, unless ``--branch`` is used or an ``--install`` option names Datasette. Previously they installed the latest stable release, which does not accept the ``--config`` option.

@@ -25,6 +25,12 @@ apispec.ext.marshmallow.field_converter
 .. automodule:: apispec.ext.marshmallow.field_converter
     :members:
 
+apispec.ext.marshmallow.diagnostics
++++++++++++++++++++++++++++++++++++
+
+.. automodule:: apispec.ext.marshmallow.diagnostics
+    :members:
+
 apispec.ext.marshmallow.common
 ++++++++++++++++++++++++++++++
 .. automodule:: apispec.ext.marshmallow.common

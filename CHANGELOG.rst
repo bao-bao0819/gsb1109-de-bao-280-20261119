@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+Unreleased
+**********
+
+Features:
+
+- Report fields that cannot be converted to OpenAPI.  The report records the
+  operation and component that use the field and the schema nesting path, so
+  a field reused by several operations is traceable to each one.  Diagnostics
+  are generation-side only and are not included in ``to_dict()`` or
+  ``to_yaml()`` output.
+
 6.10.1 (2026-11-03)
 *******************
 

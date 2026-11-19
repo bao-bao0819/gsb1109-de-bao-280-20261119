@@ -92,3 +92,23 @@ class BasePlugin:
         :param kwargs: All additional keywords arguments sent to `APISpec.path()`
         """
         raise PluginMethodNotImplementedError
+
+    def to_dict_helper(self, spec: APISpec, spec_dict: dict) -> None:
+        """Called by :meth:`APISpec.to_dict` with the generated document.
+
+        Plugins may inspect the document to produce generation-side output
+        (logs, diagnostics).  The document must not be modified.
+
+        :param APISpec spec: The spec being rendered
+        :param dict spec_dict: The generated specification
+        """
+        raise PluginMethodNotImplementedError
+
+    @property
+    def conversion_report(self) -> typing.Any:
+        """Generation-side diagnostics collected by the plugin.
+
+        Plugins that cannot produce diagnostics raise
+        :class:`PluginMethodNotImplementedError`.
+        """
+        raise PluginMethodNotImplementedError

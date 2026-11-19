@@ -78,6 +78,14 @@ Using this plugin
        deprecated=True,
    )
    print(json.dumps(spec.to_dict()["paths"]))
+
+Document Inspection
+-------------------
+
+Plugins may define a ``to_dict_helper(spec, spec_dict)`` method to inspect the
+generated document when `APISpec.to_dict <apispec.APISpec.to_dict>` is called.
+This is meant for generation-side output such as diagnostics or logging: the
+document must not be modified.
    # {"/gists/{gist_id}": {"get": {"responses": {"200": {"description": "standard response"}}, "deprecated": true}}}
 
 

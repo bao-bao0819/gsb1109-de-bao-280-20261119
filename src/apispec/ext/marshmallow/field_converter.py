@@ -14,10 +14,13 @@ import operator
 import re
 import typing
 import warnings
+from contextlib import nullcontext
 
 import marshmallow
 from marshmallow.orderedset import OrderedSet
 from packaging.version import Version
+
+from .diagnostics import ConversionTracker
 
 # marshmallow field => (JSON Schema type, format)
 DEFAULT_FIELD_MAPPING: dict[type, tuple[str | None, str | None]] = {
@@ -94,6 +97,23 @@ class FieldConverterMixin:
 
     field_mapping: dict[type, tuple[str | None, str | None]] = DEFAULT_FIELD_MAPPING
     openapi_version: Version
+    diagnostics: ConversionTracker
+
+    @property
+    def conversion_report(self):
+        """Diagnostics for fields that could not be converted.
+
+        This is generation-side information only: it is never included in the
+        generated specification.
+        """
+        tracker = getattr(self, "diagnostics", None)
+        return tracker.report if tracker is not None else None
+
+    def _subfield_context(self, name: str):
+        tracker = getattr(self, "diagnostics", None)
+        if tracker is None:
+            return nullcontext()
+        return tracker.field(name)
 
     def init_attribute_functions(self):
         self.attribute_functions = [
@@ -178,7 +198,48 @@ class FieldConverterMixin:
         for attr_func in self.attribute_functions:
             ret.update(attr_func(field, ret=ret))
 
+        self._record_unconvertible_field(field, ret)
+
         return ret
+
+    def _record_unconvertible_field(
+        self, field: marshmallow.fields.Field, ret: dict
+    ) -> None:
+        """Record a field with no OpenAPI representation in the diagnostics.
+
+        This does not affect the generated property.  Typeless fields that are
+        typeless by design (``Field``, ``Raw`` and their built-in siblings) are
+        ignored.
+        """
+        tracker = getattr(self, "diagnostics", None)
+        if tracker is None:
+            return
+
+        field_class = type(field)
+        mapped_class = self._mapped_field_class(field_class)
+
+        if mapped_class is None:
+            return
+
+        if not _is_custom_typeless_field(field_class, mapped_class):
+            return
+        if _has_openapi_shape(ret):
+            return
+
+        tracker.record_field(
+            field,
+            kind="unconvertible_field",
+            message=(
+                f"Field of type {field_class.__module__}."
+                f"{field_class.__qualname__} has no OpenAPI type mapping."
+            ),
+        )
+
+    def _mapped_field_class(self, field_class: type) -> type | None:
+        for field_cls in field_class.__mro__:
+            if field_cls in self.field_mapping:
+                return field_cls
+        return None
 
     def field2type_and_format(
         self, field: marshmallow.fields.Field, **kwargs: typing.Any
@@ -201,6 +262,17 @@ class FieldConverterMixin:
                 stacklevel=2,
             )
             type_, fmt = "string", None
+            tracker = getattr(self, "diagnostics", None)
+            if tracker is not None:
+                tracker.record_field(
+                    field,
+                    kind="not_a_field",
+                    message=(
+                        f"Field of type {type(field).__module__}."
+                        f"{type(field).__qualname__} does not inherit from "
+                        "marshmallow.Field and cannot be converted."
+                    ),
+                )
 
         ret = {}
         if type_:
@@ -486,7 +558,8 @@ class FieldConverterMixin:
         """
         if isinstance(field, marshmallow.fields.Pluck):
             plucked_field = field.schema.fields[field.field_name]
-            ret = self.field2property(plucked_field)
+            with self._subfield_context(field.field_name):
+                ret = self.field2property(plucked_field)
             return {"type": "array", "items": ret} if field.many else ret
         return {}
 
@@ -500,7 +573,8 @@ class FieldConverterMixin:
         """
         ret = {}
         if isinstance(field, marshmallow.fields.List):
-            ret["items"] = self.field2property(field.inner)
+            with self._subfield_context("items"):
+                ret["items"] = self.field2property(field.inner)
         return ret
 
     def dict2properties(self, field, **kwargs: typing.Any) -> dict:
@@ -516,7 +590,8 @@ class FieldConverterMixin:
         if isinstance(field, marshmallow.fields.Dict):
             value_field = field.value_field
             if value_field:
-                ret["additionalProperties"] = self.field2property(value_field)
+                with self._subfield_context("additionalProperties"):
+                    ret["additionalProperties"] = self.field2property(value_field)
             elif "additionalProperties" not in kwargs.get("ret", {}):
                 ret["additionalProperties"] = {}
         return ret
@@ -549,7 +624,8 @@ class FieldConverterMixin:
         """
         ret = {}
         if isinstance(field, marshmallow.fields.Enum):
-            ret = self.field2property(field.field)
+            with self._subfield_context("value"):
+                ret = self.field2property(field.field)
             if field.by_value is False:
                 choices = (m for m in field.enum.__members__)
             else:
@@ -620,6 +696,51 @@ def make_type_list(types):
     if isinstance(types, str):
         return [types]
     return types
+
+
+# Field classes that intentionally have no OpenAPI type.  A custom field
+# subclassing one of these is not a conversion problem.
+_TYPELESS_FIELD_CLASSES = (
+    marshmallow.fields.Field,
+    marshmallow.fields.Raw,
+    marshmallow.fields.Function,
+    marshmallow.fields.Method,
+    marshmallow.fields.Constant,
+    marshmallow.fields.Tuple,
+)
+
+_SHAPE_KEYS = {
+    "type",
+    "$ref",
+    "items",
+    "properties",
+    "additionalProperties",
+    "allOf",
+    "oneOf",
+    "anyOf",
+    "not",
+    "enum",
+}
+
+
+def _is_custom_typeless_field(field_class: type, mapped_class: type) -> bool:
+    """Return whether a field is a user field with no OpenAPI type.
+
+    Built-in marshmallow fields are not reported: apispec documents them as
+    best it can and they are not a problem with the user's schema.
+    """
+    if field_class.__module__ == marshmallow.fields.__name__:
+        return False
+    if field_class in _TYPELESS_FIELD_CLASSES:
+        return False
+    if issubclass(field_class, _TYPELESS_FIELD_CLASSES[1:]):
+        return False
+    return mapped_class in (marshmallow.fields.Field, marshmallow.fields.Raw)
+
+
+def _has_openapi_shape(ret: dict) -> bool:
+    """Return whether a converted property carries any OpenAPI type information."""
+    return any(key in _SHAPE_KEYS for key in ret)
 
 
 def make_min_max_attributes(validators, min_attr, max_attr) -> dict:

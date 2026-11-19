@@ -185,7 +185,10 @@ class MarshmallowPlugin(BasePlugin):
         assert self.converter is not None, "init_spec has not yet been called"
         self.converter.refs[schema_key] = name
 
-        json_schema = self.converter.schema2jsonschema(schema_instance)
+        with self.converter.diagnostics.schema_frame(
+            schema_key, name, type(schema_instance), "schema"
+        ):
+            json_schema = self.converter.schema2jsonschema(schema_instance)
 
         return json_schema
 
@@ -229,7 +232,45 @@ class MarshmallowPlugin(BasePlugin):
         **kwargs: typing.Any,
     ) -> None:
         assert self.resolver  # needed for mypy
-        self.resolver.resolve_operations(operations)
+        assert self.converter  # needed for mypy
+        for method, operation in (operations or {}).items():
+            if not isinstance(operation, dict):
+                continue
+            with self.converter.diagnostics.conversion_context(
+                path=path, method=method, operation=operation
+            ):
+                self.resolver.resolve_operation(operation)
+
+    @property
+    def conversion_report(self):
+        """Diagnostics for fields that could not be converted."""
+        assert self.converter is not None, "init_spec has not yet been called"
+        return self.converter.conversion_report
+
+    @property
+    def conversion_issues(self):
+        """Unique unconvertible fields found while converting schemas."""
+        assert self.converter is not None, "init_spec has not yet been called"
+        return self.converter.conversion_issues
+
+    def build_conversion_report(self, *, log: bool = True):
+        """Attribute conversion issues to the interfaces that use them."""
+        assert self.converter is not None, "init_spec has not yet been called"
+        return self.converter.build_conversion_report(log=log)
+
+    def clear_conversion_report(self) -> None:
+        """Reset conversion diagnostics."""
+        assert self.converter is not None, "init_spec has not yet been called"
+        self.converter.clear_conversion_report()
+
+    def to_dict_helper(self, spec: APISpec, spec_dict: dict) -> None:
+        """Attribute unconvertible fields to the interfaces that use them.
+
+        This produces generation-side diagnostics only; ``spec_dict`` is left
+        untouched.
+        """
+        assert self.converter is not None, "init_spec has not yet been called"
+        self.converter.diagnostics.build_report(spec, log=True)
 
     def warn_if_schema_already_in_spec(self, schema_key: tuple) -> None:
         """Method to warn the user if the schema has already been added to the

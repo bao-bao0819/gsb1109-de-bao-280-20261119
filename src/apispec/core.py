@@ -493,7 +493,40 @@ class APISpec:
             if components_dict:
                 ret["components"] = components_dict
         ret = deepupdate(ret, self.options)
+        self._run_to_dict_helpers(ret)
         return ret
+
+    @property
+    def conversion_report(self):
+        """Return generation-side diagnostics from all plugins.
+
+        Diagnostics are never part of the generated document.  Building the
+        report requires the document to be generated first (``to_dict``).
+        """
+        from .report import AggregateConversionReport
+
+        reports = []
+        for plugin in self.plugins:
+            try:
+                reports.append(plugin.conversion_report)
+            except PluginMethodNotImplementedError:
+                continue
+        return AggregateConversionReport(reports)
+
+    def _run_to_dict_helpers(self, spec_dict: dict) -> None:
+        """Let plugins inspect the generated document.
+
+        Plugins use this for generation-side output (e.g. diagnostics).  They
+        must not modify the document.
+        """
+        for plugin in self.plugins:
+            helper = getattr(plugin, "to_dict_helper", None)
+            if helper is None:
+                continue
+            try:
+                helper(self, spec_dict)
+            except PluginMethodNotImplementedError:
+                continue
 
     def to_yaml(self, yaml_dump_kwargs: typing.Any | None = None) -> str:
         """Render the spec to YAML. Requires PyYAML to be installed.

@@ -344,6 +344,78 @@ this function:
 
     ma_plugin.converter.add_parameter_attribute_function(delimited_list2param)
 
+Conversion Diagnostics
+**********************
+
+Some fields have no OpenAPI representation.  This is typically the case for a
+custom field that does not inherit from a mapped marshmallow field and was not
+registered with `map_to_openapi_type
+<apispec.ext.marshmallow.MarshmallowPlugin.map_to_openapi_type>`.  Such a field
+is still emitted in the document (as an empty schema), but apispec records the
+problem so it can be fixed.
+
+Diagnostics are generation-side only.  They are never written to
+`to_dict <apispec.APISpec.to_dict>` or `to_yaml <apispec.APISpec.to_yaml>`, so
+the generated specification keeps its usual structure.
+
+Each entry records the field, the schema nesting path and the interface that
+used it:
+
+.. code-block:: python
+
+    ma_plugin = MarshmallowPlugin()
+    spec = APISpec(
+        title="Demo", version="0.1", openapi_version="3.0.0", plugins=(ma_plugin,)
+    )
+
+
+    class Unsupported(fields.Field):
+        pass
+
+
+    class Inner(Schema):
+        broken = Unsupported()
+
+
+    class Outer(Schema):
+        inner = fields.Nested(Inner)
+
+
+    spec.components.schema("Outer", schema=Outer)
+    spec.path(
+        "/things",
+        operations={
+            "get": {
+                "operationId": "listThings",
+                "responses": {
+                    "200": {"content": {"application/json": {"schema": "Outer"}}}
+                },
+            }
+        },
+    )
+
+    #: A report is built when the document is rendered.
+    spec.to_dict()
+
+    for occurrence in ma_plugin.build_conversion_report(log=False):
+        print(occurrence)
+    # Cannot convert field __main__.Unsupported at Outer.inner.broken;
+    # nesting: Outer -> Inner; used by GET /things (operationId: listThings).
+
+When the same unconvertible field is reused by several operations, the report
+contains one entry per operation.  ``report.issues`` groups them by field:
+
+.. code-block:: python
+
+    report = ma_plugin.build_conversion_report(log=False)
+    report.for_operation("/things", "get")   # occurrences for one operation
+    report.issues[0].operations               # every operation using the field
+    report.to_dict()                          # JSON-serializable list of entries
+
+A warning is also emitted through the ``apispec.ext.marshmallow.diagnostics``
+logger for every entry, so problems show up in generation logs without extra
+code.  Repeated builds do not log the same entry twice.
+
 Enum Fields
 ***********
 

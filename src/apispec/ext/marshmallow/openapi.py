@@ -25,6 +25,7 @@ from .common import (
     make_schema_key,
     resolve_schema_instance,
 )
+from .diagnostics import ConversionTracker
 from .field_converter import FieldConverterMixin
 
 __location_map__ = {
@@ -64,10 +65,32 @@ class OpenAPIConverter(FieldConverterMixin):
         )
         self.schema_name_resolver = schema_name_resolver
         self.spec = spec
+        self.diagnostics = ConversionTracker()
         self.init_attribute_functions()
         self.init_parameter_attribute_functions()
         # Schema references
         self.refs: dict = {}
+
+    @property
+    def conversion_report(self):
+        """Diagnostics for fields that could not be converted.
+
+        Generation-side only; never part of the generated specification.
+        """
+        return self.diagnostics.report
+
+    @property
+    def conversion_issues(self):
+        """Unique unconvertible fields found while converting schemas."""
+        return self.diagnostics.report.issues
+
+    def build_conversion_report(self, *, log: bool = True):
+        """Attribute conversion issues to the interfaces that use them."""
+        return self.diagnostics.build_report(self.spec, log=log)
+
+    def clear_conversion_report(self) -> None:
+        """Reset conversion diagnostics."""
+        self.diagnostics.clear()
 
     def init_parameter_attribute_functions(self) -> None:
         self.parameter_attribute_functions = [
@@ -192,7 +215,8 @@ class OpenAPIConverter(FieldConverterMixin):
         """
         ret: dict = {"in": location, "name": name}
 
-        prop = self.field2property(field)
+        with self._subfield_context(name):
+            prop = self.field2property(field)
         if self.openapi_version.major < 3:
             ret.update(prop)
         else:
@@ -252,9 +276,16 @@ class OpenAPIConverter(FieldConverterMixin):
         Meta = getattr(schema, "Meta", None)
         partial = getattr(schema, "partial", None)
 
-        jsonschema = self.fields2jsonschema(fields, partial=partial)
-
         schema_instance = resolve_schema_instance(schema)
+
+        if self.diagnostics._schema_frames:
+            jsonschema = self.fields2jsonschema(fields, partial=partial)
+        else:
+            schema_key = make_schema_key(schema_instance)
+            with self.diagnostics.schema_frame(
+                schema_key, None, type(schema_instance), None
+            ):
+                jsonschema = self.fields2jsonschema(fields, partial=partial)
 
         if hasattr(Meta, "title"):
             jsonschema["title"] = Meta.title
@@ -281,7 +312,8 @@ class OpenAPIConverter(FieldConverterMixin):
 
         for field_name, field_obj in fields.items():
             observed_field_name = field_obj.data_key or field_name
-            prop = self.field2property(field_obj)
+            with self._subfield_context(field_name):
+                prop = self.field2property(field_obj)
             jsonschema["properties"][observed_field_name] = prop
 
             if field_obj.required:

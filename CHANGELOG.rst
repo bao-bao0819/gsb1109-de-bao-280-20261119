@@ -1,6 +1,15 @@
 Changelog
 ---------
 
+6.10.2 (unreleased)
+*******************
+
+Bug fixes:
+
+- ``MarshmallowPlugin``: Serialize ``OneOf``/``Equal`` choices with the field's
+  ``_serialize`` method so ``enum`` values in the spec match the serialized
+  output (e.g. ``Date`` fields produce ISO date strings) (:issue:`783`).
+
 6.10.1 (2026-11-03)
 *******************
 

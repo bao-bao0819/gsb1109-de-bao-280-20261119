@@ -172,6 +172,54 @@ def test_field_with_equal(spec_fixture):
     assert res["enum"] == ["only choice"]
 
 
+def test_date_field_with_choices(spec_fixture):
+    field = fields.Date(
+        validate=validate.OneOf([dt.date(2026, 11, 20), dt.date(2026, 12, 25)])
+    )
+    res = spec_fixture.openapi.field2property(field)
+    assert res["enum"] == ["2026-11-20", "2026-12-25"]
+
+
+def test_date_field_with_custom_format_choices(spec_fixture):
+    field = fields.Date(
+        format="%d/%m/%Y",
+        validate=validate.OneOf([dt.date(2026, 11, 20), dt.date(2026, 12, 25)]),
+    )
+    res = spec_fixture.openapi.field2property(field)
+    assert res["enum"] == ["20/11/2026", "25/12/2026"]
+
+
+def test_datetime_field_with_choices(spec_fixture):
+    field = fields.DateTime(
+        validate=validate.OneOf([dt.datetime(2026, 11, 20, 12, 30, 0)])
+    )
+    res = spec_fixture.openapi.field2property(field)
+    assert res["enum"] == ["2026-11-20T12:30:00"]
+
+
+def test_date_field_with_nullable_choices(spec_fixture):
+    field = fields.Date(
+        validate=validate.OneOf([dt.date(2026, 11, 20)]), allow_none=True
+    )
+    res = spec_fixture.openapi.field2property(field)
+    assert res["enum"] == ["2026-11-20", None]
+
+
+def test_list_of_date_field_with_choices(spec_fixture):
+    field = fields.List(
+        fields.Date(validate=validate.OneOf([dt.date(2026, 11, 20)]))
+    )
+    res = spec_fixture.openapi.field2property(field)
+    assert res["items"]["enum"] == ["2026-11-20"]
+    assert res["items"]["format"] == "date"
+
+
+def test_date_field_without_choices_has_no_enum(spec_fixture):
+    field = fields.Date()
+    res = spec_fixture.openapi.field2property(field)
+    assert "enum" not in res
+
+
 def test_only_allows_valid_properties_in_metadata(spec_fixture):
     field = fields.Str(
         load_default="foo",

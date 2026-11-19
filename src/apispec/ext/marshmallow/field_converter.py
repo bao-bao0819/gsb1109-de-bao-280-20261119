@@ -249,7 +249,10 @@ class FieldConverterMixin:
             elif hasattr(validator, "comparable"):
                 choices.append(OrderedSet([validator.comparable]))
         if choices:
-            attributes["enum"] = list(functools.reduce(operator.and_, choices))
+            attributes["enum"] = [
+                field._serialize(choice, None, None)
+                for choice in functools.reduce(operator.and_, choices)
+            ]
 
         if field.allow_none:
             enum = attributes.get("enum")

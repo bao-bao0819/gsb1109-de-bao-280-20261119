@@ -30,7 +30,7 @@ from deepdiff.helper import (strings, bytes_type, numbers, uuids, ListItemRemove
                              detailed__dict__, add_root_to_paths,
                              np, get_truncate_datetime, dict_, CannotCompare, ENUM_INCLUDE_KEYS,
                              PydanticBaseModel, Opcode, SetOrdered, ipranges,
-                             separate_wildcard_and_exact_paths)
+                             separate_wildcard_and_exact_paths, RedactedValue)
 from deepdiff.serialization import SerializationMixin
 from deepdiff.distance import DistanceMixin, logarithmic_similarity
 from deepdiff.model import (
@@ -45,6 +45,7 @@ from deepdiff.base import Base
 from deepdiff.lfucache import LFUCache, DummyLFU
 from deepdiff.colored_view import ColoredView
 from deepdiff.match_keys import CompiledMatchKeys, KeySpec, get_key_matching_pairs
+from deepdiff.path import compile_glob_paths
 from deepdiff._multiprocessing import (
     normalize_mp_config, compute_distances_parallel,
     compute_hashes_parallel, compute_subtree_diffs_parallel,
@@ -94,6 +95,10 @@ WORKER_DISTANCE_CACHE_HIT_COUNT = 'WORKER DISTANCE CACHE HIT COUNT'
 WORKER_BATCH_COUNT = 'WORKER BATCH COUNT'
 CANT_FIND_NUMPY_MSG = 'Unable to import numpy. This must be a bug in DeepDiff since a numpy array is detected.'
 INVALID_VIEW_MSG = "view parameter must be one of 'text', 'tree', 'delta', 'colored' or 'colored_compact'. But {} was passed."
+REDACT_PATHS_COLORED_VIEW_MSG = (
+    'redact_paths can not be used with the colored views since they display the whole t2 object. '
+    'Please use the text, tree or delta view.')
+REDACTED_VALUE_FORMAT = '<redacted:{}>'
 CUTOFF_RANGE_ERROR_MSG = 'cutoff_distance_for_pairs needs to be a positive float max 1.'
 VERBOSE_LEVEL_RANGE_MSG = 'verbose_level should be 0, 1, or 2.'
 PURGE_LEVEL_RANGE_MSG = 'cache_purge_level should be 0, 1, or 2.'
@@ -144,6 +149,31 @@ class DeepDiffProtocol(Protocol):
     view: str
     math_epsilon: Optional[float]
 
+
+class _ValueRedactor:
+    """
+    Assigns a stable placeholder code to each distinct value.
+
+    The same original value always maps to the same code within one diff
+    report, so a reader of the report can tell whether two redacted values
+    were equal without ever seeing the values themselves.
+    """
+
+    def __init__(self) -> None:
+        self._codes: Dict[Any, str] = {}
+        self._count = 0
+
+    def code_for(self, value: Any) -> str:
+        try:
+            hash(value)
+        except TypeError:
+            key = (get_type(value), repr(value))
+        else:
+            key = value
+        if key not in self._codes:
+            self._count += 1
+            self._codes[key] = REDACTED_VALUE_FORMAT.format(self._count)
+        return RedactedValue(self._codes[key], get_type(value))
 
 
 class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, Base):
@@ -201,6 +231,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  number_format_notation: Literal["f", "e"]="f",
                  number_to_string_func: Optional[Callable]=None,
                  progress_logger: Callable[[str], None]=logger.info,
+                 redact_paths: Union[str, List[str], Set[str], FrozenSet[str], None]=None,
                  report_repetition: bool=False,
                  significant_digits: Optional[int]=None,
                  threshold_to_diff_deeper: float = 0.33,
@@ -220,6 +251,8 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         self.include_glob_paths = None
         self.iterable_match_keys = None
         self._compiled_match_keys = None
+        self.redact_paths = None
+        self._redact_matchers = None
         if kwargs:
             raise ValueError((
                 "The following parameter(s) are not valid: %s\n"
@@ -233,7 +266,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                 "math_epsilon, iterable_compare_func, iterable_match_keys, use_enum_value, _original_type, "
                 "threshold_to_diff_deeper, default_timezone "
                 "ignore_order_func, custom_operators, encodings, ignore_encoding_errors, use_log_scale, log_scale_similarity_threshold "
-                "multiprocessing, multiprocessing_workers, multiprocessing_threshold, "
+                "multiprocessing, multiprocessing_workers, multiprocessing_threshold, redact_paths, "
                 "_parameters and _shared_parameters.") % ', '.join(kwargs.keys()))
 
         if _parameters:
@@ -275,6 +308,13 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             _include_set = convert_item_or_items_into_set_else_none(include_paths)
             _include_exact, self.include_glob_paths = separate_wildcard_and_exact_paths(_include_set)
             self.include_paths = add_root_to_paths(_include_exact)
+            _redact_set = convert_item_or_items_into_set_else_none(redact_paths)
+            _redact_exact, _redact_glob_matchers = separate_wildcard_and_exact_paths(_redact_set)
+            self.redact_paths = add_root_to_paths(_redact_exact)
+            _redact_matchers = list(_redact_glob_matchers) if _redact_glob_matchers else []
+            if self.redact_paths:
+                _redact_matchers.extend(compile_glob_paths(self.redact_paths))
+            self._redact_matchers = _redact_matchers or None
             self.exclude_regex_paths = convert_item_or_items_into_compiled_regexes_else_none(exclude_regex_paths)
             self.exclude_types = set(exclude_types) if exclude_types else None
             self.exclude_types_tuple = tuple(exclude_types) if exclude_types else None  # we need tuple for checking isinstance
@@ -416,6 +456,11 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             if get_deep_distance and view in {TEXT_VIEW, TREE_VIEW}:
                 self.tree['deep_distance'] = self._get_rough_distance()
 
+            if self.is_root and self._redact_matchers:
+                if view in {COLORED_VIEW, COLORED_COMPACT_VIEW}:
+                    raise ValueError(REDACT_PATHS_COLORED_VIEW_MSG)
+                self._redact_tree_values()
+
             self.tree.remove_empty_keys()
             view_results = self._get_view_results(self.view)
             if isinstance(view_results, ColoredView):
@@ -507,6 +552,37 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             if gp.match_or_is_descendant(level_path):
                 return False
         return True
+
+    def _redact_path_matches(self, path):
+        return any(matcher.match_or_is_descendant(path) for matcher in self._redact_matchers)
+
+    def _redact_level_paths(self, level):
+        """Candidate report paths for a change level, used for redaction matching."""
+        paths = {level.path(force=FORCE_DEFAULT), level.path(use_t2=True, force=FORCE_DEFAULT)}
+        if level.up is not None:
+            # Some changes, e.g. set items, have no representable path of their
+            # own. Reports fall back to the parent's path in those cases.
+            paths.add(level.up.path(force=FORCE_DEFAULT))
+        return [path for path in paths if path]
+
+    def _redact_tree_values(self):
+        """
+        Replace the reported values at the redact_paths with placeholder codes.
+
+        This runs after the diff is fully calculated so the comparison itself
+        always uses the real values. The same original value maps to the same
+        code throughout the report.
+        """
+        redactor = _ValueRedactor()
+        for levels in self.tree.values():
+            if not isinstance(levels, SetOrdered):
+                continue
+            for level in levels:
+                if any(self._redact_path_matches(path) for path in self._redact_level_paths(level)):
+                    if level.t1 is not notpresent:
+                        level.t1 = redactor.code_for(level.t1)
+                    if level.t2 is not notpresent:
+                        level.t2 = redactor.code_for(level.t2)
 
     @staticmethod
     def _dict_from_slots(object: Any) -> Dict[str, Any]:

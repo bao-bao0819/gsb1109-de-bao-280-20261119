@@ -1,6 +1,7 @@
 # DeepDiff Change log
 
 - v9-2-0
+    - Added `redact_paths` to `DeepDiff`: changes at the given paths (and their descendants, with wildcard support) are still detected by comparing the real values, but the report shows placeholder codes such as `<redacted:1>` instead of the raw values. The same original value maps to the same code throughout the report, so reports can be shared with external reviewers without leaking sensitive values
     - Added `iterable_match_keys` to match list items by key per path, e.g. `{"root['orders']": "order_id", "root['orders'][*]['lines']": ("sku", "warehouse")}`. Inserted, removed and reordered records are reported per record at real list indexes, and `Delta` round-trips (#664)
     - Support for Python 3.15
     - Dropping support for Python 3.10, which reached end-of-life in October 2026

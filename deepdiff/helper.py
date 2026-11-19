@@ -35,6 +35,27 @@ class SetOrdered(SetOrderedBase):
         return str(list(self))
 
 
+class RedactedValue(str):
+    """
+    A placeholder string that replaces a redacted value in diff reports.
+
+    It keeps the type of the original value around so that reports such as
+    type_changes can still show the real old_type/new_type while the value
+    itself stays hidden.
+    """
+
+    def __new__(cls, code: str, original_type: Type[Any]) -> 'RedactedValue':
+        obj = super().__new__(cls, code)
+        obj.original_type = original_type
+        return obj
+
+    def __getnewargs__(self) -> Tuple[str, Type[Any]]:
+        return (str(self), self.original_type)
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
 try:
     import numpy as np
 except ImportError:  # pragma: no cover. The case without Numpy is tested locally only.
@@ -432,6 +453,8 @@ def get_type(obj: Any) -> Type[Any]:
     """
     if isinstance(obj, np_ndarray):
         return obj.dtype.type  # type: ignore
+    if isinstance(obj, RedactedValue):
+        return obj.original_type
     return obj if type(obj) is type else type(obj)
 
 

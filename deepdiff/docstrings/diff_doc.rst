@@ -189,6 +189,15 @@ number_to_string_func : function, default=None
 progress_logger: log function, default = logger.info
     :ref:`progress_logger_label` defines what logging function to use specifically for progress reporting. This function is only used when progress logging is enabled which happens by setting log_frequency_in_sec to anything above zero.
 
+redact_paths: list, default = None
+    List of paths whose values must not appear in the report. If only one item, you can pass it as a string.
+    Changes at these paths (and their descendants) are still detected by comparing the real values,
+    but the report shows a placeholder code such as ``<redacted:1>`` instead of the old and new values.
+    The same original value maps to the same code throughout the report, so a reader can tell whether
+    two redacted values were equal. Paths that are not listed keep showing their real values.
+    Supports :ref:`wildcard_paths_label`: use ``[*]`` to match one segment or ``[**]`` to match any depth.
+    redact_paths can not be used with the colored views since they display the whole t2 object.
+
 report_repetition : Boolean, default=False
     :ref:`report_repetition_label` reports repetitions when set True
     It only works when ignore_order is set to True too.

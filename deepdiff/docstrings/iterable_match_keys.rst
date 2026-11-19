@@ -104,12 +104,41 @@ The key spec says how to get the key of an item:
     >>> DeepDiff(t1, t2, iterable_match_keys={"root": lambda item: (item["product"]["id"], item["ts"])})
     {'values_changed': {"root[0]['qty']": {'new_value': 5, 'old_value': 1}}}
 
+Duplicate IDs: a second key
+---------------------------
+
+Some feeds legitimately contain several rows for the same ID, for example multiple stock lines for one product.
+Use :class:`deepdiff.MatchKey` to group by the ID and then choose the most similar row by a second field:
+
+    >>> from deepdiff import DeepDiff, MatchKey
+    >>> t1 = [
+    ...     {"product_id": 7, "warehouse": "east", "price": 10, "freight": 2},
+    ...     {"product_id": 7, "warehouse": "west", "price": 20, "freight": 3},
+    ... ]
+    >>> t2 = [
+    ...     {"product_id": 7, "warehouse": "west", "price": 21, "freight": 3},
+    ...     {"product_id": 7, "warehouse": "east", "price": 10, "freight": 5},
+    ... ]
+    >>> DeepDiff(t1, t2, iterable_match_keys={"root": MatchKey("product_id", "warehouse")})
+    {'values_changed': {"root[1]['freight']": {'new_value': 5, 'old_value': 2}, "root[0]['price']": {'new_value': 21, 'old_value': 20}}}
+
+The price change lands on the west row and the freight change on the east row, even though the rows are in a
+different order. Both parts of a ``MatchKey`` use the same forms as a key spec: a key name, a tuple of key names
+for a composite value, or a callable.
+
+Exact secondary values are paired first. For numeric secondary values, when no exact value is left, the closest value is used, so
+rows whose second field changed slightly still pair with their counterpart. For text values such as a warehouse name,
+only exact values pair; a row with a new value is reported as ``iterable_item_added`` and the row it replaces as
+``iterable_item_removed``. Rows left without a counterpart in either case are reported individually as added or
+removed instead of being paired with a different row.
+
 Matching rules
 --------------
 
 Duplicate keys
     The first item with a given key in t1 is paired with the first item with that key in t2, the second with
     the second, and so on. Extra items are reported as ``iterable_item_added`` or ``iterable_item_removed``.
+    With a ``MatchKey``, the secondary field chooses the counterpart first, and occurrence order only breaks ties.
 
 Items without a key
     An item has no key when getting the key raises ``KeyError``, ``IndexError`` or ``TypeError``, when a callable

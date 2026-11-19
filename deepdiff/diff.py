@@ -44,7 +44,7 @@ from deepdiff.deephash import DeepHash, combine_hashes_lists
 from deepdiff.base import Base
 from deepdiff.lfucache import LFUCache, DummyLFU
 from deepdiff.colored_view import ColoredView
-from deepdiff.match_keys import CompiledMatchKeys, KeySpec, get_key_matching_pairs
+from deepdiff.match_keys import CompiledMatchKeys, MatchKeySpec, get_key_matching_pairs
 from deepdiff._multiprocessing import (
     normalize_mp_config, compute_distances_parallel,
     compute_hashes_parallel, compute_subtree_diffs_parallel,
@@ -188,7 +188,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  include_obj_callback_strict: Optional[Callable]=None,
                  include_paths: Union[str, List[str], None]=None,
                  iterable_compare_func: Optional[Callable]=None,
-                 iterable_match_keys: Optional[Mapping[str, KeySpec]]=None,
+                 iterable_match_keys: Optional[Mapping[str, MatchKeySpec]]=None,
                  log_frequency_in_sec: int=0,
                  log_scale_similarity_threshold: float=0.1,
                  log_stacktrace: bool=False,
@@ -885,7 +885,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         else:
             self._diff_iterable_in_order(level, parents_ids, _original_type=_original_type, local_tree=local_tree)
 
-    def _get_iterable_match_key_spec(self, level: Any) -> Optional[KeySpec]:
+    def _get_iterable_match_key_spec(self, level: Any) -> Optional[MatchKeySpec]:
         """The iterable_match_keys key spec for the list at this level, if any."""
         if self._compiled_match_keys is None:
             return None
@@ -917,7 +917,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         self, level,
         t1_from_index=None, t1_to_index=None,
         t2_from_index=None, t2_to_index=None,
-        match_key_spec: Optional[KeySpec]=None,
+        match_key_spec: Optional[MatchKeySpec]=None,
     ) -> List[Tuple[Tuple[int, int], Tuple[Any, Any]]]:
         """
         Given a level get matching pairs. This returns list of two tuples in the form:
@@ -975,7 +975,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
 
     def _diff_iterable_in_order(
         self, level, parents_ids=frozenset(), _original_type=None, local_tree=None,
-        match_key_spec: Optional[KeySpec]=None, report_moves: bool=True,
+        match_key_spec: Optional[MatchKeySpec]=None, report_moves: bool=True,
     ):
         # We're handling both subscriptable and non-subscriptable iterables. Which one is it?
         subscriptable = self._iterables_subscriptable(level.t1, level.t2)
@@ -1069,7 +1069,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         _original_type=None, child_relationship_class=None,
         t1_from_index=None, t1_to_index=None,
         t2_from_index=None, t2_to_index=None,
-        match_key_spec: Optional[KeySpec]=None, report_moves: bool=True,
+        match_key_spec: Optional[MatchKeySpec]=None, report_moves: bool=True,
     ):
         # Items are paired by a custom criterion rather than by position or equality.
         custom_pairing = match_key_spec is not None or self.iterable_compare_func is not None

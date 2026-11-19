@@ -156,7 +156,7 @@ iterable_compare_func:
 
 iterable_match_keys: Dictionary, default = None
     :ref:`iterable_match_keys_label`:
-    Match the items of specific lists by a key instead of by position. Maps a path (exact or glob, e.g. ``"root['orders'][*]['lines']"``) to a key spec: a key name such as ``"id"``, a tuple of key names for a composite key, or a callable that takes an item and returns its key. Inserted, removed and reordered records are then reported per record, at real list indexes, and Delta can be applied to the original object.
+    Match the items of specific lists by a key instead of by position. Maps a path (exact or glob, e.g. ``"root['orders'][*]['lines']"``) to a key spec: a key name such as ``"id"``, a tuple of key names for a composite key, or a callable that takes an item and returns its key. Inserted, removed and reordered records are then reported per record, at real list indexes, and Delta can be applied to the original object. When one ID has several rows, use ``MatchKey(primary, secondary)`` to first group by the primary key and then pair each row with the most similar row by the secondary key.
 
 
 log_frequency_in_sec: Integer, default = 0

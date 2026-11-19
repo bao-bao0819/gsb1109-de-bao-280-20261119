@@ -8,6 +8,7 @@ if __name__ == '__main__':
 
 
 from .diff import DeepDiff as DeepDiff
+from .match_keys import MatchKey as MatchKey
 from .search import DeepSearch as DeepSearch, grep as grep
 from .deephash import DeepHash as DeepHash
 from .delta import Delta as Delta

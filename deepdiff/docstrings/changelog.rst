@@ -7,6 +7,7 @@ DeepDiff Changelog
 
 - v9-2-0
    - Added ``iterable_match_keys`` to match list items by key per path, e.g. ``{"root['orders']": "order_id", "root['orders'][*]['lines']": ("sku", "warehouse")}``. Inserted, removed and reordered records are reported per record at real list indexes, and ``Delta`` round-trips (#664)
+   - Added ``MatchKey(primary, secondary)`` for lists where one primary key has multiple valid rows: rows are grouped by the primary key and each row is paired with the most similar row by the secondary key, so duplicate IDs with different field changes are reported against the right pair (#664)
    - Support for Python 3.15
    - Dropping support for Python 3.10, which reached end-of-life in October 2026
    - Fixed ``iterable_compare_func`` dropping an added item whose content equals an item that was already matched, e.g. ``[{"id": 1}]`` vs ``[{"id": 1}, {"id": 1}]`` returned ``{}`` (#665)

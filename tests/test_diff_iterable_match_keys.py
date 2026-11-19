@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import pytest
 
-from deepdiff import DeepDiff, Delta
+from deepdiff import DeepDiff, Delta, MatchKey
 from deepdiff.helper import CannotCompare, TREE_VIEW
 from deepdiff.match_keys import BOOL_TAG, NO_KEY, CompiledMatchKeys, get_item_key
 
@@ -201,6 +201,187 @@ class TestKeySpecs:
 
     def test_bool_tag_survives_pickling(self):
         assert pickle.loads(pickle.dumps(BOOL_TAG)) is BOOL_TAG
+
+
+class TestMatchKeySecondary:
+    """Two-stage matching: group by ID, then pick the closest duplicate."""
+
+    def test_two_duplicate_rows_change_different_fields(self):
+        t1 = [
+            {"id": 1, "warehouse": "east", "price": 10, "freight": 2},
+            {"id": 1, "warehouse": "west", "price": 20, "freight": 3},
+        ]
+        t2 = [
+            {"id": 1, "warehouse": "west", "price": 21, "freight": 3},
+            {"id": 1, "warehouse": "east", "price": 10, "freight": 5},
+        ]
+        spec = MatchKey("id", "warehouse")
+        assert DeepDiff(t1, t2, iterable_match_keys={"root": spec}) == {
+            "values_changed": {
+                "root[0]['price']": {"new_value": 21, "old_value": 20},
+                "root[1]['freight']": {"new_value": 5, "old_value": 2},
+            },
+        }
+        assert_delta_round_trip(t1, t2, iterable_match_keys={"root": spec})
+
+    def test_secondary_pairs_closest_value_not_just_order(self):
+        t1 = [
+            {"id": 1, "line": 1, "price": 10},
+            {"id": 1, "line": 3, "price": 30},
+            {"id": 1, "line": 5, "price": 50},
+        ]
+        t2 = [
+            {"id": 1, "line": 2, "price": 20},
+            {"id": 1, "line": 4, "price": 40},
+            {"id": 1, "line": 6, "price": 60},
+        ]
+        spec = MatchKey("id", "line")
+        diff = DeepDiff(t1, t2, iterable_match_keys={"root": spec})
+        assert set(diff["values_changed"]) == {
+            "root[0]['line']", "root[0]['price']",
+            "root[1]['line']", "root[1]['price']",
+            "root[2]['line']", "root[2]['price']",
+        }
+        assert_delta_round_trip(t1, t2, iterable_match_keys={"root": spec})
+
+    def test_absent_secondary_falls_back_to_occurrence(self):
+        t1 = [{"id": 1, "v": 1}, {"id": 1, "v": 2}]
+        t2 = [{"id": 1, "v": 3}, {"id": 1, "v": 2}]
+        spec = MatchKey("id", "line")
+        assert DeepDiff(t1, t2, iterable_match_keys={"root": spec}) == {
+            "values_changed": {"root[0]['v']": {"new_value": 3, "old_value": 1}},
+        }
+
+    def test_extra_duplicate_is_reported_individually(self):
+        t1 = [{"id": 1, "line": 1, "price": 10}]
+        t2 = [
+            {"id": 1, "line": 1, "price": 11},
+            {"id": 1, "line": 2, "price": 20},
+        ]
+        spec = MatchKey("id", "line")
+        assert DeepDiff(t1, t2, iterable_match_keys={"root": spec}) == {
+            "values_changed": {"root[0]['price']": {"new_value": 11, "old_value": 10}},
+            "iterable_item_added": {"root[1]": {"id": 1, "line": 2, "price": 20}},
+        }
+        assert_delta_round_trip(t1, t2, iterable_match_keys={"root": spec})
+
+    def test_missing_duplicate_is_reported_individually(self):
+        t1 = [
+            {"id": 1, "line": 1, "price": 10},
+            {"id": 1, "line": 2, "price": 20},
+        ]
+        t2 = [{"id": 1, "line": 2, "price": 21}]
+        spec = MatchKey("id", "line")
+        diff = DeepDiff(t1, t2, iterable_match_keys={"root": spec})
+        assert diff["values_changed"] == {
+            "root[0]['price']": {"new_value": 21, "old_value": 20},
+        }
+        assert list(diff["iterable_item_removed"].values()) == [
+            {"id": 1, "line": 1, "price": 10},
+        ]
+        assert_delta_round_trip(t1, t2, iterable_match_keys={"root": spec})
+
+    def test_composite_secondary_key(self):
+        t1 = [
+            {"id": 1, "line": 1, "batch": "a", "q": 1},
+            {"id": 1, "line": 1, "batch": "b", "q": 2},
+        ]
+        t2 = [
+            {"id": 1, "line": 1, "batch": "b", "q": 20},
+            {"id": 1, "line": 1, "batch": "a", "q": 10},
+        ]
+        spec = MatchKey("id", ("line", "batch"))
+        assert DeepDiff(t1, t2, iterable_match_keys={"root": spec}) == {
+            "values_changed": {
+                "root[0]['q']": {"new_value": 20, "old_value": 2},
+                "root[1]['q']": {"new_value": 10, "old_value": 1},
+            },
+        }
+
+    def test_callable_secondary_key(self):
+        t1 = [{"id": 1, "meta": {"line": 1}, "q": 1}, {"id": 1, "meta": {"line": 2}, "q": 2}]
+        t2 = [{"id": 1, "meta": {"line": 2}, "q": 20}, {"id": 1, "meta": {"line": 1}, "q": 10}]
+        spec = MatchKey("id", lambda item: item["meta"]["line"])
+        assert DeepDiff(t1, t2, iterable_match_keys={"root": spec}) == {
+            "values_changed": {
+                "root[0]['q']": {"new_value": 20, "old_value": 2},
+                "root[1]['q']": {"new_value": 10, "old_value": 1},
+            },
+        }
+
+    def test_tuple_shorthand_for_two_key_specs(self):
+        t1 = [{"id": 1, "line": 1, "q": 1}, {"id": 1, "line": 2, "q": 2}]
+        t2 = [{"id": 1, "line": 2, "q": 20}, {"id": 1, "line": 1, "q": 10}]
+        keys = {"root": (lambda item: item["id"], lambda item: item["line"])}
+        assert DeepDiff(t1, t2, iterable_match_keys=keys) == {
+            "values_changed": {
+                "root[0]['q']": {"new_value": 20, "old_value": 2},
+                "root[1]['q']": {"new_value": 10, "old_value": 1},
+            },
+        }
+
+    def test_primary_group_still_applies(self):
+        t1 = [{"id": 1, "line": 1, "q": 1}, {"id": 2, "line": 1, "q": 2}]
+        t2 = [{"id": 2, "line": 1, "q": 20}, {"id": 1, "line": 1, "q": 10}]
+        spec = MatchKey("id", "line")
+        assert DeepDiff(t1, t2, iterable_match_keys={"root": spec}) == {
+            "values_changed": {
+                "root[0]['q']": {"new_value": 20, "old_value": 2},
+                "root[1]['q']": {"new_value": 10, "old_value": 1},
+            },
+        }
+
+    def test_extra_rows_on_both_sides_are_added_and_removed(self):
+        t1 = [
+            {"id": 1, "line": 1, "price": 10},
+            {"id": 1, "line": 2, "price": 20},
+        ]
+        t2 = [
+            {"id": 1, "line": 1, "price": 11},
+            {"id": 1, "line": 2, "price": 20},
+            {"id": 1, "line": 3, "price": 30},
+        ]
+        spec = MatchKey("id", "line")
+        diff = DeepDiff(t1, t2, iterable_match_keys={"root": spec})
+        assert diff["values_changed"] == {
+            "root[0]['price']": {"new_value": 11, "old_value": 10},
+        }
+        assert list(diff["iterable_item_added"].values()) == [{"id": 1, "line": 3, "price": 30}]
+        assert not diff.get("iterable_item_removed")
+        assert_delta_round_trip(t1, t2, iterable_match_keys={"root": spec})
+
+    def test_new_named_row_is_added_not_paired(self):
+        t1 = [
+            {"id": 1, "warehouse": "east", "price": 10},
+            {"id": 1, "warehouse": "west", "price": 20},
+        ]
+        t2 = [
+            {"id": 1, "warehouse": "east", "price": 10},
+            {"id": 1, "warehouse": "south", "price": 40},
+        ]
+        spec = MatchKey("id", "warehouse")
+        diff = DeepDiff(t1, t2, iterable_match_keys={"root": spec})
+        assert "values_changed" not in diff
+        assert list(diff["iterable_item_added"].values()) == [
+            {"id": 1, "warehouse": "south", "price": 40},
+        ]
+        assert list(diff["iterable_item_removed"].values()) == [
+            {"id": 1, "warehouse": "west", "price": 20},
+        ]
+        assert_delta_round_trip(t1, t2, iterable_match_keys={"root": spec})
+
+    def test_numeric_secondary_moved_row_pairs_with_closest(self):
+        t1 = [{"id": 1, "line": 10, "price": 10}, {"id": 1, "line": 20, "price": 20}]
+        t2 = [{"id": 1, "line": 21, "price": 20}, {"id": 1, "line": 11, "price": 10}]
+        spec = MatchKey("id", "line")
+        diff = DeepDiff(t1, t2, iterable_match_keys={"root": spec})
+        assert set(diff["values_changed"]) == {"root[0]['line']", "root[1]['line']"}
+        assert not diff.get("iterable_item_added")
+        assert not diff.get("iterable_item_removed")
+
+    def test_invalid_match_key(self):
+        with pytest.raises(ValueError, match="primary spec, secondary spec"):
+            CompiledMatchKeys({"root": MatchKey("id", object())})
 
 
 class TestPaths:

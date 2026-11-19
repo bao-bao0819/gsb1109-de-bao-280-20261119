@@ -56,11 +56,20 @@ class Field(FieldType):
             # Need to convert non-string types into their correct return types.
             if isinstance(x._dtype, DtypeSingle) and (ret_type := x._dtype._definition.return_type) in (int, float, bytes, bool):
                 try:
-                    value = ret_type(literal_eval(value_str))
-                except ValueError:
+                    literal = literal_eval(value_str)
+                except (ValueError, SyntaxError):
                     raise ValueError(f"Can't initialise dtype '{dtype}' with the value string '{value_str}' "
-                                     f"as it can't be converted to a {ret_type}.")
-        if value is not None:
+                                     f"as it can't be converted to a {ret_type}.") from None
+                if literal is None:
+                    # An explicit None is the dtype's missing value, not an unset field.
+                    value = None
+                else:
+                    try:
+                        value = ret_type(literal)
+                    except (TypeError, ValueError):
+                        raise ValueError(f"Can't initialise dtype '{dtype}' with the value string '{value_str}' "
+                                         f"as it can't be converted to a {ret_type}.")
+        if value is not None or (isinstance(x._dtype, DtypeSingle) and getattr(x._dtype, "missing", None) is not None):
             x._set_value_no_const_check(value, {})
         return x
 
@@ -186,7 +195,7 @@ class Field(FieldType):
         return self._concrete_dtype.unpack(self._bits)
 
     def _set_value_no_const_check(self, value: Any, kwargs: dict[str, Any]) -> None:
-        if value is None:
+        if value is None and not self._accepts_missing_value():
             raise ValueError("Cannot set the value of a Field to None. Perhaps you could use clear()?")
         if self._concrete_dtype is not None:
             self._bits = self._concrete_dtype.pack(value)
@@ -202,8 +211,13 @@ class Field(FieldType):
     def _set_value_with_kwargs(self, value: Any, kwargs: dict[str, Any]) -> None:
         if self._const and value is not None:
             raise ValueError(f"Cannot set the value of a const Field '{self}'.")
-        if value is not None:
+        if value is not None or self._accepts_missing_value():
             self._set_value_no_const_check(value, kwargs)
+
+    def _accepts_missing_value(self) -> bool:
+        """Whether this field's dtype can store an explicit 'missing' value such as ``None``."""
+        dtype = self._concrete_dtype if self._concrete_dtype is not None else self._dtype
+        return getattr(dtype, "missing", None) is not None and hasattr(dtype, "pack_raw")
 
     def _get_dtype(self) -> Dtype:
         return self._dtype
@@ -230,7 +244,7 @@ class Field(FieldType):
             dtype_str = str(self._dtype)
         d = f"{const_str}{dtype_str}"
         n = "" if self.name == "" else f"{colour.name}{self.name}{colour.off}: "
-        if self.value is None:
+        if self.value is None and not self._has_stored_missing_value():
             v = ""
         else:
             if self._const:
@@ -238,6 +252,10 @@ class Field(FieldType):
             else:
                 v = f" = {colour.value}{self.value}{colour.off}"
         return indent(f"{n}{d}{v}")
+
+    def _has_stored_missing_value(self) -> bool:
+        """Whether the field currently holds an explicit missing code (value ``None``)."""
+        return self._bits is not None and self._accepts_missing_value()
 
     @override
     def _info(self, use_colour: bool) -> str:

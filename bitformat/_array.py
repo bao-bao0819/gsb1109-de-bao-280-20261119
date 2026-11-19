@@ -16,7 +16,24 @@ import sys
 __all__ = ["Array"]
 
 # The possible types stored in each element of the Array
-ElementType = Union[float, str, int, bytes, bool, Tibs, Mutibs]
+ElementType = Union[float, str, int, bytes, bool, Tibs, Mutibs, None]
+
+
+def _missing_op_result(op, value: Any, other: Any, is_comparison: bool) -> Any:
+    """Apply an operator when the element (or the other operand) is the missing marker ``None``."""
+    if is_comparison:
+        # Missing equals missing; a missing value never equals a real value.
+        if op is operator.eq:
+            return (value is None) == (other is None)
+        if op is operator.ne:
+            return (value is None) != (other is None)
+        # Ordering comparisons involving a missing value are false.
+        return False
+    if op in (operator.add, operator.sub, operator.mul, operator.truediv, operator.floordiv,
+              operator.mod, operator.lshift, operator.rshift):
+        # Arithmetic involving a missing value stays missing rather than raising.
+        return None
+    raise ValueError(f"The value is missing, so the operator '{op.__name__}' can't be applied.")
 
 
 class Array:
@@ -435,8 +452,10 @@ class Array:
         For floating point types using a value of ``float('nan')`` will count the number of elements that are NaN.
 
         """
-        if math.isnan(value):
-            return sum(math.isnan(i) for i in self)
+        if value is None:
+            return sum(i is None for i in self)
+        if isinstance(value, float) and math.isnan(value):
+            return sum(isinstance(i, float) and math.isnan(i) for i in self)
         else:
             return sum(i == value for i in self)
 
@@ -565,7 +584,8 @@ class Array:
         a_copy = self.__class__.from_tibs(self._dtype, self.to_tibs())
         return a_copy
 
-    def _apply_op_to_all_elements(self, op, value: int | float | None, is_comparison: bool = False) -> Array:
+    def _apply_op_to_all_elements(self, op, value: int | float | None, is_comparison: bool = False,
+                                  value_is_missing: bool = False) -> Array:
         """Apply op with value to each element of the Array and return a new Array"""
         if isinstance(self._dtype, DtypeTuple):
             raise ValueError(f"Cannot apply operators such as '{op.__name__}' to an Array with a DtypeTuple dtype.")
@@ -573,8 +593,10 @@ class Array:
         new_data = Mutibs()
         failures = index = 0
         msg = ""
-        if value is not None:
+        if value is not None or value_is_missing:
             def partial_op(a):
+                if a is None or value_is_missing:
+                    return _missing_op_result(op, a, value, is_comparison)
                 return op(a, value)
         else:
             def partial_op(a):
@@ -608,7 +630,11 @@ class Array:
             b = self._get_bit_slice(self._item_size * i, self._item_size)
             v = self._dtype.unpack(b)
             try:
-                new_data += self._dtype.pack(op(v, value))
+                if v is None:
+                    v = _missing_op_result(op, v, value, False)
+                else:
+                    v = op(v, value)
+                new_data += self._dtype.pack(v)
             except (ZeroDivisionError, ValueError) as e:
                 if failures == 0:
                     msg = str(e)
@@ -666,7 +692,10 @@ class Array:
             a = self._dtype.unpack(a_bits)
             b = other._dtype.unpack(b_bits)
             try:
-                new_data += new_array._dtype.pack(op(a, b))
+                if a is None or b is None:
+                    new_data += new_array._dtype.pack(_missing_op_result(op, a, b, is_comparison))
+                else:
+                    new_data += new_array._dtype.pack(op(a, b))
             except (ValueError, ZeroDivisionError) as e:
                 if failures == 0:
                     msg = str(e)
@@ -866,6 +895,8 @@ class Array:
         return self._apply_op_to_all_elements(operator.le, other, is_comparison=True)
 
     def _eq_ne(self, op, other: Any) -> Array:
+        if other is None:
+            return self._apply_op_to_all_elements(op, None, is_comparison=True, value_is_missing=True)
         if isinstance(other, (int, float, str, Tibs, Mutibs)):
             return self._apply_op_to_all_elements(op, other, is_comparison=True)
         other = self.__class__(self.dtype, other)

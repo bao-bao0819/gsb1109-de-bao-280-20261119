@@ -127,9 +127,17 @@ class FieldType(abc.ABC):
         if b is not None:
             self.parse(b, **kwargs)
         v = self.value
-        if v is None:
+        if v is None and not self._has_missing_value():
             raise ValueError("Cannot unpack field as it has no value.")
         return v
+
+    def _has_missing_value(self) -> bool:
+        """Whether this field holds a dtype's explicit missing code rather than no value at all."""
+        dtype = getattr(self, "dtype", None)
+        if getattr(dtype, "missing", None) is None:
+            return False
+        bits = getattr(self, "_bits", None)
+        return bits is not None
 
     @final
     def __str__(self) -> str:

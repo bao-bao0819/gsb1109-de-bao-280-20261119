@@ -46,15 +46,18 @@ from ._options import Options
 from ._common import Expression, Endianness, DtypeKind
 from ._reader import Reader
 from ._dtype_definitions import dtype_definitions as _dtype_definitions
+from ._scaled import Scaled, DtypeScaled, ScaledDtype, ScaledInt, FixedPoint, ScaledArray, install_scaled_dtype
 
 
 __all__ = ["Tibs", "Mutibs", "TibsLike", "Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "Format", "FieldType", "Field", "Array", "Expression",
-           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind"]
+           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind",
+           "Scaled", "DtypeScaled", "ScaledDtype", "ScaledInt", "FixedPoint", "ScaledArray"]
 
 
 def _init():
     for _dt in _dtype_definitions:
         Register().add_dtype(_dt)
+    install_scaled_dtype()
 
 _init()
 

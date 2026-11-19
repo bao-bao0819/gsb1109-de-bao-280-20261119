@@ -1,7 +1,7 @@
 start: field_type
 
 // This should reflect the DtypeKind enum.
-dtype_kind: /u|i|f|bool|bytes|hex|bin|oct|bits|pad/
+dtype_kind: /u|i|f|s|bool|bytes|hex|bin|oct|bits|pad/
 
 // Endian modifiers for dtypes
 dtype_modifier: /le|be/
@@ -13,17 +13,33 @@ expression: "{" /[^\}]+/ "}"
 dtype_size: INT | expression
 dtype_items: INT | expression
 
+// A signed integer with a fixed scale, plus optional offset, missing code and unit.
+// The parameters may be positional or named:
+//   "i12[scale=0.0625,missing=-2048]"
+//   "i12[1/16,2.5,-2048,degC]"
+scaled_dtype: dtype_kind dtype_size ["_" dtype_modifier] "[" [scaled_params] "]"
+scaled_short: dtype_kind dtype_size ["_" dtype_modifier] "*" UNSIGNED_NUMBER [SIGNED_OFFSET] ["[" [scaled_params] "]"]
+scaled_params: scaled_param ("," scaled_param)* [","]
+?scaled_param: scaled_named_param | scaled_positional_param
+scaled_named_param: NAME "=" scaled_value
+scaled_positional_param: scaled_value
+?scaled_value: SCALED_NUMBER | NAME | python_string | expression
+
+UNSIGNED_NUMBER: /(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d*)?|\.\d+)(?:\/\d+)?(?:[eE][+-]?\d+)?/
+SIGNED_OFFSET: /[+-](?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d*)?|\.\d+)(?:\/\d+)?(?:[eE][+-]?\d+)?/
+SCALED_NUMBER: /[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d*)?|\.\d+)(?:\/\d+)?(?:[eE][+-]?\d+)?/
+
 // dtype is the abstract base class for the dtypes below.
-?dtype: dtype_tuple | dtype_single | dtype_array
+?dtype: dtype_tuple | dtype_array | scaled_short | scaled_dtype | dtype_single
 
 // When in a Field, the tuple dtype needs start with 'tuple('.
 // This is so that it isn't confused with a Format.
-?field_dtype: field_dtype_tuple | dtype_single | dtype_array
+?field_dtype: field_dtype_tuple | dtype_array | scaled_short | scaled_dtype | dtype_single
 
 // A dtype with a single type and optional size, for example "u8".
 dtype_single: dtype_kind [dtype_size] ["_" dtype_modifier]
 // An array with items of a single dtype, for example "[u8; 4]".
-dtype_array: "[" dtype_single ";" [dtype_items] "]"
+dtype_array: "[" (scaled_short | scaled_dtype | dtype_single) ";" [dtype_items] "]"
 // A tuple of dtypes, for example "(u8, u16, [u32; 10])".
 dtype_tuple: "(" dtype ("," dtype)* [","] ")"
 // When a tuple dtype is part of a Field, it needs the tuple keyword.

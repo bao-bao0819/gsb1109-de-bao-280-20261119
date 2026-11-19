@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import ast
 import functools
 from typing import Any, Callable, Iterable, Sequence, overload, Self
 import bitformat
@@ -61,7 +62,106 @@ class DtypeTransformer(Transformer):
         assert len(items) == 2
         dtype = items[0]
         items_count = items[1]
+        from bitformat._scaled import Scaled, ScaledArray
+        if isinstance(dtype, Scaled):
+            return ScaledArray._create_scaled(dtype, items_count)
         return DtypeArray.from_params(dtype.kind, dtype.size, items_count, dtype.endianness)
+
+    @staticmethod
+    def _scaled_value(value) -> str:
+        text = str(value)
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            try:
+                return str(ast.literal_eval(text))
+            except (SyntaxError, ValueError):
+                return text[1:-1]
+        return text
+
+    @staticmethod
+    def scaled_named_param(items) -> tuple[str, str]:
+        return str(items[0]), DtypeTransformer._scaled_value(items[1])
+
+    @staticmethod
+    def scaled_positional_param(items) -> str:
+        return DtypeTransformer._scaled_value(items[0])
+
+    @staticmethod
+    def scaled_value(items) -> str:
+        return DtypeTransformer._scaled_value(items[0])
+
+    @staticmethod
+    def scaled_params(items) -> list[tuple[str | None, str]]:
+        result = []
+        for item in items:
+            if isinstance(item, tuple):
+                result.append(item)
+            else:
+                result.append((None, item))
+        return result
+
+    @staticmethod
+    def scaled_dtype(items) -> Dtype:
+        from bitformat._scaled import Scaled
+        values = [item for item in items if item is not None and not isinstance(item, Endianness)]
+        if len(values) < 2:
+            raise ValueError("A scaled dtype requires a kind and a size.")
+        kind = values[0]
+        size = values[1]
+        params = values[2] if len(values) > 2 else []
+        endianness = next((item for item in items if isinstance(item, Endianness)), Endianness.UNSPECIFIED)
+        if size is None:
+            raise ValueError("A scaled dtype must specify a size.")
+        positional = [value for name, value in params if name is None]
+        keyword = {name: value for name, value in params if name is not None}
+        scale = positional[0] if len(positional) > 0 else keyword.pop("scale", keyword.pop("factor", 1))
+        offset = positional[1] if len(positional) > 1 else keyword.pop("offset", keyword.pop("bias", 0))
+        missing = positional[2] if len(positional) > 2 else keyword.pop(
+            "missing", keyword.pop("sentinel", keyword.pop("no_value", None)))
+        unit = positional[3] if len(positional) > 3 else keyword.pop("unit", keyword.pop("units", None))
+        if keyword:
+            raise ValueError(f"Unknown scaled dtype parameter(s): {', '.join(sorted(keyword))}.")
+        raw_kind = "i" if kind is DtypeKind.SCALED else str(kind)
+        if isinstance(size, str) and size.strip().startswith("{"):
+            raw_dtype = DtypeSingle.from_params(
+                DtypeKind.INT, Expression(size.strip()), endianness)
+            return Scaled.from_parts(raw_dtype, scale, offset, missing, unit)
+        raw = raw_kind + str(size)
+        if endianness is not Endianness.UNSPECIFIED:
+            raw += "_" + endianness.value
+        return Scaled.from_params(raw, scale, offset, missing, unit)
+
+    @staticmethod
+    def scaled_short(items) -> Dtype:
+        from bitformat._scaled import Scaled
+        # Grammar: kind, size, [modifier], scale, [signed_offset], [params]
+        if len(items) != 6:
+            raise ValueError("Unexpected scaled dtype parameters.")
+        kind, size, modifier, scale, offset, params = items
+        endianness = Endianness.UNSPECIFIED if modifier is None else modifier
+        if offset is None:
+            offset = 0
+        positional = []
+        keyword = {}
+        for name, value in (params or []):
+            if name is None:
+                positional.append(value)
+            else:
+                keyword[name] = value
+        if positional:
+            keyword.setdefault("missing", positional.pop(0))
+        if positional:
+            keyword.setdefault("unit", positional.pop(0))
+        if positional:
+            raise ValueError("Too many positional parameters for a scaled dtype.")
+        missing = keyword.pop("missing", keyword.pop("sentinel", keyword.pop("no_value", None)))
+        unit = keyword.pop("unit", keyword.pop("units", None))
+        if keyword:
+            raise ValueError(f"Unknown scaled dtype parameter(s): {', '.join(sorted(keyword))}.")
+        raw_kind = "i" if kind is DtypeKind.SCALED else str(kind)
+        raw = raw_kind + str(size)
+        if endianness is not Endianness.UNSPECIFIED:
+            raw += "_" + endianness.value
+        return Scaled.from_params(raw, scale, offset, missing, unit)
 
     @staticmethod
     def dtype_tuple(items) -> DtypeTuple:
@@ -519,13 +619,17 @@ class DtypeArray(Dtype):
     @override
     @final
     def from_params(cls, kind: DtypeKind, size: Expression, items: Expression = Expression.from_none(),
-                    endianness: Endianness = Endianness.UNSPECIFIED) -> Self:
+                    endianness: Endianness = Endianness.UNSPECIFIED, **kwargs: Any) -> Self:
         """Create a new Dtype from its kind, size and items.
 
         It's usually clearer to use the Dtype constructor directly with a dtype str, but
         this builder will be more efficient and is used internally to avoid string parsing.
 
         """
+        if kind is DtypeKind.SCALED:
+            from bitformat._scaled import DtypeScaled, ScaledArray
+            scaled = DtypeScaled.from_params(DtypeKind.INT, size, endianness=endianness, **kwargs)
+            return ScaledArray._create_scaled(scaled, items)
         return Register().get_array_dtype(kind, size, items, endianness)
 
     @override
@@ -1002,3 +1106,13 @@ class Register:
                 f"{key:<12}:{m.kind:>12}{m.is_signed:^8}{allowed!s:^16}{ret:<13} # {m.description}"
             )
         return "\n".join(s)
+
+
+def __getattr__(name: str):
+    # Lazily expose the scaled dtype names without a circular import at module
+    # load time.  ``bitformat._scaled`` imports this module, so these names can
+    # only safely be imported from here once this module is fully initialised.
+    if name in {"Scaled", "DtypeScaled", "ScaledDtype", "ScaledInt", "FixedPoint", "ScaledArray"}:
+        from bitformat import _scaled
+        return getattr(_scaled, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

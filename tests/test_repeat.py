@@ -95,3 +95,41 @@ def test_thing():
     assert x == "Repeat.from_params(Expression('1'), 'u16', [7])"
     x = repr(r)
     assert x == "Repeat.from_params(Expression('1'), 'u16', [7])"
+
+
+def test_nested_repeat_with_shadowed_count():
+    # The outer repeat is driven by a field named 'count'. Each repeated segment defines another
+    # field with the same name, so the inner repeat's count expression must resolve against the
+    # inner, shadowing value rather than any count cached from an earlier segment.
+    format_string = "(count: u8, repeat{count}: (count: u8, repeat{count}: value: u8))"
+    values = [2, [[0, []], [2, [10, 20]]]]
+
+    f = Format(format_string)
+    bits = f.pack(values)
+    # Outer count 2, then an empty segment (inner count 0), then a segment with two u8 values.
+    assert bits == Tibs.from_string("0x0200020a14")
+
+    g = Format(format_string)
+    parsed = g.unpack(bits)
+    # An empty Repeat unpacks to None.
+    assert parsed == [2, [[0, None], [2, [10, 20]]]]
+    assert g[0].value == 2
+    outer_repeat = g[1]
+    assert outer_repeat.value == [[0, None], [2, [10, 20]]]
+    # The inner segment itself contains a shadowing 'count' and a repeat driven by it.
+    inner_segment = outer_repeat.field
+    assert inner_segment[0].name == "count"
+    assert isinstance(inner_segment[1], Repeat)
+    assert inner_segment[1].count.code_str == "count"
+
+    # Reading the same bits back again must give the same hierarchy.
+    h = Format(format_string)
+    assert h.unpack(bits) == parsed
+
+    # The parsed hierarchy, with the empty segment restored to an empty list, repacks identically.
+    round_trip_values = [
+        parsed[0],
+        [[segment[0], [] if segment[1] is None else segment[1]] for segment in parsed[1]],
+    ]
+    i = Format(format_string)
+    assert i.pack(round_trip_values) == bits

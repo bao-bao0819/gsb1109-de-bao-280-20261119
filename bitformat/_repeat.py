@@ -132,6 +132,10 @@ class Repeat(FieldType):
         if self._concrete_count is None:
             self._concrete_count = self._count.evaluate(**kwargs)
         for i in range(self._concrete_count):
+            # Clear the shared field between iterations so that values or counts cached during an
+            # earlier iteration (e.g. an inner field that shadows an outer repeat count) cannot be
+            # reused instead of being re-evaluated for the current iteration.
+            self.field.clear()
             pos += self.field._parse(b, pos, kwargs)
             self._bits_list.append(self.field.to_tibs())
         return pos - startbit

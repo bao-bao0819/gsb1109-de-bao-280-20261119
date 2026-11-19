@@ -351,7 +351,13 @@ def convert_item_or_items_into_set_else_none(items: Union[str, Iterable[str], No
         if isinstance(items, str):
             return {items}
         else:
-            return set(items)
+            # A tuple is a single structured path selector, not a collection of
+            # paths, so it must stay intact instead of being unpacked into a set.
+            if isinstance(items, tuple):
+                return {items}
+            # Lists are containers of paths; a nested list is one structured
+            # selector that is normalized to a tuple so it stays hashable.
+            return {tuple(item) if isinstance(item, list) else item for item in items}
     else:
         return None
 
@@ -361,12 +367,17 @@ def add_root_to_paths(paths: Optional[Iterable[str]]) -> Optional[SetOrdered]:
     Sometimes the users want to just pass
     [key] instead of root[key] for example.
     Here we automatically add all sorts of variations that might match
-    the path they were supposed to pass. 
+    the path they were supposed to pass.
     """
     if paths is None:
         return
     result = SetOrdered()
     for path in paths:
+        # Structured selectors already carry their full segment list; the path
+        # machinery prepends root when compiling them.
+        if isinstance(path, (tuple, list)):
+            result.add(path)
+            continue
         if path.startswith('root'):
             result.add(path)
         else:
@@ -385,16 +396,18 @@ def separate_wildcard_and_exact_paths(paths):
     """Separate a set of paths into exact paths and wildcard pattern paths.
 
     Returns ``(exact_set_or_none, wildcard_list_or_none)``.
-    Wildcard paths must start with ``root``; a ``ValueError`` is raised otherwise.
+    Each entry is either a path string or a structured tuple/list selector.
+    String wildcard paths must start with ``root``; a ``ValueError`` is raised
+    otherwise. Structured selectors are always root-relative already.
     """
     if not paths:
         return None, None
-    from deepdiff.path import path_has_wildcard, compile_glob_paths
+    from deepdiff.path import compile_glob_paths, is_structured_path, selector_has_wildcard
     exact = set()
     wildcards = []
     for path in paths:
-        if path_has_wildcard(path):
-            if not path.startswith('root'):
+        if selector_has_wildcard(path):
+            if not is_structured_path(path) and not path.startswith('root'):
                 raise ValueError(
                     "Wildcard paths must start with 'root'. Got: {}".format(path))
             wildcards.append(path)
@@ -406,6 +419,83 @@ def separate_wildcard_and_exact_paths(paths):
 
 
 RE_COMPILED_TYPE = type(re.compile(''))
+
+
+def is_structured_selector(path) -> bool:
+    """A tuple/list selector (versus a path string) used in include/exclude paths."""
+    return isinstance(path, (tuple, list))
+
+
+def structured_selectors(paths):
+    """Return just the structured tuple/list selectors in *paths*."""
+    if not paths:
+        return ()
+    return tuple(path for path in paths if is_structured_selector(path))
+
+
+def _segment_relation(selector_segments, target_segments):
+    common = 0
+    for selector_segment, target_segment in zip(selector_segments, target_segments):
+        if selector_segment != target_segment:
+            break
+        common += 1
+    if selector_segments == target_segments:
+        return 'equal'
+    if common == len(selector_segments):
+        return 'ancestor'
+    if common == len(target_segments):
+        return 'descendant'
+    return None
+
+
+def compare_selector_to_level(selector, level_path: Optional[str]) -> Optional[str]:
+    """Segment-wise relation of a structured *selector* to a concrete *level_path*.
+
+    Returns ``'equal'`` when they point at the same location, ``'ancestor'`` when
+    the selector is above the level path, ``'descendant'`` when it is below it,
+    and ``None`` when the two paths diverge or the level path is not a string.
+    """
+    if not level_path:
+        return None
+    from deepdiff.path import concrete_path_segments, structured_path_segments
+    try:
+        return _segment_relation(structured_path_segments(selector),
+                                 concrete_path_segments(level_path))
+    except (ValueError, SyntaxError, TypeError):
+        return None
+
+
+def compare_selector_to_key(selector, level_path: Optional[str], key) -> Optional[str]:
+    """Relation of *selector* to the concrete path ``level_path[key]``.
+
+    Unlike the string-built key path (which always quotes the key), this keeps
+    the raw *key* object, so integer indices and other unquotable keys match
+    their structured-selector counterparts by value and type.
+    """
+    if not level_path:
+        return None
+    from deepdiff.path import concrete_path_segments, structured_path_segments
+    try:
+        target_segments = concrete_path_segments(level_path) + (key,)
+        return _segment_relation(structured_path_segments(selector), target_segments)
+    except (ValueError, SyntaxError, TypeError):
+        return None
+
+
+def structured_selector_matches(selectors, level_path: Optional[str], relations) -> bool:
+    """True if *level_path* has one of *relations* to any structured selector."""
+    return any(
+        compare_selector_to_level(selector, level_path) in relations
+        for selector in selectors
+    )
+
+
+def structured_key_matches(selectors, level_path: Optional[str], key, relations) -> bool:
+    """True if ``level_path[key]`` has one of *relations* to any structured selector."""
+    return any(
+        compare_selector_to_key(selector, level_path, key) in relations
+        for selector in selectors
+    )
 
 
 def convert_item_or_items_into_compiled_regexes_else_none(items: Union[str, Pattern[str], Iterable[Union[str, Pattern[str]]], None]) -> Optional[List[Pattern[str]]]:

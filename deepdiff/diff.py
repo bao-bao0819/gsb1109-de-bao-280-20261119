@@ -30,7 +30,9 @@ from deepdiff.helper import (strings, bytes_type, numbers, uuids, ListItemRemove
                              detailed__dict__, add_root_to_paths,
                              np, get_truncate_datetime, dict_, CannotCompare, ENUM_INCLUDE_KEYS,
                              PydanticBaseModel, Opcode, SetOrdered, ipranges,
-                             separate_wildcard_and_exact_paths)
+                             separate_wildcard_and_exact_paths,
+                             is_structured_selector, structured_selectors,
+                             structured_selector_matches, structured_key_matches)
 from deepdiff.serialization import SerializationMixin
 from deepdiff.distance import DistanceMixin, logarithmic_similarity
 from deepdiff.model import (
@@ -218,6 +220,9 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         # that may receive _parameters without these keys.
         self.exclude_glob_paths = None
         self.include_glob_paths = None
+        # Structured tuple/list selectors kept apart from the path strings.
+        self.exclude_structured_paths = ()
+        self.include_structured_paths = ()
         self.iterable_match_keys = None
         self._compiled_match_keys = None
         if kwargs:
@@ -272,9 +277,11 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             _exclude_set = convert_item_or_items_into_set_else_none(exclude_paths)
             _exclude_exact, self.exclude_glob_paths = separate_wildcard_and_exact_paths(_exclude_set)
             self.exclude_paths = add_root_to_paths(_exclude_exact)
+            self.exclude_structured_paths = structured_selectors(self.exclude_paths)
             _include_set = convert_item_or_items_into_set_else_none(include_paths)
             _include_exact, self.include_glob_paths = separate_wildcard_and_exact_paths(_include_set)
             self.include_paths = add_root_to_paths(_include_exact)
+            self.include_structured_paths = structured_selectors(self.include_paths)
             self.exclude_regex_paths = convert_item_or_items_into_compiled_regexes_else_none(exclude_regex_paths)
             self.exclude_types = set(exclude_types) if exclude_types else None
             self.exclude_types_tuple = tuple(exclude_types) if exclude_types else None  # we need tuple for checking isinstance
@@ -500,7 +507,11 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             if level_path in self.include_paths:
                 return False
             for prefix in self.include_paths:
-                if prefix in level_path:
+                if is_structured_selector(prefix):
+                    if structured_selector_matches(
+                            (prefix,), level_path, ('equal', 'ancestor')):
+                        return False
+                elif prefix in level_path:
                     return False
         # Check glob patterns: match or descendant
         for gp in self.include_glob_paths:
@@ -602,6 +613,9 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         skip = False
         if self.exclude_paths and level_path in self.exclude_paths:
             skip = True
+        elif self.exclude_structured_paths and structured_selector_matches(
+                self.exclude_structured_paths, level_path, ('equal',)):
+            skip = True
         elif self.exclude_glob_paths and any(gp.match(level_path) for gp in self.exclude_glob_paths):
             skip = True
         if not skip and (self.include_paths or self.include_glob_paths) and level_path != 'root':
@@ -611,7 +625,15 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                     skip = False
                 else:
                     for prefix in self.include_paths:
-                        if prefix in level_path or level_path in prefix:
+                        if is_structured_selector(prefix):
+                            # equal -> the selected level itself;
+                            # ancestor -> a descendant of an included subtree;
+                            # descendant -> an ancestor that traversal must enter.
+                            if structured_selector_matches(
+                                    (prefix,), level_path, ('equal', 'ancestor', 'descendant')):
+                                skip = False
+                                break
+                        elif prefix in level_path or level_path in prefix:
                             skip = False
                             break
             if skip and self.include_glob_paths:
@@ -655,7 +677,16 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             if level.path() in self.include_paths:
                 # matches e.g. level+key root['foo']['bar']['veg'] include_paths ["root['foo']['bar']"]
                 return False
+            if self.include_structured_paths and structured_key_matches(
+                    self.include_structured_paths, level.path(), key,
+                    ('equal', 'ancestor', 'descendant')):
+                # equal: the key itself is selected;
+                # ancestor: the key sits under an included subtree;
+                # descendant: the key is above the target and traversal must pass.
+                return False
             for prefix in self.include_paths:
+                if is_structured_selector(prefix):
+                    continue
                 if key_path in prefix:
                     # matches as long the prefix is longer than this object key
                     # eg.: level+key root['foo']['bar'] matches prefix root['foo']['bar'] from include paths

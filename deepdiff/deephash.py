@@ -15,7 +15,8 @@ from deepdiff.helper import (strings, numbers, only_numbers, times, unprocessed,
                              get_id, type_is_subclass_of_type_group, type_in_type_group,
                              number_to_string, datetime_normalize, KEY_TO_VAL_STR,
                              get_truncate_datetime, dict_, add_root_to_paths, PydanticBaseModel,
-                             separate_wildcard_and_exact_paths,
+                             separate_wildcard_and_exact_paths, structured_selectors,
+                             is_structured_selector, structured_selector_matches,
                              SetOrdered)
 
 from deepdiff.base import Base
@@ -243,6 +244,8 @@ class DeepHash(Base):
         _include_exact, _include_globs = separate_wildcard_and_exact_paths(_include_set)
         self.include_paths = add_root_to_paths(_include_exact)
         self.include_glob_paths = include_glob_paths or _include_globs
+        self.exclude_structured_paths = structured_selectors(self.exclude_paths)
+        self.include_structured_paths = structured_selectors(self.include_paths)
         self.exclude_regex_paths = convert_item_or_items_into_compiled_regexes_else_none(exclude_regex_paths)
         self.hasher = default_hasher if hasher is None else hasher
         self.hashes[UNPROCESSED_KEY] = []  # type: ignore
@@ -471,6 +474,9 @@ class DeepHash(Base):
         skip = False
         if self.exclude_paths and parent in self.exclude_paths:
             skip = True
+        elif self.exclude_structured_paths and structured_selector_matches(
+                self.exclude_structured_paths, parent, ('equal', 'ancestor')):
+            skip = True
         elif self.exclude_glob_paths and any(gp.match(parent) for gp in self.exclude_glob_paths):
             skip = True
         if (self.include_paths or self.include_glob_paths) and parent != 'root':
@@ -479,10 +485,17 @@ class DeepHash(Base):
                 if parent in self.include_paths:
                     skip = False
                 else:
-                    for prefix in self.include_paths:
-                        if parent.startswith(prefix):
-                            skip = False
-                            break
+                    if self.include_structured_paths and structured_selector_matches(
+                            self.include_structured_paths, parent,
+                            ('equal', 'ancestor', 'descendant')):
+                        skip = False
+                    else:
+                        for prefix in self.include_paths:
+                            if is_structured_selector(prefix):
+                                continue
+                            if parent.startswith(prefix):
+                                skip = False
+                                break
             if skip and self.include_glob_paths:
                 for gp in self.include_glob_paths:
                     if gp.match_or_is_ancestor(parent):

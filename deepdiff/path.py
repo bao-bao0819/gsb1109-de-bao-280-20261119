@@ -85,7 +85,11 @@ def _path_to_elements(path, root_element=DEFAULT_FIRST_ELEMENT):
         [(4.3, 'GET'), ('b', 'GETATTR'), ('a3', 'GET')]
     """
     if isinstance(path, (tuple, list)):
-        return path
+        if _looks_like_parsed_elements(path, root_element):
+            # Already-parsed (element, action) pairs from an internal caller:
+            # preserve the previous pass-through behavior.
+            return path
+        return _normalize_structured_path(path, root_element=root_element)
     elements = []
     if root_element:
         elements.append(root_element)
@@ -371,6 +375,86 @@ def path_has_wildcard(path):
     return bool(_WILDCARD_RE.search(path))
 
 
+def is_structured_path(path):
+    """True for tuple/list structured path selectors, False for path strings."""
+    return isinstance(path, (tuple, list))
+
+
+def _is_element_pair(segment):
+    return (
+        isinstance(segment, tuple)
+        and len(segment) == 2
+        and segment[1] in (GET, GETATTR)
+    )
+
+
+def _looks_like_parsed_elements(path, root_element):
+    """Detect an already-parsed element tuple (as opposed to a raw selector).
+
+    Internal callers feed ``_path_to_elements`` tuples made entirely of
+    ``(element, action)`` pairs; user structured selectors use root-relative
+    raw segments (keys/indices/wildcards). An all-pairs tuple is passed
+    through unchanged for backward compatibility.
+    """
+    return bool(path) and all(_is_element_pair(seg) for seg in path)
+
+
+def _normalize_structured_path(path, root_element=DEFAULT_FIRST_ELEMENT):
+    """Turn a structured tuple/list selector into ``(element, action)`` pairs.
+
+    A segment is normally a bare key or index, retrieved with ``GET`` (the
+    right action for dict keys and list indices). To select an object
+    attribute, pass an explicit ``(name, GETATTR)`` pair instead.
+    Wildcard tokens (``SINGLE_WILDCARD`` / ``MULTI_WILDCARD``) are kept as
+    sentinels so a literal ``'*'`` key and a wildcard stay distinguishable.
+    """
+    elements = []
+    if root_element:
+        elements.append(root_element)
+    for segment in path:
+        if isinstance(segment, tuple) and len(segment) == 2 and segment[1] in (GET, GETATTR):
+            elements.append((segment[0], segment[1]))
+        else:
+            elements.append((segment, GET))
+    return tuple(elements)
+
+
+def structured_path_has_wildcard(path):
+    """Check a structured (tuple/list) path selector for wildcard tokens.
+
+    A plain ``'*'`` string segment is a literal key and does not count;
+    only the ``SINGLE_WILDCARD`` / ``MULTI_WILDCARD`` sentinels do.
+    """
+    for segment in path:
+        element = segment[0] if isinstance(segment, tuple) else segment
+        if element is SINGLE_WILDCARD or element is MULTI_WILDCARD:
+            return True
+    return False
+
+
+def selector_has_wildcard(path):
+    """Wildcard check that works for both path strings and structured selectors."""
+    if is_structured_path(path):
+        return structured_path_has_wildcard(path)
+    return path_has_wildcard(path)
+
+
+def structured_path_segments(path):
+    """The selector's segments without the root and without access actions.
+
+    Works on both structured tuple/list selectors and path strings, so the
+    result can be compared against the segments of a concrete result path.
+    """
+    elements = _path_to_elements(path, root_element=None)
+    return tuple(element for element, _ in elements)
+
+
+def concrete_path_segments(level_path):
+    """Parse a concrete path (e.g. ``root['items'][0]``) into plain segments."""
+    elements = _path_to_elements(level_path, root_element=DEFAULT_FIRST_ELEMENT)
+    return tuple(element for element, _ in elements[1:])
+
+
 class GlobPathMatcher:
     """Pre-compiled matcher for a single glob pattern path.
 
@@ -383,9 +467,16 @@ class GlobPathMatcher:
 
     def __init__(self, pattern_path):
         self.original_pattern = pattern_path
+        # Structured tuple/list selectors are normalized (root-prefixed) by
+        # _path_to_elements; string patterns are parsed as before.
         elements = _path_to_elements(pattern_path, root_element=('root', GETATTR))
         # Skip the root element for matching
         self._pattern = elements[1:]
+
+    @property
+    def pattern_segments(self):
+        """The pattern's segments without the root and without access actions."""
+        return tuple(element for element, _ in self._pattern)
 
     def match(self, path_string):
         """Return True if *path_string* matches this pattern exactly."""

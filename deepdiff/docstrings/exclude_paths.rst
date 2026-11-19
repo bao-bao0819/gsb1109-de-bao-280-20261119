@@ -102,6 +102,52 @@ When both ``exclude_paths`` and ``include_paths`` apply to the same path, exclus
 Wildcards also work with ``DeepHash`` and ``DeepSearch`` exclude_paths.
 
 
+.. _structured_paths_label:
+
+Structured Path Selectors
+-------------------------
+
+Path strings can be ambiguous: a supplier might emit the literal field name
+``items[0]`` (one flat key), while another payload really has an ``items`` list
+with a 0th element. As an alternative to a path string, ``include_paths`` and
+``exclude_paths`` accept a structured selector: a tuple (or list) of raw
+segments where each segment is one dict key, list index, or wildcard token.
+A selector never goes through string quoting, so the two shapes are selected
+separately and reported changes still point back at the real JSON location.
+
+Select the literal ``items[0]`` key versus the 0th member of the ``items`` list:
+    >>> t1 = {"items[0]": "old"}
+    >>> t2 = {"items[0]": "new"}
+    >>> DeepDiff(t1, t2, include_paths=[("items[0]",)])
+    {'values_changed': {"root['items[0]']": {'new_value': 'new', 'old_value': 'old'}}}
+    >>> t1 = {"items": [{"name": "a"}, {"name": "b"}]}
+    >>> t2 = {"items": [{"name": "A"}, {"name": "b"}]}
+    >>> DeepDiff(t1, t2, include_paths=[("items", 0)])
+    {'values_changed': {"root['items'][0]['name']": {'new_value': 'A', 'old_value': 'a'}}}
+
+String and structured selectors can be mixed in the same argument, and several
+structured selectors can be passed together:
+    >>> DeepDiff(
+    ...     {"items[0]": "old", "keep": 1},
+    ...     {"items[0]": "new", "keep": 2},
+    ...     include_paths=[("items[0]",), "root['keep']"],
+    ... )
+    {'values_changed': {"root['items[0]']": {'new_value': 'new', 'old_value': 'old'}, "root['keep']": {'new_value': 2, 'old_value': 1}}}
+
+A plain ``"*"`` segment is always a literal key. To explicitly select a
+one-level wildcard, use the ``SINGLE_WILDCARD`` token (or ``MULTI_WILDCARD``
+for zero or more levels) from ``deepdiff.path``:
+    >>> from deepdiff.path import SINGLE_WILDCARD
+    >>> t1 = {"items": [{"v": 1}, {"v": 2}]}
+    >>> t2 = {"items": [{"v": 9}, {"v": 8}]}
+    >>> DeepDiff(t1, t2, include_paths=[("items", SINGLE_WILDCARD, "v")])
+    {'values_changed': {"root['items'][0]['v']": {'new_value': 9, 'old_value': 1}, "root['items'][1]['v']": {'new_value': 8, 'old_value': 2}}}
+
+Object attributes are selected with an explicit ``(name, GETATTR)`` pair;
+every other segment is treated as a key/index lookup. Structured selectors
+also work with ``DeepHash`` and ``DeepSearch``.
+
+
 .. _exclude_regex_paths_label:
 
 Exclude Regex Paths

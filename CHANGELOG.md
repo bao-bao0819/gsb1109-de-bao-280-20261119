@@ -1,6 +1,7 @@
 # DeepDiff Change log
 
 - v9-2-0
+    - Added structured path selectors for `include_paths` and `exclude_paths`: pass a tuple (or list) of raw segments such as `("items", 0)` to select the 0th member of the `items` list, versus `("items[0]",)` to select a literal field named `items[0]`. A literal `"*"` segment stays literal while the `SINGLE_WILDCARD`/`MULTI_WILDCARD` tokens opt into one-level / any-depth matching, and reported change paths still point back at the real JSON location. Works with `DeepDiff`, `DeepSearch`, `DeepHash`, `parse_path`, and `extract`
     - Added `iterable_match_keys` to match list items by key per path, e.g. `{"root['orders']": "order_id", "root['orders'][*]['lines']": ("sku", "warehouse")}`. Inserted, removed and reordered records are reported per record at real list indexes, and `Delta` round-trips (#664)
     - Support for Python 3.15
     - Dropping support for Python 3.10, which reached end-of-life in October 2026

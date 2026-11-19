@@ -46,10 +46,11 @@ from ._options import Options
 from ._common import Expression, Endianness, DtypeKind
 from ._reader import Reader
 from ._dtype_definitions import dtype_definitions as _dtype_definitions
+from ._checksum import Checksum, ChecksumFormat, xor8
 
 
 __all__ = ["Tibs", "Mutibs", "TibsLike", "Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "Format", "FieldType", "Field", "Array", "Expression",
-           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind"]
+           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind", "Checksum", "ChecksumFormat", "xor8"]
 
 
 def _init():

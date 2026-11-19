@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 from unittest.mock import patch
 
 import tablib
@@ -10,6 +11,7 @@ from django.utils import translation
 
 from import_export import exceptions, fields, resources, widgets
 from import_export.fields import Field
+from import_export.formats import base_formats
 from import_export.resources import ModelResource
 from import_export.results import RowResult
 
@@ -329,6 +331,117 @@ class ImportExportFieldOrderTest(TestCase):
         data = self.resource.export()
         target = f"datePublished,id,AuthorFooName\r\n,{self.pk},\r\n"
         self.assertEqual(target, data.csv)
+
+
+class CSVImportRegressionTest(TestCase):
+    """
+    Regression tests for importing real CSV files where the column order
+    varies, the first header carries a UTF-8 BOM, or a field is declared twice.
+    """
+
+    class MappedBookResource(resources.ModelResource):
+        class Meta:
+            model = Book
+            fields = ("id", "name", "author_email", "price")
+
+    def _import_csv(self, content, resource=None):
+        dataset = base_formats.CSV().create_dataset(content.encode("utf-8"))
+        return (resource or self.MappedBookResource()).import_data(
+            dataset, raise_errors=False
+        )
+
+    def _snapshot_import(self, content):
+        result = self._import_csv(content)
+        return {
+            "totals": dict(result.totals),
+            "import_types": [row.import_type for row in result.rows],
+            "books": list(
+                Book.objects.values("name", "author_email", "price").order_by("pk")
+            ),
+        }
+
+    def test_reordered_columns_produce_same_result_as_normal_file(self):
+        normal = "id,name,author_email,price\n,Some book,test@example.com,10.25\n"
+        reordered = (
+            "price,author_email,name,id\n10.25,test@example.com,Some book,\n"
+        )
+
+        normal_snapshot = self._snapshot_import(normal)
+        Book.objects.all().delete()
+        reordered_snapshot = self._snapshot_import(reordered)
+
+        self.assertEqual(normal_snapshot, reordered_snapshot)
+        self.assertEqual(1, normal_snapshot["totals"]["new"])
+        self.assertEqual(
+            [
+                {
+                    "name": "Some book",
+                    "author_email": "test@example.com",
+                    "price": Decimal("10.25"),
+                }
+            ],
+            normal_snapshot["books"],
+        )
+
+    def test_utf8_bom_on_first_header_is_stripped(self):
+        content = (
+            "\ufeffid,name,author_email,price\n,Some book,test@example.com,10.25\n"
+        )
+
+        dataset = base_formats.CSV().create_dataset(content.encode("utf-8"))
+        self.assertEqual(["id", "name", "author_email", "price"], dataset.headers)
+
+        result = self.MappedBookResource().import_data(dataset, raise_errors=True)
+        self.assertEqual(1, result.totals["new"])
+        self.assertEqual("Some book", Book.objects.get().name)
+
+    def test_duplicate_header_reports_unambiguous_error(self):
+        content = "id,name,name\n,Some book,Other book\n"
+
+        result = self._import_csv(content)
+
+        self.assertTrue(result.has_errors())
+        self.assertEqual(1, len(result.base_errors))
+        self.assertEqual(
+            "The following fields are duplicated in the file headers: name. "
+            "Each field must appear only once so that the input is unambiguous.",
+            str(result.base_errors[0].error),
+        )
+
+    def test_duplicate_header_raises_when_raise_errors_is_set(self):
+        content = "id,name,name\n,Some book,Other book\n"
+        dataset = base_formats.CSV().create_dataset(content.encode("utf-8"))
+
+        with self.assertRaises(exceptions.ImportError) as e:
+            self.MappedBookResource().import_data(dataset, raise_errors=True)
+        self.assertIn("duplicated in the file headers: name", str(e.exception))
+
+    def test_duplicate_header_does_not_write_any_rows(self):
+        content = "id,name,name\n,Some book,Other book\n"
+
+        result = self._import_csv(content)
+
+        self.assertTrue(result.has_errors())
+        self.assertEqual(0, Book.objects.count())
+        self.assertEqual(0, len(result.rows))
+
+    def test_missing_import_id_header_does_not_write_any_rows(self):
+        class NameAsIdResource(resources.ModelResource):
+            name = fields.Field(attribute="name", column_name="book_name")
+
+            class Meta:
+                model = Book
+                import_id_fields = ["name"]
+
+        content = "id,author_email\n,test@example.com\n"
+        result = self._import_csv(content, resource=NameAsIdResource())
+
+        self.assertTrue(result.has_errors())
+        self.assertEqual(0, Book.objects.count())
+        self.assertIn(
+            "not present in the file headers: book_name",
+            str(result.base_errors[0].error),
+        )
 
 
 class ImportIdFieldsTestCase(TestCase):

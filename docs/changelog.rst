@@ -42,6 +42,9 @@ Fixes
 - Fixed ``import`` management command ignoring ``--encoding`` for file input: the file is now read as ``bytes`` and decoded by the format (`2197 <https://github.com/django-import-export/django-import-export/pull/2197>`_)
 - Fixed the "Select all" toggle on the export form being blocked by a strict Content Security Policy (`2204 <https://github.com/django-import-export/django-import-export/issues/2204>`_)
 - Fixed the ``import_id_fields`` error messages not being translated, because the column names were interpolated before the message was passed to ``gettext``. Added the Spanish translation of both messages (`2219 <https://github.com/django-import-export/django-import-export/issues/2219>`_)
+- Fixed CSV (and other text format) imports when the first header contains a UTF-8 BOM: a BOM is now stripped so the first column maps to its resource field
+- Fixed imports silently mapping the wrong values when the file declares the same header more than once. Duplicate headers are now reported as a base error and no rows are imported
+- Fixed imports continuing to write rows after header validation failed (for example a missing ``import_id_fields`` column), which could persist data with unmapped columns. No rows are imported when the headers are invalid
 
 Development
 ###########

@@ -935,9 +935,17 @@ class Resource(metaclass=DeclarativeMetaclass):
         try:
             with atomic_if_using_transaction(using_transactions, using=db_connection):
                 self.before_import(dataset, **kwargs)
-            self._check_import_id_fields(dataset.headers)
         except Exception as e:
             self.handle_import_error(result, e, raise_errors)
+
+        try:
+            self._check_import_id_fields(dataset.headers)
+            self._check_duplicate_headers(dataset.headers)
+        except Exception as e:
+            self.handle_import_error(result, e, raise_errors)
+            # The dataset could not be mapped unambiguously, so importing rows
+            # could write values to the wrong columns.
+            return result
 
         instance_loader = self._meta.instance_loader_class(self, dataset)
 
@@ -1224,6 +1232,32 @@ class Resource(metaclass=DeclarativeMetaclass):
 
     def _is_dry_run(self, kwargs):
         return kwargs.get("dry_run", False)
+
+    def _check_duplicate_headers(self, headers):
+        """
+        Reject datasets which declare the same column more than once.
+
+        A row is converted to a dict keyed by header, so duplicate headers
+        would silently overwrite each other and the imported value would depend
+        on column order.
+        """
+        if not headers:
+            return
+        seen = set()
+        duplicates = []
+        for header in headers:
+            if header in seen and header not in duplicates:
+                duplicates.append(header)
+            seen.add(header)
+        if duplicates:
+            raise exceptions.FieldError(
+                _(
+                    "The following fields are duplicated in the file headers: %s. "
+                    "Each field must appear only once so that the input is "
+                    "unambiguous."
+                )
+                % ", ".join(duplicates)
+            )
 
     def _check_import_id_fields(self, headers):
         """

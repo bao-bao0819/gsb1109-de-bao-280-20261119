@@ -155,6 +155,11 @@ class TextFormat(TablibFormat):
         """
         if isinstance(in_stream, bytes):
             in_stream = in_stream.decode(self.encoding or "utf-8")
+        # A UTF-8 BOM is not removed by the ``utf-8`` codec and would otherwise
+        # become part of the first header, so the first column would not map to
+        # its field.
+        if in_stream.startswith("\ufeff"):
+            in_stream = in_stream[1:]
         return super().create_dataset(in_stream, **kwargs)
 
     def get_read_mode(self):

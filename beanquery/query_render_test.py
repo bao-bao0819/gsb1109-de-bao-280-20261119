@@ -338,6 +338,20 @@ class TestInventoryRenderer(RendererTestBase):
             ' 5 AA & 6 EE & 7 FF                     ',
         ])
 
+    def test_inventory_empty(self):
+        # An empty inventory is a zero balance, distinct from a NULL value.
+        self.assertEqual(self.render([I('')], expand=False), [
+            '()',
+        ])
+        self.assertEqual(self.render([I(''), None], expand=False), [
+            '()',
+            '  ',
+        ])
+        self.assertEqual(self.render([I(''), None], expand=False, nullvalue='NULL'), [
+            '()  ',
+            'NULL',
+        ])
+
 
 class TestCostRenderer(RendererTestBase):
 

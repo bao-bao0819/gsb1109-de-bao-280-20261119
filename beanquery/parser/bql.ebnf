@@ -68,7 +68,14 @@ ordering
     ;
 
 pivotby::PivotBy
-    = columns+:(integer | column) ',' columns+:(integer | column)
+    = columns+:(integer | column) ',' columns+:(integer | column) [values:pivotvalues]
+    ;
+
+pivotvalues
+    = ['VALUES' | 'IN' | 'ON'] '(' @:','.{ literal }+ ')'
+    | ('VALUES' | 'IN' | 'ON') @:','.{ literal }+
+    | ',' '(' @:','.{ literal }+ ')'
+    | ',' @:','.{ literal }+
     ;
 
 target::Target

@@ -643,6 +643,7 @@ class EvalPivot:
 
     query: EvalQuery
     pivots: list[int]
+    values: list | None = None
 
     def __call__(self):
         columns, rows = self.query()
@@ -651,7 +652,16 @@ class EvalPivot:
         othercols = [i for i in range(len(columns)) if i not in self.pivots]
         nother = len(othercols)
         other = lambda x: tuple(x[i] for i in othercols)
-        keys = sorted({row[col2] for row in rows})
+
+        # When an explicit list of values is provided, it determines both
+        # the set and the order of the pivoted columns.  Values that do
+        # not occur in the result set still produce an empty column and
+        # values occurring in the data but not listed are not pivoted.
+        explicit = self.values is not None
+        if explicit:
+            keys = list(self.values)
+        else:
+            keys = sorted({row[col2] for row in rows})
 
         # Compute the new column names and dtypes.
         if nother > 1:
@@ -668,7 +678,12 @@ class EvalPivot:
         for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
             outrow = [field1] + [None] * (len(columns) - 1)
             for row in group:
-                index = keys.index(row[col2]) * nother + 1
+                try:
+                    index = keys.index(row[col2]) * nother + 1
+                except ValueError:
+                    if explicit:
+                        continue
+                    raise
                 outrow[index:index+nother] = other(row)
             pivoted.append(tuple(outrow))
 

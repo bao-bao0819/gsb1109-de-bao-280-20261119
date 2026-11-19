@@ -172,7 +172,16 @@ class Ordering(enum.IntEnum):
 #
 # Attributes:
 #   columns: A list of group-by expressions, simple Column() or otherwise.
-PivotBy = node('PivotBy', 'columns')
+#   values: An optional list of values to pivot on.  When specified, these
+#     values determine both the set and the order of the resulting columns.
+PivotBy = dataclasses.make_dataclass(
+    'PivotBy',
+    [('columns', list),
+     ('values', list, dataclasses.field(default=None)),
+     ('parseinfo', None, dataclasses.field(default=None, compare=False, repr=False))],
+    bases=(Node,),
+    **({'slots': True} if sys.version_info[:2] >= (3, 10) else {}))
+
 
 # A reference to a table.
 #

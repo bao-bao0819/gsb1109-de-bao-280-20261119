@@ -153,7 +153,7 @@ class Compiler:
 
         pivots = self._compile_pivot_by(node.pivot_by, c_targets, group_indexes)
         if pivots:
-            return EvalPivot(query, pivots)
+            return EvalPivot(query, pivots, node.pivot_by.values)
 
         self.stack.pop()
         return query
@@ -352,6 +352,18 @@ class Compiler:
             raise CompilationError('the two PIVOT BY columns cannot be the same column')
         if indexes[1] not in group_indexes:
             raise CompilationError('the second PIVOT BY column must be a GROUP BY column')
+
+        # When an explicit list of values is provided, the resulting column
+        # order follows the list and every listed value gets a column.  A
+        # value may appear only once, otherwise the generated column names
+        # would be duplicated.
+        values = pivot_by.values
+        if values is not None:
+            seen = []
+            for value in values:
+                if value in seen:
+                    raise CompilationError(f'duplicate PIVOT BY value {value!r}')
+                seen.append(value)
 
         return indexes
 

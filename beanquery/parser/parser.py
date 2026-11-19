@@ -416,10 +416,87 @@ class BQLParser(Parser):
                     '<column> <integer>'
                 )
         self.add_last_node_to_name('columns')
+        with self._optional():
+            self._pivotvalues_()
+            self.name_last_node('values')
         self._define(
-            [],
+            ['values'],
             ['columns'],
         )
+
+    @tatsumasu()
+    def _pivotvalues_(self):
+        with self._choice():
+            with self._option():
+                with self._optional():
+                    with self._choice():
+                        with self._option():
+                            self._token('VALUES')
+                        with self._option():
+                            self._token('IN')
+                        with self._option():
+                            self._token('ON')
+                        self._error(
+                            'expecting one of: '
+                            "'IN' 'ON' 'VALUES'"
+                        )
+                self._token('(')
+
+                def sep0():
+                    self._token(',')
+
+                def block1():
+                    self._literal_()
+                self._positive_gather(block1, sep0)
+                self.name_last_node('@')
+                self._token(')')
+            with self._option():
+                with self._group():
+                    with self._choice():
+                        with self._option():
+                            self._token('VALUES')
+                        with self._option():
+                            self._token('IN')
+                        with self._option():
+                            self._token('ON')
+                        self._error(
+                            'expecting one of: '
+                            "'IN' 'ON' 'VALUES'"
+                        )
+
+                def sep2():
+                    self._token(',')
+
+                def block3():
+                    self._literal_()
+                self._positive_gather(block3, sep2)
+                self.name_last_node('@')
+            with self._option():
+                self._token(',')
+                self._token('(')
+
+                def sep4():
+                    self._token(',')
+
+                def block5():
+                    self._literal_()
+                self._positive_gather(block5, sep4)
+                self.name_last_node('@')
+                self._token(')')
+            with self._option():
+                self._token(',')
+
+                def sep6():
+                    self._token(',')
+
+                def block7():
+                    self._literal_()
+                self._positive_gather(block7, sep6)
+                self.name_last_node('@')
+            self._error(
+                'expecting one of: '
+                "'(' ',' 'IN' 'ON' 'VALUES'"
+            )
 
     @tatsumasu('Target')
     def _target_(self):

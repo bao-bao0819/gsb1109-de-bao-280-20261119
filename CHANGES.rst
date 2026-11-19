@@ -1,6 +1,13 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- The ``PIVOT BY`` clause now accepts an explicit list of values, as in
+  ``PIVOT BY 1, 2 VALUES ('USD', 'EUR')``.  The list determines both the
+  set and the order of the resulting columns, so a currency that does not
+  occur in the data still gets an (empty) column.  Empty inventories
+  (a balance that nets to zero) are now rendered as ``()`` and thus stay
+  distinguishable from ``NULL`` (a missing value) in text and CSV output.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

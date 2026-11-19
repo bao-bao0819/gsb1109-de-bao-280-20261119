@@ -386,8 +386,15 @@ class InventoryRenderer(ColumnRenderer):
         self.renderers = collections.defaultdict(lambda: PositionRenderer(ctx))
         # How many distinct commodity need to be rendered.
         self.distinct = 0
+        # Whether the column contains empty inventories.
+        self.has_empty = False
 
     def update(self, value):
+        # An empty inventory is a valid value and must be rendered
+        # distinguishably from a missing (NULL) value.
+        if value.is_empty():
+            self.has_empty = True
+            return
         for pos in value.get_positions():
             # We use the little indexing trick to do not have to
             # conditionalize this code on whether rows expansion is
@@ -406,6 +413,8 @@ class InventoryRenderer(ColumnRenderer):
                 self.distinct += self.counts[commodity]
                 self.maxwidth += self.counts[commodity] * (w + len(self.listsep))
             self.maxwidth -= len(self.listsep)
+        if self.has_empty:
+            self.maxwidth = max(self.maxwidth, 2)
         return super().prepare()
 
     @staticmethod
@@ -415,6 +424,10 @@ class InventoryRenderer(ColumnRenderer):
                 (position.cost.currency, -position.cost.number, position.cost.date) if position.cost else ())
 
     def format(self, value):
+        # An empty inventory renders as the canonical empty inventory
+        # string, distinct from the NULL placeholder.
+        if value.is_empty():
+            return '()'
         # Expanded row format.
         if self.expand:
             strings = []

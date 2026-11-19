@@ -423,6 +423,26 @@ class TestSelectPivotBy(QueryParserTestBase):
             "SELECT * PIVOT BY 1, 2",
             Select(ast.Asterisk(), pivot_by=ast.PivotBy([1, 2])))
 
+    def test_pivotby_values(self):
+        self.assertParse(
+            "SELECT * PIVOT BY a, b VALUES ('USD', 'EUR')",
+            Select(ast.Asterisk(), pivot_by=ast.PivotBy([ast.Column('a'), ast.Column('b')], ['USD', 'EUR'])))
+
+        self.assertParse(
+            "SELECT * PIVOT BY 1, 2 IN ('USD')",
+            Select(ast.Asterisk(), pivot_by=ast.PivotBy([1, 2], ['USD'])))
+
+        self.assertParse(
+            "SELECT * PIVOT BY 1, 2, 'USD', 'EUR'",
+            Select(ast.Asterisk(), pivot_by=ast.PivotBy([1, 2], ['USD', 'EUR'])))
+
+        self.assertParse(
+            "SELECT * PIVOT BY 1, 2 ('USD')",
+            Select(ast.Asterisk(), pivot_by=ast.PivotBy([1, 2], ['USD'])))
+
+        with self.assertRaises(parser.ParseError):
+            parser.parse("SELECT * PIVOT BY a, b VALUES ()")
+
 
 class TestSelectOptions(QueryParserTestBase):
 

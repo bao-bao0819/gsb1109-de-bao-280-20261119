@@ -67,6 +67,8 @@ from beancount.core import inventory
 
 from .cursor import Column
 
+ZERO = Decimal()
+
 
 def numberify_results(columns, drows, dformat=None):
     """Number rows containing Amount, Position or Inventory types.
@@ -89,7 +91,13 @@ def numberify_results(columns, drows, dformat=None):
             converters.append(IdentityConverter(column.name, column.datatype, index))
         else:
             col_converters = convert_col_fun(column.name, drows, index)
-            converters.extend(col_converters)
+            if col_converters:
+                converters.extend(col_converters)
+            else:
+                # No values of the converted type were found (e.g. an
+                # inventory column containing only empty or NULL values):
+                # keep the column instead of silently dropping it.
+                converters.append(IdentityConverter(column.name, column.datatype, index))
 
     # Derive the output types from the expected outputs from the converters
     # themselves.
@@ -208,19 +216,31 @@ class InventoryConverter:
 
     dtype = Decimal
 
-    def __init__(self, name, index, currency):
+    def __init__(self, name, index, currency, ambiguous):
         self.name = name
         self.index = index
         self.currency = currency
+        # True when the column holds several currencies, in which case an
+        # empty inventory does not identify which currency netted to zero.
+        self.ambiguous = ambiguous
 
     def __call__(self, drow, dformat):
         inv = drow[self.index]
-        # FIXME:: get_currency_units() returns ZERO and not None when the value
-        # isn't present. This should be fixed to distinguish between the two.
+        if inv is None:
+            # A NULL inventory means that no group exists for this cell.
+            return None
+        if inv.is_empty():
+            # An empty inventory from a single-currency column is a balance
+            # that nets to zero.  Keep it as zero so it stays distinguishable
+            # from a NULL cell.  In a mixed-currency column the currency is
+            # unknown, so report it as missing.
+            return None if self.ambiguous else ZERO
+        if self.currency not in inv.currencies():
+            return None
         number = inv.get_currency_units(self.currency).number
-        if number and dformat:
+        if dformat:
             number = dformat.quantize(number, self.currency)
-        return number or None
+        return number
 
 
 def convert_col_Inventory(name, drows, index):
@@ -234,11 +254,16 @@ def convert_col_Inventory(name, drows, index):
       A list of Converter instances, one for each of the currency types found.
     """
     currency_map = collections.defaultdict(int)
+    currencies = set()
     for drow in drows:
         inv = drow[index]
+        if inv is None:
+            continue
         for currency in inv.currencies():
             currency_map[currency] += 1
-    return [InventoryConverter('{} ({})'.format(name, currency), index, currency)
+            currencies.add(currency)
+    ambiguous = len(currencies) > 1
+    return [InventoryConverter('{} ({})'.format(name, currency), index, currency, ambiguous)
             for currency, _ in sorted(currency_map.items(),
                                       key=lambda item: (item[1], item[0]),
                                       reverse=True)]

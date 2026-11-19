@@ -1506,6 +1506,168 @@ class TestExecutePivot(QueryBase):
                 ('Expenses:Bbb', I('5.00 USD'), datetime.date(2014, 2, 2), None, None),
             ]))
 
+    def test_pivot_explicit_values_order(self):
+        self.assertEqual(self.execute("""
+            SELECT
+              account,
+              year(date) AS year,
+              sum(cost(position)) AS balance
+            WHERE
+              account ~ 'Expenses'
+            GROUP BY 1, 2
+            PIVOT BY account, year VALUES (2015, 2012)"""), (
+            [
+                ('account/year', str),
+                ('2015', inventory.Inventory),
+                ('2012', inventory.Inventory),
+            ],
+            [
+                ('Expenses:Aaa', I('8.00 USD'), I('5.00 USD')),
+                ('Expenses:Bbb', None, I('1.00 USD')),
+            ]))
+
+    def test_pivot_explicit_values_missing_column(self):
+        self.assertEqual(self.execute("""
+            SELECT
+              account,
+              year(date) AS year,
+              sum(cost(position)) AS balance
+            WHERE
+              account ~ 'Expenses'
+            GROUP BY 1, 2
+            PIVOT BY account, year VALUES (2012, 2016)"""), (
+            [
+                ('account/year', str),
+                ('2012', inventory.Inventory),
+                ('2016', inventory.Inventory),
+            ],
+            [
+                ('Expenses:Aaa', I('5.00 USD'), None),
+                ('Expenses:Bbb', I('1.00 USD'), None),
+            ]))
+
+    def test_pivot_zero_is_not_absent(self):
+        entries, errors, options = loader.load_string(textwrap.dedent("""
+          2012-01-01 open Assets:Offset USD
+          2012-01-01 open Assets:Other EUR
+          2012-01-01 open Equity:Opening
+
+          2012-01-02 * "A"
+            Assets:Offset   10.00 USD
+            Equity:Opening
+
+          2012-01-03 * "B"
+            Assets:Offset  -10.00 USD
+            Equity:Opening
+
+          2012-01-04 * "C"
+            Assets:Other     5.00 EUR
+            Equity:Opening
+        """))
+        self.assertFalse(errors)
+        ctx = beanquery.connect('beancount:', entries=entries, errors=errors, options=options)
+        curs = ctx.execute("""
+            SELECT
+              account,
+              currency,
+              sum(position) AS balance
+            WHERE
+              account ~ 'Assets'
+            GROUP BY 1, 2
+            PIVOT BY 1, 2""")
+        self.assertEqual([(c.name, c.datatype) for c in curs.description], [
+            ('account/currency', str),
+            ('EUR', inventory.Inventory),
+            ('USD', inventory.Inventory),
+        ])
+        self.assertEqual(curs.fetchall(), [
+            ('Assets:Offset', None, I('')),
+            ('Assets:Other', I('5.00 EUR'), None),
+        ])
+
+    def test_pivot_zero_and_absent_with_two_ledgers(self):
+        ledgers = [
+            """
+              2012-01-01 open Assets:Offset USD
+              2012-01-01 open Assets:Other EUR
+              2012-01-01 open Equity:Opening
+
+              2012-01-02 * "A"
+                Assets:Offset   10.00 USD
+                Equity:Opening
+
+              2012-01-03 * "B"
+                Assets:Offset  -10.00 USD
+                Equity:Opening
+
+              2012-01-04 * "C"
+                Assets:Other     5.00 EUR
+                Equity:Opening
+            """,
+            """
+              2012-01-01 open Assets:Offset USD
+              2012-01-01 open Assets:Other EUR
+              2012-01-01 open Assets:Third CAD
+              2012-01-01 open Equity:Opening
+
+              2012-01-02 * "A"
+                Assets:Offset   10.00 USD
+                Equity:Opening
+
+              2012-01-03 * "B"
+                Assets:Offset  -10.00 USD
+                Equity:Opening
+
+              2012-01-04 * "C"
+                Assets:Other     5.00 EUR
+                Equity:Opening
+
+              2012-01-05 * "D"
+                Assets:Third     7.00 CAD
+                Equity:Opening
+            """,
+        ]
+        query = """
+            SELECT
+              account,
+              currency,
+              sum(position) AS balance
+            WHERE
+              account ~ 'Assets'
+            GROUP BY 1, 2
+            PIVOT BY 1, 2 VALUES ('EUR', 'USD', 'GBP')"""
+
+        results = []
+        for ledger in ledgers:
+            entries, errors, options = loader.load_string(textwrap.dedent(ledger))
+            self.assertFalse(errors)
+            ctx = beanquery.connect('beancount:', entries=entries, errors=errors, options=options)
+            curs = ctx.execute(query)
+            results.append(([(c.name, c.datatype) for c in curs.description], curs.fetchall()))
+
+        # The column order follows the explicit list, and 'GBP', which never
+        # occurs in either ledger, still gets a column in both results.
+        expected_columns = [
+            ('account/currency', str),
+            ('EUR', inventory.Inventory),
+            ('USD', inventory.Inventory),
+            ('GBP', inventory.Inventory),
+        ]
+        self.assertEqual(results[0][0], expected_columns)
+        self.assertEqual(results[1][0], expected_columns)
+
+        # Assets:Offset nets to zero in USD: it must show an empty inventory
+        # for USD and NULL for currencies it never held.  Both ledgers agree.
+        self.assertEqual(results[0][1], [
+            ('Assets:Offset', None, I(''), None),
+            ('Assets:Other', I('5.00 EUR'), None, None),
+        ])
+        self.assertEqual(results[1][1], [
+            ('Assets:Offset', None, I(''), None),
+            ('Assets:Other', I('5.00 EUR'), None, None),
+            ('Assets:Third', None, None, None),
+        ])
+
 
 class TestExecuteSubquery(QueryBase):
 

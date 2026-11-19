@@ -549,6 +549,7 @@ class BQLShell(DispatchingShell):
            [WHERE <where_expr>]
            [GROUP BY <groups>]
            [ORDER BY <groups> [ASC|DESC]]
+           [PIVOT BY <row-column>, <pivot-column> [VALUES (<values>)]]
            [LIMIT num]
 
         Where:
@@ -579,6 +580,16 @@ class BQLShell(DispatchingShell):
           CLOSE clause: Remove all the transactions after the given date and
 
           CLEAR: Transfer final Income and Expenses balances to Equity.
+
+          PIVOT BY clause: turn the values of the second column into output
+            columns, one per distinct value, for each value of the first
+            column. The optional VALUES list fixes both the set and the order
+            of the output columns; a listed value that does not occur in the
+            data still gets an (empty) column. This is meant to keep exports
+            stable across inputs and allows a consumer to tell a balance that
+            nets to zero (an empty inventory, rendered as ``()``) apart from a
+            currency that is absent for that row (NULL, rendered as the null
+            placeholder).
 
         """
         cursor = self.context.execute(statement)

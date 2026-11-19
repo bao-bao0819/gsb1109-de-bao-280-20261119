@@ -209,24 +209,41 @@ class Format(FieldType):
         except KeyError:
             raise KeyError(f"Field with name '{key}' not found.")
 
-    def __setitem__(self, key: slice | str | int, value: str | FieldType) -> None:
+    def _field_from_value(self, value: str | FieldType) -> FieldType:
         if isinstance(value, str):
             try:
-                _ = FieldType.from_string(value)
+                return FieldType.from_string(value)
             except ValueError as e:
                 raise ValueError(f"Can't set field from string: {e}") from None
-        elif isinstance(value, FieldType):
-            field = value
-        else:
-            raise ValueError(f"Can't create and set field from type '{type(value)}'.")
-        if isinstance(key, int):
-            self._fields[key] = field
-        elif isinstance(key, slice):
-            self._fields[key] = field
+        if isinstance(value, FieldType):
+            return value
+        raise ValueError(f"Can't create and set field from type '{type(value)}'.")
+
+    def _rebuild_field_names(self) -> None:
+        self._field_names = {}
+        for field in self._fields:
+            if field.name != "":
+                self._field_names[field.name] = field
+
+    def __setitem__(self, key: slice | str | int, value: str | FieldType | Iterable[str | FieldType]) -> None:
+        if isinstance(key, slice):
+            if isinstance(value, Format):
+                fields = [field._copy() for field in value._fields]
+            elif isinstance(value, Iterable) and not isinstance(value, str):
+                fields = [self._field_from_value(field) for field in value]
+            else:
+                fields = [self._field_from_value(value)]
+            self._fields[key] = fields
+            self._rebuild_field_names()
+        elif isinstance(key, int):
+            self._fields[key] = self._field_from_value(value)
+            self._rebuild_field_names()
         elif isinstance(key, str):
+            field = self._field_from_value(value)
             for i in range(len(self._fields)):
                 if self._fields[i].name == key:
                     self._fields[i] = field
+                    self._rebuild_field_names()
                     return
             raise KeyError(f"Field with name '{key}' not found.")
         else:
@@ -235,12 +252,15 @@ class Format(FieldType):
     def __delitem__(self, key: slice | int | str):
         if isinstance(key, int):
             del self._fields[key]
+            self._rebuild_field_names()
         elif isinstance(key, slice):
             del self._fields[key]
+            self._rebuild_field_names()
         elif isinstance(key, str):
             for i, field in enumerate(self._fields):
                 if field.name == key:
                     del self._fields[i]
+                    self._rebuild_field_names()
                     return
             raise KeyError(f"Field with name '{key}' not found.")
         else:
@@ -294,6 +314,7 @@ class Format(FieldType):
         x.name = self.name
         x.vars = copy.deepcopy(self.vars)
         x._fields = [copy.copy(f) for f in self._fields]
+        x._rebuild_field_names()
         return x
 
     def __add__(self, other: FieldType | str) -> Format:

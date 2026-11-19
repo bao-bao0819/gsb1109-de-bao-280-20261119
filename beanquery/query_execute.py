@@ -140,11 +140,15 @@ def execute_select(query):
     if query.group_indexes is None:
         # This is a non-aggregated query.
 
-        # Iterate over all the postings once.
+        # Iterate over all the postings once. Rows filtered out by the
+        # display filter are evaluated, thus updating stateful columns
+        # like the running balance, but are not included in the results.
+        c_display = query.c_display
         for context in query.table:
             if c_where is None or c_where(context):
                 values = [c_expr(context) for c_expr in c_target_exprs]
-                rows.append(values)
+                if c_display is None or c_display(context):
+                    rows.append(values)
 
     else:
         # This is an aggregated query.

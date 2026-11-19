@@ -123,6 +123,17 @@ class Compiler:
         new_targets, group_indexes, having_index = self._compile_group_by(node.group_by, c_targets)
         c_targets.extend(new_targets)
 
+        # If the FROM clause contains an OPEN directive, entries dated
+        # before the OPEN date are synthesized opening balances entries.
+        # For queries returning individual rows, these entries are
+        # evaluated, thus updating the running balance, but are
+        # filtered out of the reported rows.
+        c_display = None
+        if group_indexes is None:
+            open_date = getattr(self.table, 'open', None)
+            if open_date is not None and getattr(self.table, 'hide_opening_entries', False):
+                c_display = self._compile(ast.GreaterEq(ast.Column('date'), ast.Constant(open_date)))
+
         # Process the ORDER-BY clause.
         new_targets, order_spec = self._compile_order_by(node.order_by, c_targets)
         c_targets.extend(new_targets)
@@ -149,7 +160,8 @@ class Compiler:
                           having_index,
                           order_spec,
                           node.limit,
-                          node.distinct)
+                          node.distinct,
+                          c_display)
 
         pivots = self._compile_pivot_by(node.pivot_by, c_targets, group_indexes)
         if pivots:

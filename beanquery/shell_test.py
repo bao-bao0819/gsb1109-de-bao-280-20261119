@@ -220,7 +220,10 @@ class TestUseCases(unittest.TestCase):
         JOURNAL 'Assets:Checking'
         FROM OPEN ON 2022-02-01 CLOSE ON 2022-03-01;
         """
-        self.assertRegex(out, "2022-01-31 +S +Opening balance for 'Assets:Checking'")
+        # The synthesized opening balances entries are not reported but
+        # are included in the running balance.
+        self.assertNotRegex(out, 'Opening balance')
+        self.assertRegex(out, r'2022-02-01 .* 10.00 USD +-1571.61 USD')
         self.assertRegex(out, "Test 02")
 
     @runshell

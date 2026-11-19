@@ -11,6 +11,7 @@ from dateutil.relativedelta import relativedelta
 from beancount.core.amount import from_string as A
 from beancount.core.number import D
 from beancount.core import inventory
+from beancount.core import position
 from beancount.core.inventory import from_string as I
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
@@ -678,6 +679,76 @@ class TestFilterEntries(CommonInputBase, QueryBase):
             Equity:Earnings:Current                            -510.00 USD
 
         """), filtered_entries)
+
+
+class TestOpenClause(QueryBase):
+    """The OPEN directive in the FROM clause synthesizes opening
+    balances entries dated before the OPEN date. These entries update
+    the running balance but are not included in the results of queries
+    returning individual rows."""
+
+    INPUT = """
+
+      2026-01-01 open Assets:Bank:Checking
+      2026-01-01 open Income:Salary
+      2026-01-01 open Expenses:Food
+
+      2026-04-10 * "April salary"
+        Assets:Bank:Checking   1000.00 USD
+        Income:Salary         -1000.00 USD
+
+      2026-04-15 * "April EUR deposit"
+        Assets:Bank:Checking    500.00 EUR
+        Income:Salary          -500.00 EUR
+
+      2026-05-03 * "May groceries"
+        Expenses:Food            50.00 USD
+        Assets:Bank:Checking    -50.00 USD
+
+      2026-05-20 * "May dinner"
+        Expenses:Food            30.00 USD
+        Assets:Bank:Checking    -30.00 USD
+
+    """
+
+    def test_opening_balances_not_displayed(self):
+        # Only rows within the OPEN..CLOSE interval are reported. The
+        # EUR balance results exclusively from transactions before the
+        # OPEN date and is carried over by the running balance.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT date, account, position, balance
+            FROM OPEN ON 2026-05-01 CLOSE ON 2026-06-01
+            WHERE account = 'Assets:Bank:Checking'
+            """,
+            [('date', datetime.date),
+             ('account', str),
+             ('position', position.Position),
+             ('balance', inventory.Inventory)],
+            [
+                (datetime.date(2026, 5, 3), 'Assets:Bank:Checking',
+                 position.Position(A('-50.00 USD'), None),
+                 I('500.00 EUR, 950.00 USD')),
+                (datetime.date(2026, 5, 20), 'Assets:Bank:Checking',
+                 position.Position(A('-30.00 USD'), None),
+                 I('500.00 EUR, 920.00 USD')),
+            ])
+
+    def test_opening_balances_aggregated(self):
+        # Aggregated queries include the opening balances entries.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(position)
+            FROM OPEN ON 2026-05-01 CLOSE ON 2026-06-01
+            WHERE account = 'Assets:Bank:Checking'
+            """,
+            [('account', str),
+             ('sum(position)', inventory.Inventory)],
+            [
+                ('Assets:Bank:Checking', I('500.00 EUR, 920.00 USD')),
+            ])
 
 
 class TestAllocation(unittest.TestCase):

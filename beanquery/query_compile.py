@@ -618,6 +618,10 @@ EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 #     This list may refer to either aggregates or non-aggregates.
 #   limit: An optional integer used to cut off the number of result rows returned.
 #   distinct: An optional boolean that requests we should uniquify the result rows.
+#   c_display: An optional instance of EvalNode, a compiled expression
+#     tree. Rows for which this expression evaluates to false are
+#     evaluated, thus updating stateful columns like the running
+#     balance, but are not included in the query results.
 @dataclasses.dataclass
 class EvalQuery:
     table: tables.Table
@@ -628,6 +632,7 @@ class EvalQuery:
     order_spec: list[tuple[int, ast.Ordering]]
     limit: int
     distinct: bool
+    c_display: EvalNode = None
 
     @property
     def columns(self):

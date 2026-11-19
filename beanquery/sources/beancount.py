@@ -403,6 +403,12 @@ class PostingsTable(_BeancountTable):
     columns = ColumnsRegistry()
     wildcard_columns = 'date flag payee narration position'.split()
 
+    # Transactions dated before the FROM clause OPEN date are opening
+    # balances entries synthesized by the OPEN directive. These entries
+    # update the running balance but are not included in the results of
+    # queries returning individual rows.
+    hide_opening_entries = True
+
     def __iter__(self):
         entries = self.prepare()
         context = _PostingsTableRow()

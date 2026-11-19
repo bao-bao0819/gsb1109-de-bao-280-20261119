@@ -12,6 +12,18 @@ class Error(RuntimeError):
         return "\n".join((*self.args, self.message))
 
 
+class NoImporterError(Error):
+    """No configured importer can handle a document."""
+
+
+class FileOpenError(Error):
+    """An importer cannot open or read a document."""
+
+
+class EntryParseError(Error):
+    """An importer cannot interpret a record read from a document."""
+
+
 class ExceptionsTrap(contextlib.AbstractContextManager):
     """A context manager to log exceptions.
 
@@ -23,26 +35,39 @@ class ExceptionsTrap(contextlib.AbstractContextManager):
 
     """
 
-    def __init__(self, func):
-        self.log = func
+    def __init__(self, log):
+        self.log = log
         self.errors = 0
+
+    def report(self, exc):
+        """Log an exception and count it as an error.
+
+        Args:
+          exc: The exception instance to report.
+
+        """
+        self.errors += 1
+        self.log("  ERROR", fg="red")
+        if isinstance(exc, Error):
+            # Beangulp validation error.
+            self.log(textwrap.indent(str(exc), "  "))
+            return
+        # Unexpected exception.
+        self.log("  Exception in importer code.")
+        exc_str = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        self.log(textwrap.indent(exc_str, "  ").rstrip())
 
     def __exit__(self, exctype, excinst, exctb):
         if exctype is None:
             return True
-        self.errors += 1
-        self.log("  ERROR", fg="red")
-        if issubclass(exctype, Error):
-            # Beangulp validation error.
-            self.log(textwrap.indent(str(excinst), "  "))
-            return True
-        if issubclass(exctype, Exception):
-            # Unexpected exception.
-            self.log("  Exception in importer code.")
-            exc = "".join(traceback.format_exception(exctype, excinst, exctb))
-            self.log(textwrap.indent(exc, "  ").rstrip())
-            return True
-        return False
+        if not isinstance(excinst, Exception):
+            # Do not suppress BaseException instances, for example
+            # KeyboardInterrupt or SystemExit.
+            return False
+        self.report(excinst)
+        return True
 
     def __bool__(self):
         """Return True if any error occurred."""

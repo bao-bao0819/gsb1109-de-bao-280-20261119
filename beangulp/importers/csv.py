@@ -29,6 +29,7 @@ from beangulp import utils
 from beangulp import cache
 from beangulp import date_utils
 from beangulp import importer
+from beangulp.exceptions import EntryParseError
 from beangulp.importers.mixins import filing, identifier
 
 
@@ -326,78 +327,87 @@ class _CSVImporterBase:
                     first_row = row
                 last_row = row
 
-                # Extract the data we need from the row, based on the configuration.
-                date = get(row, Col.DATE)
-                txn_date = get(row, Col.TXN_DATE)
-                txn_time = get(row, Col.TXN_TIME)
+                try:
+                    # Extract the data we need from the row, based on the configuration.
+                    date = get(row, Col.DATE)
+                    txn_date = get(row, Col.TXN_DATE)
+                    txn_time = get(row, Col.TXN_TIME)
 
-                payee = get(row, Col.PAYEE)
-                if payee:
-                    payee = payee.strip()
+                    payee = get(row, Col.PAYEE)
+                    if payee:
+                        payee = payee.strip()
 
-                fields = filter(
-                    None,
-                    [
-                        get(row, field)
-                        for field in (Col.NARRATION1, Col.NARRATION2, Col.NARRATION3)
-                    ],
-                )
-                narration = self.narration_sep.join(
-                    field.strip() for field in fields
-                ).replace("\n", "; ")
+                    fields = filter(
+                        None,
+                        [
+                            get(row, field)
+                            for field in (Col.NARRATION1, Col.NARRATION2, Col.NARRATION3)
+                        ],
+                    )
+                    narration = self.narration_sep.join(
+                        field.strip() for field in fields
+                    ).replace("\n", "; ")
 
-                tag = get(row, Col.TAG)
-                tags = {tag} if tag else data.EMPTY_SET
+                    tag = get(row, Col.TAG)
+                    tags = {tag} if tag else data.EMPTY_SET
 
-                link = get(row, Col.REFERENCE_ID)
-                links = {link} if link else data.EMPTY_SET
+                    link = get(row, Col.REFERENCE_ID)
+                    links = {link} if link else data.EMPTY_SET
 
-                last4 = get(row, Col.LAST4)
+                    last4 = get(row, Col.LAST4)
 
-                balance = get(row, Col.BALANCE)
+                    balance = get(row, Col.BALANCE)
 
-                currency = get(row, Col.CURRENCY) or self.currency
+                    currency = get(row, Col.CURRENCY) or self.currency
 
-                # Create a transaction
-                meta = data.new_metadata(file.name, index)
-                if txn_date is not None:
-                    meta["date"] = date_utils.parse_date(txn_date, self.dateutil_kwds)
-                if txn_time is not None:
-                    meta["time"] = str(dateutil.parser.parse(txn_time).time())
-                if balance is not None:
-                    meta["balance"] = Amount(self.parse_amount(balance), currency)
-                if last4:
-                    last4_friendly = self.last4_map.get(last4.strip())
-                    meta["card"] = last4_friendly if last4_friendly else last4
-                date = date_utils.parse_date(date, self.dateutil_kwds)
-                txn = data.Transaction(
-                    meta, date, self.FLAG, payee, narration, tags, links, []
-                )
-
-                # Attach one posting to the transaction
-                amount_debit, amount_credit = self.get_amounts(
-                    iconfig, row, False, self.parse_amount
-                )
-
-                # Skip empty transactions
-                if amount_debit is None and amount_credit is None:
-                    continue
-
-                for amount in [amount_debit, amount_credit]:
-                    if amount is None:
-                        continue
-                    if self.invert_sign:
-                        amount = -amount
-                    units = Amount(amount, currency)
-                    txn.postings.append(
-                        data.Posting(account, units, None, None, None, None)
+                    # Create a transaction
+                    meta = data.new_metadata(file.name, index)
+                    if txn_date is not None:
+                        meta["date"] = date_utils.parse_date(txn_date, self.dateutil_kwds)
+                    if txn_time is not None:
+                        meta["time"] = str(dateutil.parser.parse(txn_time).time())
+                    if balance is not None:
+                        meta["balance"] = Amount(self.parse_amount(balance), currency)
+                    if last4:
+                        last4_friendly = self.last4_map.get(last4.strip())
+                        meta["card"] = last4_friendly if last4_friendly else last4
+                    date = date_utils.parse_date(date, self.dateutil_kwds)
+                    txn = data.Transaction(
+                        meta, date, self.FLAG, payee, narration, tags, links, []
                     )
 
-                # Attach the other posting(s) to the transaction.
-                txn = self.call_categorizer(txn, row)
+                    # Attach one posting to the transaction
+                    amount_debit, amount_credit = self.get_amounts(
+                        iconfig, row, False, self.parse_amount
+                    )
 
-                # Add the transaction to the output list
-                entries.append(txn)
+                    # Skip empty transactions
+                    if amount_debit is None and amount_credit is None:
+                        continue
+
+                    for amount in [amount_debit, amount_credit]:
+                        if amount is None:
+                            continue
+                        if self.invert_sign:
+                            amount = -amount
+                        units = Amount(amount, currency)
+                        txn.postings.append(
+                            data.Posting(account, units, None, None, None, None)
+                        )
+
+                    # Attach the other posting(s) to the transaction.
+                    txn = self.call_categorizer(txn, row)
+
+                    # Add the transaction to the output list
+                    entries.append(txn)
+
+                except EntryParseError:
+                    raise
+                except Exception as ex:
+                    raise EntryParseError(
+                        f"Error processing {file.name} line {index + 1} "
+                        f"with values {row!r}"
+                    ) from ex
 
         # Figure out if the file is in ascending or descending order.
         first_date = date_utils.parse_date(get(first_row, Col.DATE), self.dateutil_kwds)

@@ -10,6 +10,7 @@ from itertools import islice, tee
 from beancount.core import data
 
 import beangulp
+from beangulp.exceptions import EntryParseError
 
 EMPTY = frozenset()
 
@@ -420,7 +421,7 @@ class Importer(beangulp.Importer, CSVReader):
                 # Report input file location of processing errors. This could
                 # use Exception.add_note() instead, but this is available only
                 # with Python 3.11 and later.
-                raise RuntimeError(
+                raise EntryParseError(
                     f"Error processing {filepath} line {lineno + 1} with values {row!r}"
                 ) from ex
 

@@ -10,6 +10,9 @@ from pprint import pformat
 from beancount.core import data
 from beancount.parser import cmptest
 from beancount.utils import test_utils
+import beangulp
+from beangulp import extract
+from beangulp.exceptions import EntryParseError
 from beangulp.importers import csv
 
 
@@ -618,3 +621,56 @@ class TestCSVImporter(cmptest.TestCase):
 # TODO: Add balances every month or week.
 # TODO: Test ascending and descending orders.
 # TODO: Add a test for all the supported fields, e.g. NARRATION2.
+
+
+class TestLegacyImporterErrorClassification(cmptest.TestCase):
+    def setUp(self):
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+
+    def _legacy_importer(self):
+        # The deprecated Importer implements the old ImporterProtocol
+        # and is wrapped in an Adapter when used through beangulp.Ingest.
+        return csv.Importer(
+            {
+                Col.DATE: "Posting",
+                Col.NARRATION: "Description",
+                Col.AMOUNT: "Amount",
+            },
+            "Assets:Bank",
+            "EUR",
+            [],
+        )
+
+    @test_utils.docfile
+    def test_entry_parse_error_through_adapter(self, filename):
+        """\
+          Posting,Description,Amount
+          11/7/2016,A,2
+          12/7/2016,B,bad
+        """
+        importer = beangulp.Adapter(self._legacy_importer())
+        with self.assertRaises(EntryParseError) as ctx:
+            extract.extract_from_file(importer, filename, [])
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+
+    @test_utils.docfile
+    def test_valid_rows_through_adapter(self, filename):
+        """\
+          Posting,Description,Amount
+          11/7/2016,A,2
+          12/7/2016,B,3
+        """
+        importer = beangulp.Adapter(self._legacy_importer())
+        entries = extract.extract_from_file(importer, filename, [])
+        self.assertEqualEntries(
+            """
+
+          2016-11-07 * "A"
+            Assets:Bank  2 EUR
+
+          2016-12-07 * "B"
+            Assets:Bank  3 EUR
+
+        """,
+            entries,
+        )

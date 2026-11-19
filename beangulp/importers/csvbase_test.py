@@ -6,6 +6,7 @@ import unittest
 from beancount.core import data
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
+from beangulp.exceptions import EntryParseError
 from beangulp.importers.csvbase import (
     _chomp,
     Column,
@@ -791,7 +792,7 @@ class TestImporter(cmptest.TestCase):
         msg = re.escape(
             f"Error processing {filename} line 3 with values ('2025-01-26', ' Test', ' invalid'"
         )
-        with self.assertRaisesRegex(RuntimeError, msg) as ctx:
+        with self.assertRaisesRegex(EntryParseError, msg) as ctx:
             importer.extract(filename, [])
         self.assertIsInstance(ctx.exception.__cause__, decimal.InvalidOperation)
 

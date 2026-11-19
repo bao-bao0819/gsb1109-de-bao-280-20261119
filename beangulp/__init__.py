@@ -19,7 +19,6 @@ import click
 
 from beancount import loader
 from typing import Optional
-from typing import List
 
 from beangulp import archive
 from beangulp import cache
@@ -97,26 +96,31 @@ def _extract(
     # Load the ledger, if one is specified.
     existing_entries = loader.load_file(existing)[0] if existing else []
 
-    extracted: List[extract.ExtractedEntry] = []
-    for filename in _walk(src, log):
-        with errors:
-            importer = identify.identify(ctx.importers, filename)
-            if not importer:
-                log("")  # Newline.
-                continue
+    def on_pending(filename, exc):
+        # No configured importer matches this document: it remains in
+        # the pending list without being considered an error.
+        log("")
 
-            # Signal processing of this document.
-            log(" ...", nl=False)
+    def on_success(filename):
+        log(" ...", nl=False)
+        log(" OK", fg="green")
 
-            # Extract entries.
-            entries = extract.extract_from_file(importer, filename, existing_entries)
-            account = importer.account(filename)
+    def on_error(filename, exc):
+        # Errors are classified by their exception type:
+        # FileOpenError for documents that cannot be opened or read,
+        # EntryParseError for records an importer cannot interpret.
+        log(" ...", nl=False)
+        errors.report(exc)
 
-            extracted.append((filename, entries, account, importer))
-            log(" OK", fg="green")
-
-        if failfast and errors:
-            break
+    extracted, _pending, _failed = extract.process_documents(
+        ctx.importers,
+        _walk(src, log),
+        existing_entries,
+        on_error=on_error,
+        on_pending=on_pending,
+        on_success=on_success,
+        failfast=failfast,
+    )
 
     # Sort.
     extract.sort_extracted_entries(extracted)

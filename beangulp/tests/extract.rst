@@ -116,6 +116,79 @@ Cleanup:
   >>> mkdir(downloads)
 
 
+Error classification
+--------------------
+
+A batch may contain three kinds of problematic documents: documents
+for which no importer applies, documents an importer cannot open or
+read, and documents that can be read but contain a record an importer
+cannot interpret.  The three conditions are reported distinctly and
+entries from readable documents are still extracted.
+
+  >>> from beangulp.exceptions import EntryParseError
+
+  >>> class UnreadableImporter(Importer):
+  ...
+  ...     def identify(self, filepath):
+  ...         return filepath.endswith('.bin')
+  ...
+  ...     def extract(self, filepath, existing):
+  ...         raise OSError('cannot open document')
+
+  >>> class LineErrorImporter(Importer):
+  ...
+  ...     def identify(self, filepath):
+  ...         return filepath.endswith('.pdf')
+  ...
+  ...     def extract(self, filepath, existing):
+  ...         raise EntryParseError(f'Error processing {filepath} line 3')
+
+  >>> classified = importers + [
+  ...     UnreadableImporter('test.Unreadable', 'Assets:Tests', None),
+  ...     LineErrorImporter('test.LineError', 'Assets:Tests', None),
+  ... ]
+  >>> def run_classified(*args):
+  ...     ingest = beangulp.Ingest(classified)
+  ...     return runner.invoke(ingest.cli, args, catch_exceptions=False)
+
+One document of each kind, plus a readable statement:
+
+  >>> for fname in ('notes.txt', 'statement.bin', 'rows.pdf'):
+  ...     with open(path.join(downloads, fname), 'w') as f:
+  ...         _ = f.write('data\n')
+  >>> _ = pathlib.Path(downloads, 'one.beans').write_text("""
+  ... 2023-01-01 * "Test"
+  ...   Assets:Tests  2 TESTS
+  ... """)
+
+  >>> r = run_classified('extract', downloads, '-o', output)
+  >>> r.exit_code
+  1
+  >>> print(r.output)
+  * .../downloads/notes.txt
+  * .../downloads/one.beans ... OK
+  * .../downloads/rows.pdf ... ERROR
+    Error processing .../downloads/rows.pdf line 3
+  * .../downloads/statement.bin ... ERROR
+    Could not read document .../statement.bin.
+
+The readable statement is still written to the output file even though
+other documents in the batch failed:
+
+  >>> print(pathlib.Path(output).read_text())
+  ;; -*- mode: beancount -*-
+  <BLANKLINE>
+  **** .../downloads/one.beans
+  <BLANKLINE>
+  2023-01-01 * "Test"
+    Assets:Tests  2 TESTS
+
+Cleanup:
+
+  >>> for fname in ('notes.txt', 'statement.bin', 'rows.pdf', 'one.beans'):
+  ...     unlink(path.join(downloads, fname))
+
+
 Deduplication
 -------------
 

@@ -12,10 +12,15 @@ from typing import Callable
 from typing import TYPE_CHECKING
 from typing import Tuple
 from typing import List
+from typing import Optional
+from typing import Iterable
 
 from beancount.core import data
 from beancount.parser import printer
 from beangulp import similar
+from beangulp.exceptions import EntryParseError
+from beangulp.exceptions import FileOpenError
+from beangulp.exceptions import NoImporterError
 
 if TYPE_CHECKING:
     from beangulp.importer import Importer
@@ -46,8 +51,25 @@ def extract_from_file(
 
     Returns:
       The list of imported entries.
+
+    Raises:
+      beangulp.exceptions.FileOpenError: The importer could not open
+        or read the document.
+      beangulp.exceptions.EntryParseError: The importer could read the
+        document but could not interpret one of its records.
+
     """
-    entries = importer.extract(filename, existing_entries)
+    try:
+        entries = importer.extract(filename, existing_entries)
+    except FileOpenError:
+        raise
+    except EntryParseError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        # Errors opening or reading the document surface as OSError
+        # (including its FileNotFoundError and PermissionError
+        # subclasses) or UnicodeDecodeError from importer code.
+        raise FileOpenError(f"Could not read document {filename}.") from exc
     if not entries:
         return []
 
@@ -59,6 +81,117 @@ def extract_from_file(
         data.sanity_check_types(entry)
 
     return entries
+
+
+# A document that could not be processed, associated with the error
+# that prevented its processing. The first element is the document
+# filesystem path, the second element is the error exception.
+DocumentError = Tuple[str, Exception]
+
+
+def process_documents(
+    importers: List["Importer"],
+    documents: Iterable[str],
+    existing_entries: "data.Directives",
+    on_error: Callable[[str, Exception], None],
+    on_pending: Optional[Callable[[str, NoImporterError], None]] = None,
+    on_success: Optional[Callable[[str], None]] = None,
+    failfast: bool = False,
+) -> Tuple[List[ExtractedEntry], List[DocumentError], List[DocumentError]]:
+    """Identify importers and extract entries from a batch of documents.
+
+    Each document is sorted in one of three categories:
+
+    * documents for which no configured importer applies are reported
+      through on_pending with a NoImporterError and added to the
+      returned pending list;
+    * documents that could not be opened or read
+      (beangulp.exceptions.FileOpenError), or for which an importer
+      could not interpret a record
+      (beangulp.exceptions.EntryParseError), are reported through
+      on_error and added to the returned errors list;
+    * documents successfully processed contribute entries to the
+      returned extracted list and are reported through on_success, if
+      one is provided.
+
+    A failure processing a document does not prevent the remaining
+    documents from being processed.
+
+    Args:
+      importers: List of importer instances.
+      documents: Filesystem paths of the documents to process.
+      existing_entries: Existing entries.
+      on_error: Callback invoked with the document path and the error
+        exception for each document that could not be processed.
+      on_pending: Optional callback invoked with the document path for
+        each document for which no importer applies.
+      on_success: Optional callback invoked with the document path for
+        each successfully processed document.
+      failfast: When True, stop processing at the first document that
+        triggers an error.
+
+    Returns:
+      A tuple containing the list of extracted entries, the list of
+      (document, NoImporterError) pairs for documents without a
+      matching importer, and the list of (document, error) pairs for
+      the documents that triggered an error.
+
+    """
+    from beangulp import identify
+
+    extracted: List[ExtractedEntry] = []
+    pending: List[DocumentError] = []
+    errors: List[DocumentError] = []
+
+    for filename in documents:
+        try:
+            importer = identify.identify(importers, filename)
+        except (OSError, UnicodeDecodeError) as read_error:
+            # An importer tried and failed to open or read the
+            # document while identifying it.
+            error = FileOpenError(f"Could not read document {filename}.")
+            error.__cause__ = read_error
+            errors.append((filename, error))
+            on_error(filename, error)
+            if failfast:
+                break
+            continue
+        except Exception as exc:
+            # Other errors raised while identifying a document, for
+            # example importer identification collisions.
+            errors.append((filename, exc))
+            on_error(filename, exc)
+            if failfast:
+                break
+            continue
+
+        if importer is None:
+            # No configured importer can handle this document.
+            exc = NoImporterError(f"No importer matches document {filename}.")
+            pending.append((filename, exc))
+            if on_pending is not None:
+                on_pending(filename, exc)
+            continue
+
+        try:
+            entries = extract_from_file(importer, filename, existing_entries)
+            account = importer.account(filename)
+        except Exception as exc:
+            # Beangulp validation errors are classified by their
+            # exception type. Any other exception is an unexpected
+            # error in importer code. Processing continues with the
+            # next document in either case.
+            errors.append((filename, exc))
+            on_error(filename, exc)
+            if failfast:
+                break
+            continue
+
+        extracted.append((filename, entries, account, importer))
+        if on_success is not None:
+            on_success(filename)
+
+    return extracted, pending, errors
 
 
 def sort_extracted_entries(extracted: List[ExtractedEntry]) -> None:

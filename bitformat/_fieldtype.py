@@ -47,6 +47,13 @@ class FieldTypeTransformer(DtypeTransformer):
         return fieldtype_classes['Repeat'].from_params(count, field, value)
 
     @staticmethod
+    def section(items) -> 'Section':
+        name = items[0] if items[0] is not None else ''
+        length = items[1]
+        field = items[2]
+        return fieldtype_classes['Section'].from_params(length, field, name)
+
+    @staticmethod
     def while_(items) -> 'While':
         return fieldtype_classes['While'].from_params(items[0], items[1])
 

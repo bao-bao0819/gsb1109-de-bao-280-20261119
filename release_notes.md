@@ -1,5 +1,9 @@
 # Release Notes
 
+### Unreleased
+
+* Added `Section` field type, which confines another `FieldType` to a known bit range. Parsing inside a section can never consume bits belonging to later sections, short reads report the section's name and bit position, and following sections keep deterministic offsets so they can still be parsed individually.
+
 ### November 2025; version 0.9.
 
 * Allowing upper-case 0B, 0X and 0O prefixes as they are allowable in Python.

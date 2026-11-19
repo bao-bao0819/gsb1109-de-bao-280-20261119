@@ -51,6 +51,12 @@ Some of these types will usually be used as part of a larger structure, where th
    * -
      -
      - ``'repeat {10}: f64'``
+   * - :ref:`section_quick_reference`
+     - ✓
+     - Confine another field type to a known bit range, with optional name.
+   * -
+     -
+     - ``'name: section {length}: fieldtype'``
 
 
 .. _fieldtype_quick_reference:
@@ -138,3 +144,19 @@ A `Repeat` field repeats another field type a given number of times.
 
 ``Repeat('repeat {count}: fieldtype')`` or ``Repeat.from_params(count, fieldtype, value=None)``
 
+
+
+.. _section_quick_reference:
+
+Section
+-------
+
+A `Section` field confines another field type to a known bit range.
+
+``Section('name: section {length}: fieldtype')`` or ``Section.from_params(length, fieldtype, name='')``
+
+The length, in bits, can be an integer or an :class:`Expression` that is evaluated from previously parsed fields.
+When parsing, the contents of the section can only be read from within its bit range, so data belonging to
+later sections is never consumed to satisfy this one. If the data runs short, the error reports the name of
+the section and its bit position. The section always occupies its full declared bit range, so sections that
+follow it start at a known bit position and can still be parsed individually.

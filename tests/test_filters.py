@@ -7,16 +7,42 @@ from datasette.utils.asgi import Request
 @pytest.mark.parametrize(
     "args,expected_where,expected_params",
     [
-        ((("name_english__contains", "foo"),), ['"name_english" like :p0'], ["%foo%"]),
+        (
+            (("name_english__contains", "foo"),),
+            ['"name_english" like :p0 escape char(92)'],
+            ["%foo%"],
+        ),
         (
             (("name_english__notcontains", "foo"),),
-            ['"name_english" not like :p0'],
+            ['"name_english" not like :p0 escape char(92)'],
             ["%foo%"],
         ),
         (
             (("foo", "bar"), ("bar__contains", "baz")),
-            ['"bar" like :p0', '"foo" = :p1'],
+            ['"bar" like :p0 escape char(92)', '"foo" = :p1'],
             ["%baz%", "bar"],
+        ),
+        # contains and notcontains only match the literal text
+        (
+            (("foo__contains", "_R%"),),
+            ['"foo" like :p0 escape char(92)'],
+            ["%\\_R\\%%"],
+        ),
+        (
+            (("foo__notcontains", "_R%"),),
+            ['"foo" not like :p0 escape char(92)'],
+            ["%\\_R\\%%"],
+        ),
+        (
+            (("foo__contains", "a\\b_c%d"),),
+            ['"foo" like :p0 escape char(92)'],
+            ["%a\\\\b\\_c\\%d%"],
+        ),
+        # Explicit like and notlike keep their wildcards
+        (
+            (("foo__like", "_R%"), ("bar__notlike", "a_b")),
+            ['"bar" not like :p0', '"foo" like :p1'],
+            ["a_b", "_R%"],
         ),
         (
             (("foo__startswith", "bar"), ("bar__endswith", "baz")),

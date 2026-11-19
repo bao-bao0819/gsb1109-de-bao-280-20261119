@@ -677,6 +677,88 @@ async def test_table_filter_queries_multiple_of_same_type(ds_client):
     ]
 
 
+@pytest.fixture
+async def suppliers_ds():
+    return await make_ds(
+        extra_databases={
+            "suppliers": """
+                create table suppliers (
+                    id integer primary key, code text, note text
+                );
+                insert into suppliers (id, code, note) values
+                    (1, 'A', 'supplier _R% one'),
+                    (2, 'B', 'supplier XRZ one'),
+                    (3, 'C', 'supplier R one'),
+                    (4, 'D', 'supplier \\_R% one'),
+                    (5, 'E', 'supplier 100% one'),
+                    (6, 'F', 'supplier 100X one'),
+                    (7, 'G', 'supplier plain one'),
+                    (8, 'H', 'supplier plain two');
+            """
+        }
+    )
+
+
+async def test_contains_and_notcontains_match_literal_text(suppliers_ds):
+    async def ids(**args):
+        response = await suppliers_ds.client.get(
+            "/suppliers/suppliers.json?" + urllib.parse.urlencode(args)
+        )
+        assert response.status_code == 200, response.text
+        return [row["id"] for row in response.json()["rows"]]
+
+    # % and _ are matched as literal characters, not LIKE wildcards
+    assert await ids(note__contains="_R%") == [1, 4]
+    assert await ids(note__contains="%") == [1, 4, 5]
+    assert await ids(note__contains="_") == [1, 4]
+    assert await ids(note__contains="\\_R%") == [4]
+    assert await ids(note__notcontains="_R%") == [2, 3, 5, 6, 7, 8]
+    assert await ids(note__notcontains="%") == [2, 3, 6, 7, 8]
+    # Explicit like filters still use % and _ as wildcards
+    assert await ids(note__like="supplier X_Z one") == [2]
+    assert await ids(note__notlike="supplier X_Z one") == [1, 3, 4, 5, 6, 7, 8]
+
+
+async def test_contains_filter_is_preserved_across_pages(suppliers_ds):
+    query = urllib.parse.urlencode(
+        {"note__contains": "_R%", "_size": 1, "_shape": "arrays"}
+    )
+    response = await suppliers_ds.client.get("/suppliers/suppliers.json?" + query)
+    data = response.json()
+    assert data["rows"] == [[1, "A", "supplier _R% one"]]
+    next_url = data["next_url"].removeprefix("http://localhost")
+    assert "note__contains=_R%25" in next_url
+    response = await suppliers_ds.client.get(next_url)
+    data = response.json()
+    assert data["rows"] == [[4, "D", "supplier \\_R% one"]]
+    assert data["next"] is None
+
+
+async def test_notcontains_filter_is_preserved_across_pages(suppliers_ds):
+    query = urllib.parse.urlencode(
+        {"note__notcontains": "_R%", "_size": 1, "_shape": "arrays"}
+    )
+    response = await suppliers_ds.client.get("/suppliers/suppliers.json?" + query)
+    data = response.json()
+    assert data["rows"] == [[2, "B", "supplier XRZ one"]]
+    next_url = data["next_url"].removeprefix("http://localhost")
+    assert "note__notcontains=_R%25" in next_url
+    seen = []
+    while next_url:
+        response = await suppliers_ds.client.get(next_url)
+        data = response.json()
+        seen.extend(row[0] for row in data["rows"])
+        if data["next_url"]:
+            assert "note__notcontains=_R%25" in data["next_url"]
+        next_url = (
+            data["next_url"].removeprefix("http://localhost")
+            if data["next_url"]
+            else None
+        )
+    # XRZ does not literally contain "_R%", while rows 1 and 4 do
+    assert seen == [3, 5, 6, 7, 8]
+
+
 @pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
 async def test_table_filters_quote_identifiers():
     ds = await make_ds(

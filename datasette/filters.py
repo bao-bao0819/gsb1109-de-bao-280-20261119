@@ -223,6 +223,13 @@ def _coerce_numeric_filter_value(value):
     return converted if math.isfinite(converted) else value
 
 
+def _escape_like(value):
+    # Escape LIKE wildcards so the pattern only matches the literal text.
+    # The backslash must be escaped first, otherwise it would escape the
+    # backslashes we add for % and _.
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class TemplatedFilter(Filter):
     def __init__(
         self,
@@ -233,6 +240,7 @@ class TemplatedFilter(Filter):
         format="{}",
         numeric=False,
         no_argument=False,
+        escape_like=False,
     ):
         self.key = key
         self.display = display
@@ -241,8 +249,11 @@ class TemplatedFilter(Filter):
         self.format = format
         self.numeric = numeric
         self.no_argument = no_argument
+        self.escape_like = escape_like
 
     def where_clause(self, table, column, value, param_counter):
+        if self.escape_like:
+            value = _escape_like(value)
         converted = self.format.format(value)
         if self.numeric:
             converted = _coerce_numeric_filter_value(converted)
@@ -329,16 +340,18 @@ class Filters:
             TemplatedFilter(
                 "contains",
                 "contains",
-                "{c} like :{p}",
+                "{c} like :{p} escape char(92)",
                 '{c} contains "{v}"',
                 format="%{}%",
+                escape_like=True,
             ),
             TemplatedFilter(
                 "notcontains",
                 "does not contain",
-                "{c} not like :{p}",
+                "{c} not like :{p} escape char(92)",
                 '{c} does not contain "{v}"',
                 format="%{}%",
+                escape_like=True,
             ),
             TemplatedFilter(
                 "endswith",

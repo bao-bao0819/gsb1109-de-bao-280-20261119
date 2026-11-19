@@ -2,6 +2,7 @@ __copyright__ = "Copyright (C) 2014-2017  Martin Blais"
 __license__ = "GNU GPLv2"
 
 import datetime
+import typing
 import unittest
 import textwrap
 
@@ -413,6 +414,114 @@ class TestFundamentals(QueryBase):
         self.assertResult('''SELECT date_bin('1 month', 2024-11-10, 2024-06-03)''', datetime.date(2024, 11, 3))
         self.assertResult('''SELECT date_bin('3 days', 2024-11-10, 2024-11-02)''', datetime.date(2024, 11, 8))
         self.assertResult('''SELECT date_bin('3 days', 2024-11-10, 2024-11-14)''', datetime.date(2024, 11, 8))
+
+
+class TestPostingsOtherAmounts(QueryBase):
+    INPUT = """
+        2024-01-01 open Assets:Bank:Checking
+        2024-01-01 open Assets:Alice
+        2024-01-01 open Assets:Bob
+        2024-01-01 open Assets:Broker
+        2024-01-01 open Assets:Cash:EUR
+        2024-01-01 open Expenses:Food
+        2024-01-01 open Expenses:Fee
+        2024-01-01 open Expenses:Travel
+
+        2024-02-01 * "Dinner"
+          Expenses:Food        60.00 USD
+          Expenses:Food        40.00 USD
+          Assets:Alice        -30.00 USD
+          Assets:Alice        -20.00 USD
+          Assets:Bob          -50.00 USD
+          Expenses:Fee          5.00 USD
+          Assets:Bank:Checking  -5.00 USD
+
+        2024-03-01 * "Two currencies"
+          Expenses:Food       100.00 USD
+          Assets:Bank:Checking -100.00 USD
+          Expenses:Travel      50.00 EUR
+          Assets:Cash:EUR     -50.00 EUR
+
+        2024-04-01 * "Stock at cost"
+          Assets:Broker         2 HOOL {100.00 USD}
+          Expenses:Food       200.00 USD
+          Assets:Alice       -400.00 USD
+        """
+
+    def test_other_amounts_same_currency(self):
+        self.check_query(self.INPUT, """
+            SELECT other_amounts
+            WHERE account = 'Assets:Bob' AND date = 2024-02-01
+            """, [('other_amounts', dict)], [({
+                'Expenses:Food': A('100.00 USD'),
+                'Assets:Alice': A('-50.00 USD'),
+                'Expenses:Fee': A('5.00 USD'),
+                'Assets:Bank:Checking': A('-5.00 USD'),
+            },)])
+
+    def test_other_amounts_merges_legs(self):
+        self.check_query(self.INPUT, """
+            SELECT other_amounts
+            WHERE account = 'Expenses:Food' AND date = 2024-02-01 AND number = 60.00
+            """, [('other_amounts', dict)], [({
+                'Expenses:Food': A('40.00 USD'),
+                'Assets:Alice': A('-50.00 USD'),
+                'Assets:Bob': A('-50.00 USD'),
+                'Expenses:Fee': A('5.00 USD'),
+                'Assets:Bank:Checking': A('-5.00 USD'),
+            },)])
+
+    def test_other_amounts_excludes_other_currency(self):
+        self.check_query(self.INPUT, """
+            SELECT account, other_amounts
+            WHERE date = 2024-03-01
+            ORDER BY account
+            """, [('account', str), ('other_amounts', dict)], [
+            ('Assets:Bank:Checking', {'Expenses:Food': A('100.00 USD')}),
+            ('Assets:Cash:EUR', {'Expenses:Travel': A('50.00 EUR')}),
+            ('Expenses:Food', {'Assets:Bank:Checking': A('-100.00 USD')}),
+            ('Expenses:Travel', {'Assets:Cash:EUR': A('-50.00 EUR')}),
+        ])
+
+    def test_other_amounts_at_weight(self):
+        self.check_query(self.INPUT, """
+            SELECT other_amounts
+            WHERE account = 'Expenses:Food' AND date = 2024-04-01
+            """, [('other_amounts', dict)], [({
+                'Assets:Broker': A('200.00 USD'),
+                'Assets:Alice': A('-400.00 USD'),
+            },)])
+
+    def test_other_amounts_filter(self):
+        self.check_query(self.INPUT, """
+            SELECT other_amounts['Assets:Alice'] as alice
+            WHERE account = 'Assets:Bob' AND date = 2024-02-01
+            """, [('alice', object)], [(A('-50.00 USD'),)])
+
+    def test_other_postings_sources(self):
+        curs = self.ctx.execute("""
+            SELECT other_postings
+            WHERE account = 'Assets:Bob' AND date = 2024-02-01
+            """)
+        self.assertEqual(tuple([('other_postings', list)]), curs.description)
+        (postings,), = curs.fetchall()
+        self.assertEqual(
+            [(posting.account, posting.units) for posting in postings],
+            [
+                ('Expenses:Food', A('60.00 USD')),
+                ('Expenses:Food', A('40.00 USD')),
+                ('Assets:Alice', A('-30.00 USD')),
+                ('Assets:Alice', A('-20.00 USD')),
+                ('Expenses:Fee', A('5.00 USD')),
+                ('Assets:Bank:Checking', A('-5.00 USD')),
+            ])
+        self.assertTrue(all(posting.meta for posting in postings))
+
+    def test_other_currencies(self):
+        self.check_query(self.INPUT, """
+            SELECT other_currencies
+            WHERE account = 'Expenses:Food' AND date = 2024-03-01
+            """, [('other_currencies', typing.Set[str])], [({'USD', 'EUR'},)])
 
 
 class TestBeancountFunctions(QueryBase):

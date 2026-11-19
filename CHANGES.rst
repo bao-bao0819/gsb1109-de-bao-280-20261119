@@ -1,6 +1,13 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- The ``postings`` table has new ``other_amounts``, ``other_postings``
+  and ``other_currencies`` columns. ``other_amounts`` reports the
+  amounts paid by the other same-currency accounts of the transaction,
+  summed by account, while ``other_postings`` reports the other
+  postings the amounts are computed from, so that allocations can be
+  reconciled with their source postings.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

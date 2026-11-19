@@ -518,6 +518,47 @@ class PostingsTable(_BeancountTable):
         """The list of other accounts in the transaction, excluding that of this posting."""
         return {posting.account for posting in context.entry.postings if posting is not context.posting}
 
+    @columns.register(dict)
+    def other_amounts(context):
+        """The amounts paid by the other same-currency accounts, by account.
+
+        The other postings in the transaction whose weight is in the same
+        currency as the weight of this posting contribute to the amounts.
+        The weight is the amount in which the posting takes part in the
+        transaction balance, that is the amount actually paid. Multiple
+        postings to the same account are summed into a single amount.
+        Fee postings are included, while postings in another currency are
+        not: callers can apply their own filtering rules to the amounts,
+        for example by selecting the accounts they are interested in.
+        """
+        currency = convert.get_weight(context.posting).currency
+        numbers = {}
+        for posting in context.entry.postings:
+            if posting is context.posting:
+                continue
+            weight = convert.get_weight(posting)
+            if weight.currency != currency or not isinstance(weight.number, Decimal):
+                continue
+            numbers[posting.account] = numbers.get(posting.account, Decimal()) + weight.number
+        return {account: amount.Amount(number, currency) for account, number in numbers.items()}
+
+    @columns.register(list)
+    def other_postings(context):
+        """The other postings in the transaction, excluding that of this posting.
+
+        These are the postings the ``other_amounts`` column is computed
+        from. Postings in another currency and fee postings are included,
+        so that callers can filter them with their own rules and verify
+        which postings an allocation comes from.
+        """
+        return [posting for posting in context.entry.postings if posting is not context.posting]
+
+    @columns.register(typing.Set[str])
+    def other_currencies(context):
+        """The currencies of the weights of the other postings in the transaction."""
+        return {convert.get_weight(posting).currency
+                for posting in context.entry.postings if posting is not context.posting}
+
     @columns.register(Decimal)
     def number(context):
         """The number of units of the posting."""

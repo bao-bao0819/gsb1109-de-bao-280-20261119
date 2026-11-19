@@ -18,3 +18,14 @@ class TestName(unittest.TestCase):
             'links': 'set',
             'accounts': 'set[str]',
         })
+
+    def test_postings_other_names(self):
+        table = beancount.PostingsTable
+        names = {name: types.name(table.columns[name].dtype)
+                 for name in ('other_accounts', 'other_amounts', 'other_postings', 'other_currencies')}
+        self.assertEqual(names, {
+            'other_accounts': 'set[str]',
+            'other_amounts': 'dict',
+            'other_postings': 'list',
+            'other_currencies': 'set[str]',
+        })

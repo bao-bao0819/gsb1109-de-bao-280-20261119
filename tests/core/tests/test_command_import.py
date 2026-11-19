@@ -4,7 +4,7 @@ from io import BytesIO, StringIO, TextIOWrapper
 from unittest import mock
 from unittest.mock import patch
 
-from core.models import Book
+from core.models import Book, Category
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
@@ -35,6 +35,8 @@ class ImportCommandTest(TestCase):
     def setUp(self):
         self.out = StringIO()
         self.err = StringIO()
+        # the CSV rows reference an existing category by pk
+        Category.objects.create(id=1, name="Category 1")
 
     def test_import_command_with_csv(self):
         with tempfile.NamedTemporaryFile(mode="w+", suffix=".csv") as tmp_csv:

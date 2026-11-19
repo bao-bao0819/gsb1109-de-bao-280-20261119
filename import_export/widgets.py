@@ -1023,6 +1023,9 @@ class ManyToManyWidget(RelatedModelWidgetMixin, Widget):
         :returns: A QuerySet containing the related model instances, or an empty
             QuerySet
             if no value provided.
+        :raises ValueError: if one or more of the supplied values cannot be
+            matched against the related model, so that the row is reported as
+            invalid instead of silently dropping the unrecognised value(s).
         """
         if not value:
             return self.model.objects.none()
@@ -1030,9 +1033,32 @@ class ManyToManyWidget(RelatedModelWidgetMixin, Widget):
         if isinstance(value, (float, int)):
             ids = [int(value)]
         else:
-            ids = value.split(self.separator)
-            ids = filter(None, [i.strip() for i in ids])
-        return queryset.filter(**{"%s__in" % self.field: ids})
+            ids = [i.strip() for i in value.split(self.separator)]
+            ids = [i for i in ids if i]
+        objects = queryset.filter(**{"%s__in" % self.field: ids})
+        requested = [force_str(identifier) for identifier in ids]
+        found = {force_str(getattr(obj, self.field)) for obj in objects}
+        invalid = [identifier for identifier in requested if identifier not in found]
+        if invalid:
+            raise ValueError(
+                _(
+                    "No matching %(model_name)s found for the following "
+                    "value(s): %(values)s."
+                )
+                % {
+                    "model_name": force_str(self.model._meta.verbose_name),
+                    "values": ", ".join(invalid),
+                }
+            )
+        return objects
+
+    def render_object(self, obj):
+        """
+        :return: The rendered value of a single related object, using the
+            configured lookup field.  Used to render the individual entries of
+            an m2m diff.
+        """
+        return smart_str(getattr(obj, self.field))
 
     def render(self, value, **kwargs):
         """
@@ -1041,7 +1067,7 @@ class ManyToManyWidget(RelatedModelWidgetMixin, Widget):
           ``coerce_to_string`` has no effect on the return value.
         """
         if value is not None:
-            ids = [smart_str(getattr(obj, self.field)) for obj in value.all()]
+            ids = [self.render_object(obj) for obj in value.all()]
             return self.separator.join(ids)
         return ""
 

@@ -170,8 +170,9 @@
       </table>
       {% endblock %}
 
-    {% else %}
+    {% endif %}
 
+    {% if result.valid_rows and not result.has_errors %}
       {% block preview %}
       <h2>{% translate "Preview" %}</h2>
 
@@ -204,7 +205,6 @@
         {% endfor %}
       </table>
       {% endblock %}
-
     {% endif %}
 
   {% endif %}

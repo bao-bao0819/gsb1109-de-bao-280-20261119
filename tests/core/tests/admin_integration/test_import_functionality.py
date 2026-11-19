@@ -2,7 +2,7 @@ from unittest import mock
 from unittest.mock import PropertyMock, patch
 
 from core.admin import BookAdmin, EBookResource, ImportMixin
-from core.models import Author, Book, Parent
+from core.models import Author, Book, Category, Parent
 from core.tests.admin_integration.mixins import AdminTestMixin
 from django.contrib.admin.models import DELETION, LogEntry
 from django.contrib.admin.sites import AdminSite
@@ -478,6 +478,9 @@ class TestImportSkipConfirm(AdminTestMixin, TransactionTestCase):
         # test that if we send a file with multiple rows,
         # and transactions is enabled, a core error means that
         # no instances are persisted
+        # books.json references categories 1 and 2
+        Category.objects.create(id=1, name="Category 1")
+        Category.objects.create(id=2, name="Category 2")
         index = self._get_input_format_index("json")
         with mock.patch("core.admin.BookResource.skip_row") as mock_skip:
             mock_skip.side_effect = [None, ValueError("some unknown error"), None]
@@ -489,6 +492,9 @@ class TestImportSkipConfirm(AdminTestMixin, TransactionTestCase):
     def test_import_transaction_disabled_core_error(self):
         # with transactions disabled, a core (db constraint) error should not cause the
         # entire import to fail
+        # books.json references categories 1 and 2
+        Category.objects.create(id=1, name="Category 1")
+        Category.objects.create(id=2, name="Category 2")
         index = self._get_input_format_index("json")
         with mock.patch("core.admin.BookResource.skip_row") as mock_skip:
             mock_skip.side_effect = [None, ValueError("some unknown error"), None]

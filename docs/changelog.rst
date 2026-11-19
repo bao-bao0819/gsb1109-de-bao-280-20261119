@@ -22,10 +22,13 @@ Enhancements
 - Allow ``Resource`` subclasses to be subscripted, e.g. ``ModelResource[MyModel]`` (`2069 <https://github.com/django-import-export/django-import-export/issues/2069>`_)
 - ``ForeignKeyWidget``, ``CachedForeignKeyWidget`` and ``ManyToManyWidget`` now accept the related model as an ``"app_label.ModelName"`` string, resolved via the app registry (`2202 <https://github.com/django-import-export/django-import-export/issues/2202>`_)
 - Refactor bulk updates to use attribute not field (`2145 <https://github.com/django-import-export/django-import-export/issues/2145>`_)
+- The import preview diff for a many-to-many field now renders each related object separately, marking individual objects as added or removed, instead of producing a character-level diff of the joined render string.  Added :meth:`~import_export.widgets.ManyToManyWidget.render_object` which renders a single related object
+- The admin import preview now shows the valid-row preview table alongside the validation-error table when a batch contains both valid and invalid rows, so the changes which would be applied to the valid rows are visible even when the batch cannot be confirmed
 
 Fixes
 #####
 
+- Fixed :meth:`~import_export.widgets.ManyToManyWidget.clean` silently dropping values which do not match an existing related object.  It now raises a ``ValueError`` naming the unrecognised value(s), so the row is reported as invalid and the problem is visible in the import preview instead of being applied without the missing relations on confirm
 - Fixed ``DateWidget.clean()`` returning datetime instances so that xlsx round-trips of ``DateField`` values are correctly detected as unchanged by ``skip_row()`` (`2195 <https://github.com/django-import-export/django-import-export/issues/2195>`_, `2208 <https://github.com/django-import-export/django-import-export/pull/2208>`_)
 - Fixed import / export links being hidden when an admin mixin from another library declares ``change_list_template`` as a read-only property (e.g. django-admin-sortable2).  The import / export change list template now extends the template Django would otherwise have used, resolved on each request (`2205 <https://github.com/django-import-export/django-import-export/issues/2205>`_)
 - Fixed the import preview diff showing a spurious change for values which the widget considers equal but which render differently, for example a ``DecimalField`` value of ``1803.60`` imported from an xlsx cell as ``1803.6`` (`2199 <https://github.com/django-import-export/django-import-export/issues/2199>`_)

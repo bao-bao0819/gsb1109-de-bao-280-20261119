@@ -337,10 +337,11 @@ class DiffEquivalentValuesEdgeCaseTest(TestCase):
         )
         self.assertEqual(1, result.totals["update"])
         idx = resource.get_diff_headers().index("categories")
+        # related objects are shown as whole-object remove / add rather than
+        # a character-level diff ("41" -> "42" must not imply object "4" stayed)
         self.assertEqual(
-            "<span>4</span>"
-            '<del style="background:#ffe6e6;">1</del>'
-            '<ins style="background:#e6ffe6;">2</ins>',
+            '<del style="background:#ffe6e6;">41</del>'
+            '<ins style="background:#e6ffe6;">42</ins>',
             result.rows[0].diff[idx],
         )
 

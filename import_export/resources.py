@@ -60,6 +60,11 @@ class Diff:
     :meth:`~import_export.widgets.Widget.is_equal` (for example a ``Decimal``
     which only differs in trailing zeros), the persisted value is shown unchanged.
 
+    Many-to-many fields are not compared as joined strings: each related object
+    is rendered separately and shown as an insertion (added relation) or
+    deletion (removed relation), so a change from one related object to another
+    is never displayed as a partial edit of a single value.
+
     The class used can be replaced by overriding
     :meth:`~import_export.resources.Resource.get_diff_class`.  Diff generation
     can be disabled with :attr:`~import_export.options.ResourceOptions.skip_diff`,
@@ -94,6 +99,9 @@ class Diff:
         for field, v1, v2, raw1, raw2 in zip(
             self.fields, self.left, self.right, self.left_values, self.right_values
         ):
+            if isinstance(field.widget, widgets.ManyToManyWidget):
+                data.append(self._as_m2m_html(field, raw1, raw2))
+                continue
             if not self.new and v1 != v2 and self._is_equal(field, raw1, raw2):
                 # The values render differently but the widget considers them
                 # equal (e.g. Decimal("1803.60") persisted vs Decimal("1803.6")
@@ -108,6 +116,46 @@ class Diff:
             html = mark_safe(html)
             data.append(html)
         return data
+
+    def _as_m2m_html(self, field, original, updated):
+        """
+        Render the diff for a many-to-many field as the individual related
+        objects added and removed, rather than a character-level diff of the
+        joined render string (which can imply an object stayed when only part
+        of its rendered value matched, e.g. pk ``41`` -> ``42``).
+
+        ``original`` is the materialised "before" collection (related managers
+        are evaluated eagerly in :meth:`_read_raw_field_values`) and
+        ``updated`` is the "after" collection.
+        """
+        before = [] if self.new else self._render_m2m_values(field, original)
+        after = self._render_m2m_values(field, updated)
+        if not before and not after:
+            return mark_safe("")
+        unchanged = [value for value in before if value in after]
+        removed = [value for value in before if value not in after]
+        added = [value for value in after if value not in before]
+        parts = [f"<span>{escape(value)}</span>" for value in unchanged]
+        parts += [
+            f'<del style="background:#ffe6e6;">{escape(value)}</del>'
+            for value in removed
+        ]
+        parts += [
+            f'<ins style="background:#e6ffe6;">{escape(value)}</ins>'
+            for value in added
+        ]
+        return mark_safe("".join(parts))
+
+    def _render_m2m_values(self, field, value):
+        """
+        Return the rendered value of every object in an m2m collection,
+        preserving database ordering.  A missing value (e.g. an unsaved
+        instance) renders as an empty list.
+        """
+        if value is None:
+            return []
+        objects = value.all() if hasattr(value, "all") else value
+        return [force_str(field.widget.render_object(obj)) for obj in objects]
 
     def _is_equal(self, field, original_value, instance_value):
         """
@@ -137,7 +185,16 @@ class Diff:
         return [f.export(instance, sort_json_keys=True) for f in self.fields]
 
     def _read_raw_field_values(self, instance):
-        return [f.get_value(instance) for f in self.fields]
+        raw_values = []
+        for field in self.fields:
+            value = field.get_value(instance)
+            if isinstance(field.widget, widgets.ManyToManyWidget) and value is not None:
+                # Related managers are lazy: materialise the collection now,
+                # before the row is applied, so the "before" state is not read
+                # back from the database after save_m2m() has mutated it.
+                value = list(value.all())
+            raw_values.append(value)
+        return raw_values
 
 
 class Resource(metaclass=DeclarativeMetaclass):
@@ -544,6 +601,24 @@ class Resource(metaclass=DeclarativeMetaclass):
         errors = {}
         for field in self.get_import_fields():
             if isinstance(field.widget, widgets.ManyToManyWidget):
+                # m2m relations cannot be written until the instance has been
+                # saved, but the supplied values can be validated now so that
+                # an unrecognised related value marks the row invalid (and is
+                # shown in the preview) rather than failing later during
+                # save_m2m().  Readonly fields are never written, and m2m
+                # fields are not processed at all in bulk mode.
+                if (
+                    field.readonly
+                    or self._meta.use_bulk
+                    or field.column_name not in row
+                ):
+                    continue
+                try:
+                    field.clean(row, **kwargs)
+                except ValueError as e:
+                    errors[field.attribute] = ValidationError(
+                        force_str(e), code="invalid"
+                    )
                 continue
             try:
                 self.import_field(field, instance, row, **kwargs)

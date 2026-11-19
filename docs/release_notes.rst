@@ -160,6 +160,21 @@ Breaking changes
   inline in ``skip_row()``.  Behaviour is unchanged, but if you have overridden ``skip_row()`` you may be able to
   simplify it by calling ``field.widget.is_equal()`` instead.
 
+* **Unresolvable many-to-many values are now validation errors.**
+  :meth:`~import_export.widgets.ManyToManyWidget.clean` previously filtered the supplied values against the related
+  table and silently ignored any value which did not match, so a row referencing a non-existent object was imported
+  without that relation.  It now raises a ``ValueError`` naming the unrecognised value(s), which makes the row invalid
+  and shows the problem on the import preview page instead of applying a partial relation on confirm.  The values are
+  validated during the normal row validation phase (m2m relations still cannot be written until the instance is
+  saved).  If you relied on the old permissive behaviour, clean up the source data or override ``clean()`` in a
+  subclass.
+
+  The import preview diff for a many-to-many field is now rendered per related object — each removed object is shown
+  with a deletion marker and each added object with an insertion marker — instead of as a character-level diff of the
+  joined render string.  If you assert on the exact diff HTML for an m2m field, update the expected markup.  The new
+  per-object rendering is available outside the diff via
+  :meth:`~import_export.widgets.ManyToManyWidget.render_object`.
+
 Removed deprecations
 """"""""""""""""""""
 

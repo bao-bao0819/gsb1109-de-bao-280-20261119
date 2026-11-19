@@ -548,6 +548,18 @@ declaration.
         class Meta:
             model = Book
 
+Every supplied value must resolve to an existing related object.  If one or more values cannot be resolved,
+:meth:`~import_export.widgets.ManyToManyWidget.clean` raises a ``ValueError`` and the row is reported as invalid, with
+the offending value(s) named in the error.  This makes a typo or a missing related object visible in the import preview
+instead of silently importing the row without the unrecognised relations.
+
+In the import preview, a many-to-many field is diffed object by object rather than as a joined string: each related
+object which is no longer present is marked as removed and each new related object is marked as added.  For example,
+changing a book's categories from ``Fiction`` to ``History`` and ``Science`` shows ``Fiction`` as removed and both
+``History`` and ``Science`` as added, so it is immediately clear which relations will change when the import is
+confirmed.  The preview runs without writing anything, so no books or relations are created until the import is
+confirmed.
+
 .. _related_model_as_string:
 
 Referencing the related model by name

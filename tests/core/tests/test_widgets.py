@@ -1115,12 +1115,36 @@ class ManyToManyWidget(TestCase):
                 return self.model.objects.filter(name=row["category"])
 
         widget = FilteredWidget(Category)
-        value = f"{self.cat1.pk},{self.cat2.pk}"
+        value = f"{self.cat1.pk}"
         cleaned_data = widget.clean(
             value, row={"category": self.cat1.name}, row_number=1
         )
 
         self.assertQuerySetEqual(cleaned_data, [self.cat1])
+
+    def test_clean_raises_for_value_outside_get_queryset(self):
+        class FilteredWidget(widgets.ManyToManyWidget):
+            def get_queryset(self, value, row, *args, **kwargs):
+                return self.model.objects.filter(name=row["category"])
+
+        widget = FilteredWidget(Category)
+        value = f"{self.cat1.pk},{self.cat2.pk}"
+
+        with self.assertRaises(ValueError) as cm:
+            widget.clean(value, row={"category": self.cat1.name}, row_number=1)
+        self.assertIn(str(self.cat2.pk), str(cm.exception))
+
+    def test_clean_raises_for_unknown_value(self):
+        with self.assertRaises(ValueError) as cm:
+            self.widget_name.clean("Cat úňíčóďě,No such category")
+        message = str(cm.exception)
+        self.assertIn("No such category", message)
+        self.assertNotIn(self.cat1.name, message)
+
+    def test_clean_raises_for_unknown_numeric_value(self):
+        with self.assertRaises(ValueError) as cm:
+            self.widget.clean(self.cat2.pk + 99999)
+        self.assertIn(str(self.cat2.pk + 99999), str(cm.exception))
 
     def test_clean_typo(self):
         value = "%s," % self.cat1.pk

@@ -98,6 +98,13 @@ A table's schema is described using a hierarchy of description objects:
 .. autoclass:: csvw.Column
     :members:
 
+.. autoclass:: csvw.NullRule
+    :members:
+
+.. autofunction:: csvw.resolve_null
+
+.. autofunction:: csvw.null_report
+
 .. autoclass:: csvw.Datatype
     :members:
 

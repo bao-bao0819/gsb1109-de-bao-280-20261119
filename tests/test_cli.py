@@ -7,7 +7,8 @@ import argparse
 import pytest
 
 from csvw.__main__ import (
-    csvw2json, csvw2datasette, csvwdescribe, csvwvalidate, csvw2markdown, csvw2sqlite)
+    csvw2json, csvw2datasette, csvwdescribe, csvwvalidate, csvw2markdown, csvw2sqlite,
+    csvw2nullreport)
 
 
 def relpath(fname):
@@ -99,3 +100,23 @@ def test_csvw2sqlite(tmp_path, mdname):
     cu.execute('select count(*) from `csv.txt`')
     assert cu.fetchone()[0] == 2
     conn.close()
+
+
+def test_csvw2nullreport(mdname, multitable_mdname, capsys):
+    assert run(csvw2nullreport, url=multitable_mdname, indent=None) == 0
+    out, _ = capsys.readouterr()
+    report = json.loads(out)
+    assert set(report) == {'t1.csv', 't2.csv'}
+    assert report['t1.csv']['ID']['source'] == 'default'
+    assert report['t1.csv']['ID']['category'] == 'values'
+
+    assert run(csvw2nullreport, url=mdname, indent=None) == 0
+    out, _ = capsys.readouterr()
+    report = json.loads(out)
+    assert set(report) == {'csv.txt'}
+
+    # A single table's metadata yields a report keyed by column header:
+    assert run(csvw2nullreport, url=relpath('csv.txt-table-metadata.json'), indent=None) == 0
+    out, _ = capsys.readouterr()
+    report = json.loads(out)
+    assert set(report) == {'ID', '_col.2'}

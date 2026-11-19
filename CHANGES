@@ -2,6 +2,14 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Added :func:`csvw.null_report` and :attr:`csvw.Column.null_rule` to inspect the effective
+  `null` rule of each column - including the description object it is inherited from - without
+  affecting the data read by `Table.iterdicts`.
+
+
 Version 4.2.0
 -------------
 

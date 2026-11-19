@@ -212,6 +212,114 @@ class TestColumn:
         assert table.tableSchema.columns[0].inherit_null() == []
 
 
+class TestNullReport:
+
+    @staticmethod
+    def _tg(tmp_path, data=None):
+        metadata = {
+            "@context": "http://www.w3.org/ns/csvw",
+            "null": ["NA"],
+            "dialect": {"header": False},
+            "tables": [
+                {
+                    "url": "a.csv",
+                    "null": ["-"],
+                    "tableSchema": {
+                        "columns": [
+                            {"name": "inherited"},
+                            {"name": "overridden", "null": ["", "nil"]},
+                            {"name": "empty", "null": []},
+                        ]
+                    },
+                },
+                {
+                    "url": "b.csv",
+                    "tableSchema": {"columns": [{"name": "from_group"}]},
+                },
+            ],
+        }
+        (tmp_path / 'a.csv').write_text(
+            data if data is not None else 'NA,x,\n-,y,nil\n', encoding='utf-8')
+        (tmp_path / 'b.csv').write_text('NA\n', encoding='utf-8')
+        md = tmp_path / 'md.json'
+        md.write_text(json.dumps(metadata), encoding='utf-8')
+        return csvw.TableGroup.from_file(str(md))
+
+    def test_inheritance_and_source(self, tmp_path):
+        tg = self._tg(tmp_path)
+        report = tg.null_report()
+        assert list(report) == ['a.csv', 'b.csv']
+        assert report['a.csv']['inherited'].values == ['-']
+        assert report['a.csv']['inherited'].source == 'table'
+        assert report['a.csv']['overridden'].values == ['', 'nil']
+        assert report['a.csv']['overridden'].source == 'column'
+        assert report['b.csv']['from_group'].values == ['NA']
+        assert report['b.csv']['from_group'].source == 'tableGroup'
+
+    def test_empty_list_is_its_own_category(self, tmp_path):
+        tg = self._tg(tmp_path)
+        rule = tg.tables[0].tableSchema.columns[2].null_rule
+        assert rule.values == []
+        assert rule.source == 'column'
+        assert rule.category == 'empty'
+        assert rule.is_empty
+        # The distinction is visible in the serialized report:
+        assert tg.null_report()['a.csv']['empty'].asdict() == {
+            'values': [], 'source': 'column', 'category': 'empty'}
+        assert tg.null_report()['a.csv']['inherited'].category == 'values'
+
+    def test_schema_level_and_default(self):
+        t = csvw.Table.fromvalue({
+            'url': 'x',
+            'tableSchema': {
+                'null': ['schema-null'],
+                'columns': [{'name': 'schema'}, {'name': 'own', 'null': ['own-null']}]
+            }
+        })
+        assert t.tableSchema.columns[0].null_rule.asdict() == {
+            'values': ['schema-null'], 'source': 'schema', 'category': 'values'}
+        assert t.tableSchema.columns[1].null_rule.source == 'column'
+
+        t = csvw.Table.fromvalue({
+            'url': 'x', 'tableSchema': {'columns': [{'name': 'default'}]}})
+        rule = t.null_report()['default']
+        assert rule.values == ['']
+        assert rule.source == 'default'
+
+    def test_report_does_not_change_row_values(self, tmp_path):
+        # Data contains "NA" and "-", which are null values specified on the table group and
+        # table. Reading must yield the same rows before and after generating the report.
+        tg = self._tg(tmp_path)
+        table = tg.tables[0]
+        before = list(table.iterdicts())
+        report = tg.null_report()
+        after = list(table.iterdicts())
+        assert before == after
+        assert report['a.csv']['inherited'].source == 'table'
+        assert before[0]['inherited'] == 'NA'  # Overridden by the table-level rule ["-"].
+        assert before[1]['inherited'] is None
+        assert before[0]['overridden'] == 'x'
+        assert before[1]['overridden'] == 'y'
+        # An empty null list disables null handling entirely:
+        assert before[0]['empty'] == ''
+        assert before[1]['empty'] == 'nil'
+
+    def test_table_level_report(self, tmp_path):
+        tg = self._tg(tmp_path)
+        assert tg.tables[0].null_report() == tg.null_report()['a.csv']
+        assert set(tg.tables[0].null_report()) == {'inherited', 'overridden', 'empty'}
+
+    def test_inspection_is_read_only(self, tmp_path):
+        tg = self._tg(tmp_path)
+        before = json.dumps(tg.asdict(), sort_keys=True)
+        before_rows = list(tg.tables[0].iterdicts())
+        for col in tg.tables[0].tableSchema.columns:
+            col.null_rule
+        tg.null_report()
+        assert json.dumps(tg.asdict(), sort_keys=True) == before
+        assert list(tg.tables[0].iterdicts()) == before_rows
+
+
 def test_Schema():
     from csvw.metadata import Schema
 

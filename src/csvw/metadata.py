@@ -41,7 +41,7 @@ DEFAULT = object()
 
 __all__ = [
     'TableGroup', 'Table', 'Column', 'ForeignKey', 'Link', 'NaturalLanguage', 'Datatype',
-    'is_url', 'CSVW',
+    'NullRule', 'null_report', 'resolve_null', 'is_url', 'CSVW',
 ]
 
 is_url = utils.is_url
@@ -58,6 +58,154 @@ class Invalid:  # pylint: disable=R0903,C0115:
 
 
 INVALID = Invalid()
+
+#: The default value of the `null` property.
+DEFAULT_NULL = ('',)
+
+
+class NullRule(collections.OrderedDict):
+    """
+    The null rule which is effective for a single column when reading data.
+
+    CSVW specifies `null` as an inherited property. Thus, the rule used for a column may be
+    specified on the column itself, or inherited from the containing schema, table or table group.
+    A `NullRule` records both the effective values and where they come from.
+
+    The rule is a mapping with keys `values`, `source` and `category`, which are also available
+    as attributes. `source` is one of `column`, `schema`, `table`, `tableGroup` or `default`.
+    `category` is `empty` for columns which explicitly specify the empty list - i.e. which
+    disable null handling - and `values` otherwise.
+    """
+    def __init__(self, values, source, category='values', _source_object=None):
+        super().__init__(values=list(values), source=source, category=category)
+        self._source_object = _source_object
+
+    @property
+    def values(self) -> list[str]:
+        """The values which are interpreted as null."""
+        return self['values']
+
+    @property
+    def source(self) -> str:
+        """The description object which specifies the rule."""
+        return self['source']
+
+    @property
+    def category(self) -> str:
+        """`empty` for an explicit empty list, `values` otherwise."""
+        return self['category']
+
+    @property
+    def is_empty(self) -> bool:
+        """Flag signaling whether the column explicitly specifies an empty list of null values."""
+        return self.category == 'empty'
+
+    @property
+    def source_object(self) -> Optional['Description']:
+        """The description object which specified the rule, or `None` for the default rule."""
+        return self._source_object
+
+    def asdict(self) -> collections.OrderedDict[str, Any]:  # pylint: disable=C0116
+        return collections.OrderedDict(self)
+
+    def __repr__(self):
+        return f'NullRule({dict.__repr__(self)})'
+
+
+def _source_name(obj: 'Description') -> str:
+    if isinstance(obj, Column):
+        return 'column'
+    if isinstance(obj, Schema):
+        return 'schema'
+    if isinstance(obj, Table):
+        return 'table'
+    if isinstance(obj, TableGroup):
+        return 'tableGroup'
+    return type(obj).__name__  # pragma: no cover
+
+
+def _explicit_null(obj: 'Description') -> Optional[list[str]]:
+    """
+    Return the `null` property explicitly set on `obj`, or `None`.
+
+    `[""]` is the default value of the `null` property. Since there is no way to distinguish an
+    explicitly specified `[""]` from the default, it marks an unspecified property here, too.
+    This mirrors :meth:`Description.inherit_null`.
+    """
+    if obj.null is not None and list(obj.null) != list(DEFAULT_NULL):
+        return list(obj.null)
+    return None
+
+
+def resolve_null(col: 'Column', table: Optional['Table'] = None,
+                 tablegroup: Optional['TableGroup'] = None) -> NullRule:
+    """
+    Determine the null rule which is effective for `col` when reading data.
+
+    The inheritance chain of the `null` property is walked from the column up to the table group,
+    exactly as done by :meth:`Description.inherit_null`. The first explicitly specified value
+    wins - including the empty list, which disables null handling for the column.
+
+    :param col: The column to inspect.
+    :param table: The table containing `col`. Used to complete the inheritance chain if it is not \
+    linked via `_parent` attributes.
+    :param tablegroup: The table group containing `table`. Used to complete the inheritance chain \
+    if it is not linked via `_parent` attributes.
+    :return: A :class:`NullRule` with the effective values, the source of the rule and a \
+    category, which is `empty` for explicitly specified empty lists and `values` otherwise.
+    """
+    chain, seen = [], set()
+    obj = col
+    while isinstance(obj, Description) and id(obj) not in seen:
+        seen.add(id(obj))
+        chain.append((_source_name(obj), obj))
+        obj = getattr(obj, '_parent', None)  # pylint: disable=protected-access
+
+    # Complete the chain for objects which are not linked to their containing objects.
+    for source, obj in [
+            ('schema', table.tableSchema if isinstance(table, Table) else None),
+            ('table', table),
+            ('tableGroup', tablegroup)]:
+        if obj is not None and id(obj) not in seen:
+            seen.add(id(obj))
+            chain.append((source, obj))
+
+    for source, obj in chain:
+        values = _explicit_null(obj)
+        if values is not None:
+            return NullRule(
+                values=values,
+                source=source,
+                category='empty' if values == [] else 'values',
+                _source_object=obj)
+    return NullRule(values=list(DEFAULT_NULL), source='default', category='values')
+
+
+def null_report(table_or_group: Union['Table', 'TableGroup']) -> collections.OrderedDict:
+    """
+    Describe the null rule which is effective for each column before reading the data.
+
+    For a :class:`Table`, the report maps column headers to :class:`NullRule` instances. For a
+    :class:`TableGroup`, it maps table names to such per-table reports.
+
+    This is a read-only operation: It does not modify the metadata, nor does it affect the values
+    returned by :meth:`Table.iterdicts`.
+
+    :param table_or_group: A :class:`Table` or :class:`TableGroup` instance.
+    :return: An `OrderedDict` as described above.
+    """
+    if isinstance(table_or_group, Table):
+        group = table_or_group._parent \
+            if isinstance(table_or_group._parent, TableGroup) else None
+        res = collections.OrderedDict()
+        for col in table_or_group.tableSchema.columns:
+            res[col.header] = resolve_null(col, table=table_or_group, tablegroup=group)
+        return res
+
+    res = collections.OrderedDict()
+    for table in table_or_group.tables:
+        res[table.local_name or str(table.url)] = null_report(table)
+    return res
 
 
 @dataclasses.dataclass
@@ -576,6 +724,15 @@ class Column(Description):
             return sep.join(fmt(vv) for vv in v or [])
         return fmt(v)
 
+    @property
+    def null_rule(self) -> 'NullRule':
+        """
+        The null rule which is effective for this column when reading data.
+
+        .. seealso:: :func:`resolve_null`
+        """
+        return resolve_null(self)
+
 
 @dataclasses.dataclass
 class Reference:
@@ -1033,6 +1190,14 @@ class Table(TableLike):
             fpath.unlink()
         return rowcount
 
+    def null_report(self) -> collections.OrderedDict:
+        """
+        The null rule which is effective for each column of this table.
+
+        :return: An `OrderedDict` mapping column headers to :class:`NullRule` instances.
+        """
+        return null_report(self)
+
     def check_primary_key(self, log=None, items=None) -> bool:
         """Make sure primary keys are unique."""
         # We want to silence error logging when reading table rows, because we are not interested
@@ -1302,6 +1467,15 @@ class TableGroup(TableLike):
         Read all data of a TableGroup
         """
         return {tname: list(t.iterdicts()) for tname, t in self.tabledict.items()}
+
+    def null_report(self) -> collections.OrderedDict:
+        """
+        The null rule which is effective for each column of each table in this table group.
+
+        :return: An `OrderedDict` mapping table names to `OrderedDict`s, which map column headers \
+        to :class:`NullRule` instances.
+        """
+        return null_report(self)
 
     def write(self,
               fname: Union[str, pathlib.Path],

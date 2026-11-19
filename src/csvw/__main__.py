@@ -10,9 +10,11 @@ import subprocess
 
 from termcolor import colored
 
-from csvw import CSVW, TableGroup
+from csvw import CSVW, TableGroup, Table
 from csvw.db import Database
+from csvw.metadata import null_report
 from csvw.metadata_utils import metadata2markdown
+from csvw.utils import get_json
 
 
 def parsed_args(desc, args, *argspecs):
@@ -170,6 +172,25 @@ def csvw2markdown(args=None, test=False):
     )
     tg = TableGroup.from_file(args.url)
     print(metadata2markdown(tg, link_files=True))
+    return exit(0, test=test)  # pylint: disable=R1722
+
+
+def csvw2nullreport(args=None, test=False):
+    """Create a JSON report of the effective null rule for each column of a CSVW dataset."""
+    args = parsed_args(
+        csvw2nullreport.__doc__,
+        args,
+        (
+            ['url'],
+            {'help': 'URL or local path to CSVW metadata file describing a Table or TableGroup.'}),
+        (
+            ['-i', '--indent'],
+            {'type': int, 'default': 4, 'help': 'Indentation of the JSON output.'}),
+    )
+    data = get_json(args.url)
+    cls = TableGroup if 'tables' in data else Table
+    obj = cls.from_file(args.url, data=data)
+    print(json.dumps(null_report(obj), indent=args.indent))
     return exit(0, test=test)  # pylint: disable=R1722
 
 

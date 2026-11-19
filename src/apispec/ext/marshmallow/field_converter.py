@@ -94,6 +94,9 @@ class FieldConverterMixin:
 
     field_mapping: dict[type, tuple[str | None, str | None]] = DEFAULT_FIELD_MAPPING
     openapi_version: Version
+    # Direction of the schema currently being converted. Nested schemas are
+    # resolved in the same direction. Managed by `schema2jsonschema`.
+    _direction: str | None = None
 
     def init_attribute_functions(self):
         self.attribute_functions = [
@@ -458,7 +461,9 @@ class FieldConverterMixin:
         if isinstance(field, marshmallow.fields.Nested) and not isinstance(
             field, marshmallow.fields.Pluck
         ):
-            schema_dict = self.resolve_nested_schema(field.schema)  # type:ignore
+            schema_dict = self.resolve_nested_schema(  # type:ignore
+                field.schema, direction=self._direction
+            )
             if (
                 ret
                 and "$ref" in schema_dict

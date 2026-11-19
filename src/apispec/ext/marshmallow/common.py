@@ -48,11 +48,13 @@ def get_fields(
     schema: type[marshmallow.Schema] | marshmallow.Schema,
     *,
     exclude_dump_only: bool = False,
+    exclude_load_only: bool = False,
 ) -> dict[str, fields.Field]:
     """Return fields from schema.
 
     :param Schema schema: A marshmallow Schema instance or a class object
-    :param bool exclude_dump_only: whether to filter fields in Meta.dump_only
+    :param bool exclude_dump_only: whether to filter dump_only fields
+    :param bool exclude_load_only: whether to filter load_only fields
     :rtype: dict, of field name field object pairs
     """
     if isinstance(schema, marshmallow.Schema):
@@ -63,7 +65,12 @@ def get_fields(
         raise ValueError(f"{schema!r} is neither a Schema class nor a Schema instance.")
     Meta = getattr(schema, "Meta", None)
     warn_if_fields_defined_in_meta(fields, Meta)
-    return filter_excluded_fields(fields, Meta, exclude_dump_only=exclude_dump_only)
+    return filter_excluded_fields(
+        fields,
+        Meta,
+        exclude_dump_only=exclude_dump_only,
+        exclude_load_only=exclude_load_only,
+    )
 
 
 def warn_if_fields_defined_in_meta(fields: dict[str, fields.Field], Meta):
@@ -87,22 +94,31 @@ def warn_if_fields_defined_in_meta(fields: dict[str, fields.Field], Meta):
 
 
 def filter_excluded_fields(
-    fields: dict[str, fields.Field], Meta, *, exclude_dump_only: bool
+    fields: dict[str, fields.Field],
+    Meta,
+    *,
+    exclude_dump_only: bool,
+    exclude_load_only: bool = False,
 ) -> dict[str, fields.Field]:
     """Filter fields that should be ignored in the OpenAPI spec.
 
     :param dict fields: A dictionary of fields name field object pairs
     :param Meta: the schema's Meta class
     :param bool exclude_dump_only: whether to filter dump_only fields
+    :param bool exclude_load_only: whether to filter load_only fields
     """
     exclude = set(getattr(Meta, "exclude", []))
     if exclude_dump_only:
         exclude.update(getattr(Meta, "dump_only", []))
+    if exclude_load_only:
+        exclude.update(getattr(Meta, "load_only", []))
 
     filtered_fields = {
         key: value
         for key, value in fields.items()
-        if key not in exclude and not (exclude_dump_only and value.dump_only)
+        if key not in exclude
+        and not (exclude_dump_only and value.dump_only)
+        and not (exclude_load_only and value.load_only)
     }
 
     return filtered_fields

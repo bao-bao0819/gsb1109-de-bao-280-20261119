@@ -19,6 +19,7 @@ from apispec import APISpec
 from apispec.exceptions import APISpecError
 from apispec.ext.marshmallow import MarshmallowPlugin, common
 
+from .conftest import make_spec
 from .schemas import (
     AnalysisSchema,
     AnalysisWithListSchema,
@@ -422,7 +423,9 @@ class TestOperationHelper:
         assert header_reference == build_ref(spec_fixture.spec, "schema", "Pet")
         assert len(spec_fixture.spec.components.schemas) == 1
         resolved_schema = spec_fixture.spec.components.schemas["Pet"]
-        assert resolved_schema == spec_fixture.openapi.schema2jsonschema(PetSchema)
+        assert resolved_schema == spec_fixture.openapi.schema2jsonschema(
+            PetSchema, direction="dump"
+        )
         assert get["responses"]["200"]["description"] == "successful operation"
 
     @pytest.mark.parametrize(
@@ -471,7 +474,9 @@ class TestOperationHelper:
         assert header_reference == build_ref(spec_fixture.spec, "schema", "Pet")
         assert len(spec_fixture.spec.components.schemas) == 1
         resolved_schema = spec_fixture.spec.components.schemas["Pet"]
-        assert resolved_schema == spec_fixture.openapi.schema2jsonschema(PetSchema)
+        assert resolved_schema == spec_fixture.openapi.schema2jsonschema(
+            PetSchema, direction="dump"
+        )
         assert get["responses"]["200"]["description"] == "successful operation"
 
     @pytest.mark.parametrize(
@@ -521,7 +526,9 @@ class TestOperationHelper:
         assert header_reference == build_ref(spec_fixture.spec, "schema", "Pet")
         assert len(spec_fixture.spec.components.schemas) == 1
         resolved_schema = spec_fixture.spec.components.schemas["Pet"]
-        assert resolved_schema == spec_fixture.openapi.schema2jsonschema(PetSchema)
+        assert resolved_schema == spec_fixture.openapi.schema2jsonschema(
+            PetSchema, direction="dump"
+        )
         assert get["responses"]["200"]["description"] == "successful operation"
 
     @pytest.mark.parametrize("spec_fixture", ("2.0",), indirect=True)
@@ -584,7 +591,7 @@ class TestOperationHelper:
             assert description == PetSchema.description[name]
         post = p["post"]
         post_schema = spec_fixture.marshmallow_plugin.resolver.resolve_schema_dict(
-            PetSchema
+            PetSchema, direction="load"
         )
         assert (
             post["requestBody"]["content"]["application/json"]["schema"] == post_schema
@@ -619,7 +626,7 @@ class TestOperationHelper:
             assert description == PetSchema.description[name]
         post = c["post"]
         post_schema = spec_fixture.marshmallow_plugin.resolver.resolve_schema_dict(
-            PetSchema
+            PetSchema, direction="load"
         )
         assert (
             post["requestBody"]["content"]["application/json"]["schema"] == post_schema
@@ -936,8 +943,9 @@ class TestOperationHelper:
 
     @pytest.mark.parametrize("spec_fixture", ("3.0.0",), indirect=True)
     def test_callback_schema_uses_ref_in_parameters_and_request_body_if_available_v3(
-        self, make_pet_callback_spec
+        self, spec_fixture, make_pet_callback_spec
     ):
+        spec_fixture.spec.components.schema("Pet", schema=PetSchema)
         spec_fixture = make_pet_callback_spec(
             {
                 "get": {"parameters": [{"in": "query", "schema": PetSchema}]},
@@ -1227,6 +1235,158 @@ class TestOperationHelper:
         else:
             schema = resp["content"]["application/json"]["schema"]
         assert schema == build_ref(spec, "schema", "SomeSpecificPetSchema")
+
+
+class TestRequestResponseDirection:
+    """Tests for direction-aware schema resolution in operations.
+
+    Schemas in request bodies are resolved in the "load" direction (dump_only
+    fields excluded, component name suffixed with "Input") and schemas in
+    responses in the "dump" direction (load_only fields excluded).
+    """
+
+    @pytest.fixture()
+    def user_schema(self):
+        class SubSchema(Schema):
+            id = Int(dump_only=True)
+            secret = String(load_only=True, required=True)
+            name = String()
+
+        class UserSchema(Schema):
+            id = Int(dump_only=True)
+            password = String(load_only=True, required=True)
+            name = String(required=True)
+            sub = Nested(SubSchema)
+
+        return UserSchema
+
+    def _make_spec(self, spec_fixture, user_schema, reverse=False):
+        paths = [
+            (
+                "/ingest",
+                {
+                    "post": {
+                        "requestBody": {
+                            "content": {"application/json": {"schema": user_schema}}
+                        },
+                        "responses": {"204": {"description": "ok"}},
+                    }
+                },
+            ),
+            (
+                "/export",
+                {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "content": {"application/json": {"schema": user_schema}}
+                            }
+                        }
+                    }
+                },
+            ),
+        ]
+        if reverse:
+            paths.reverse()
+        for path, operations in paths:
+            spec_fixture.spec.path(path=path, operations=operations)
+        return spec_fixture.spec
+
+    @pytest.mark.parametrize("spec_fixture", ("3.0.0",), indirect=True)
+    def test_shared_schema_split_in_request_and_response(
+        self, spec_fixture, user_schema
+    ):
+        spec = self._make_spec(spec_fixture, user_schema)
+        schemas = get_schemas(spec)
+
+        assert set(schemas) == {"User", "UserInput", "Sub", "SubInput"}
+
+        # The request (load) component hides dump_only fields and requires
+        # load_only ones
+        user_input = schemas["UserInput"]
+        assert "id" not in user_input["properties"]
+        assert "password" in user_input["properties"]
+        assert user_input["required"] == ["name", "password"]
+
+        # The response (dump) component hides load_only fields
+        user = schemas["User"]
+        assert "id" in user["properties"]
+        assert "password" not in user["properties"]
+        assert user["required"] == ["name"]
+
+        paths = get_paths(spec)
+        assert paths["/ingest"]["post"]["requestBody"]["content"]["application/json"][
+            "schema"
+        ] == build_ref(spec, "schema", "UserInput")
+        assert paths["/export"]["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == build_ref(spec, "schema", "User")
+
+    @pytest.mark.parametrize("spec_fixture", ("3.0.0",), indirect=True)
+    def test_nested_schemas_follow_direction(self, spec_fixture, user_schema):
+        spec = self._make_spec(spec_fixture, user_schema)
+        schemas = get_schemas(spec)
+
+        assert schemas["UserInput"]["properties"]["sub"] == build_ref(
+            spec, "schema", "SubInput"
+        )
+        assert schemas["User"]["properties"]["sub"] == build_ref(spec, "schema", "Sub")
+
+        sub_input = schemas["SubInput"]
+        assert "id" not in sub_input["properties"]
+        assert sub_input["required"] == ["secret"]
+
+        sub = schemas["Sub"]
+        assert "id" in sub["properties"]
+        assert "secret" not in sub["properties"]
+        assert "required" not in sub
+
+    @pytest.mark.parametrize("spec_fixture", ("3.0.0",), indirect=True)
+    def test_registration_order_does_not_matter(self, spec_fixture, user_schema):
+        spec = self._make_spec(spec_fixture, user_schema)
+
+        other_fixture = make_spec("3.0.0")
+        reversed_spec = self._make_spec(other_fixture, user_schema, reverse=True)
+
+        assert spec.to_dict() == reversed_spec.to_dict()
+
+    @pytest.mark.parametrize("spec_fixture", ("2.0",), indirect=True)
+    def test_body_parameter_and_response_split(self, spec_fixture, user_schema):
+        spec_fixture.spec.path(
+            path="/user",
+            operations={
+                "post": {"parameters": [{"in": "body", "schema": user_schema}]},
+                "get": {"responses": {200: {"schema": user_schema}}},
+            },
+        )
+        schemas = get_schemas(spec_fixture.spec)
+        assert set(schemas) == {"User", "UserInput", "Sub", "SubInput"}
+
+        paths = get_paths(spec_fixture.spec)
+        assert paths["/user"]["post"]["parameters"][0]["schema"] == build_ref(
+            spec_fixture.spec, "schema", "UserInput"
+        )
+        assert paths["/user"]["get"]["responses"]["200"]["schema"] == build_ref(
+            spec_fixture.spec, "schema", "User"
+        )
+
+    @pytest.mark.parametrize("spec_fixture", ("3.0.0",), indirect=True)
+    def test_explicitly_registered_schema_used_in_both_directions(
+        self, spec_fixture, user_schema
+    ):
+        spec_fixture.spec.components.schema("User", schema=user_schema)
+        spec = self._make_spec(spec_fixture, user_schema)
+        schemas = get_schemas(spec)
+
+        # The explicitly registered component is used as is in both positions
+        assert set(schemas) == {"User", "Sub"}
+        paths = get_paths(spec)
+        assert paths["/ingest"]["post"]["requestBody"]["content"]["application/json"][
+            "schema"
+        ] == build_ref(spec, "schema", "User")
+        assert paths["/export"]["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == build_ref(spec, "schema", "User")
 
 
 class TestCircularReference:

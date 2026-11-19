@@ -66,7 +66,11 @@ class OpenAPIConverter(FieldConverterMixin):
         self.spec = spec
         self.init_attribute_functions()
         self.init_parameter_attribute_functions()
-        # Schema references
+        # Schema references, mapping (schema key, direction) pairs to component names.
+        # Direction is None for schemas registered explicitly through
+        # `spec.components.schema`, "load" for schemas resolved in a request
+        # (deserialization) context and "dump" for schemas resolved in a response
+        # (serialization) context.
         self.refs: dict = {}
 
     def init_parameter_attribute_functions(self) -> None:
@@ -96,7 +100,7 @@ class OpenAPIConverter(FieldConverterMixin):
         setattr(self, func.__name__, bound_func)
         self.parameter_attribute_functions.append(bound_func)
 
-    def resolve_nested_schema(self, schema):
+    def resolve_nested_schema(self, schema, direction: str | None = None):
         """Return the OpenAPI representation of a marshmallow Schema.
 
         Adds the schema to the spec if it isn't already present.
@@ -107,6 +111,15 @@ class OpenAPIConverter(FieldConverterMixin):
         representation of the schema.
 
         :param schema: schema to add to the spec
+        :param str|None direction: direction the schema is used in. May be
+            `None`, `"load"` (schema is used to deserialize a request body) or
+            `"dump"` (schema is used to serialize a response body). When a
+            direction is passed, the schema is resolved to a component that only
+            contains the fields relevant to that direction: `"load"` components
+            exclude `dump_only` fields and `"dump"` components exclude
+            `load_only` fields. Schemas registered explicitly with
+            `spec.components.schema` (direction `None`) are used as fallback in
+            both directions.
         """
         try:
             schema_instance = resolve_schema_instance(schema)
@@ -115,25 +128,35 @@ class OpenAPIConverter(FieldConverterMixin):
         except marshmallow.exceptions.RegistryError:
             return schema
         schema_key = make_schema_key(schema_instance)
-        if schema_key not in self.refs:
-            name = self.schema_name_resolver(schema)
-            if not name:
-                try:
-                    json_schema = self.schema2jsonschema(schema_instance)
-                except RuntimeError as exc:
-                    raise APISpecError(
-                        f"Name resolver returned None for schema {schema} which is "
-                        "part of a chain of circular referencing schemas. Please"
-                        " ensure that the schema_name_resolver passed to"
-                        " MarshmallowPlugin returns a string for all circular"
-                        " referencing schemas."
-                    ) from exc
-                if getattr(schema, "many", False):
-                    return {"type": "array", "items": json_schema}
-                return json_schema
-            name = get_unique_schema_name(self.spec.components, name)
-            self.spec.components.schema(name, schema=schema)
-        return self.get_ref_dict(schema_instance)
+        ref_key = (schema_key, direction)
+        if ref_key not in self.refs:
+            # Fall back to a schema registered without direction, e.g. by an
+            # explicit call to `spec.components.schema`
+            if direction is not None and (schema_key, None) in self.refs:
+                ref_key = (schema_key, None)
+            else:
+                name = self.schema_name_resolver(schema)
+                if not name:
+                    try:
+                        json_schema = self.schema2jsonschema(
+                            schema_instance, direction=direction
+                        )
+                    except RuntimeError as exc:
+                        raise APISpecError(
+                            f"Name resolver returned None for schema {schema} which is "
+                            "part of a chain of circular referencing schemas. Please"
+                            " ensure that the schema_name_resolver passed to"
+                            " MarshmallowPlugin returns a string for all circular"
+                            " referencing schemas."
+                        ) from exc
+                    if getattr(schema, "many", False):
+                        return {"type": "array", "items": json_schema}
+                    return json_schema
+                if direction == "load":
+                    name += "Input"
+                name = get_unique_schema_name(self.spec.components, name)
+                self.spec.components.schema(name, schema=schema, direction=direction)
+        return self.get_ref_dict(schema_instance, direction=ref_key[1])
 
     def schema2parameters(
         self,
@@ -161,7 +184,7 @@ class OpenAPIConverter(FieldConverterMixin):
                 "in": location,
                 "required": required,
                 "name": name,
-                "schema": self.resolve_nested_schema(schema),
+                "schema": self.resolve_nested_schema(schema, direction="load"),
             }
             if description:
                 param["description"] = description
@@ -238,7 +261,7 @@ class OpenAPIConverter(FieldConverterMixin):
                 ret["style"] = "form"
         return ret
 
-    def schema2jsonschema(self, schema):
+    def schema2jsonschema(self, schema, direction: str | None = None):
         """Return the JSON Schema Object for a given marshmallow
         :class:`Schema <marshmallow.Schema>`. Schema may optionally
         provide the ``title`` and ``description`` class Meta options.
@@ -246,13 +269,26 @@ class OpenAPIConverter(FieldConverterMixin):
         https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.2.md#schemaObject
 
         :param Schema schema: A marshmallow Schema instance
+        :param str|None direction: direction the schema is used in. May be
+            `None`, `"load"` or `"dump"`. `"load"` excludes `dump_only` fields
+            and `"dump"` excludes `load_only` fields, both from the schema
+            itself and from the nested schemas it references.
         :rtype: dict, a JSON Schema Object
         """
-        fields = get_fields(schema)
+        fields = get_fields(
+            schema,
+            exclude_dump_only=direction == "load",
+            exclude_load_only=direction == "dump",
+        )
         Meta = getattr(schema, "Meta", None)
         partial = getattr(schema, "partial", None)
 
-        jsonschema = self.fields2jsonschema(fields, partial=partial)
+        previous_direction = self._direction
+        self._direction = direction
+        try:
+            jsonschema = self.fields2jsonschema(fields, partial=partial)
+        finally:
+            self._direction = previous_direction
 
         schema_instance = resolve_schema_instance(schema)
 
@@ -295,12 +331,14 @@ class OpenAPIConverter(FieldConverterMixin):
 
         return jsonschema
 
-    def get_ref_dict(self, schema):
+    def get_ref_dict(self, schema, direction: str | None = None):
         """Method to create a dictionary containing a JSON reference to the
         schema in the spec
         """
         schema_key = make_schema_key(schema)
-        ref_schema = self.spec.components.get_ref("schema", self.refs[schema_key])
+        ref_schema = self.spec.components.get_ref(
+            "schema", self.refs[(schema_key, direction)]
+        )
         if getattr(schema, "many", False):
             return {"type": "array", "items": ref_schema}
         return ref_schema

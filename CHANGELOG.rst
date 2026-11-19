@@ -1,6 +1,22 @@
 Changelog
 ---------
 
+6.11.0 (unreleased)
+*******************
+
+Features:
+
+- ``MarshmallowPlugin``: Resolve schemas in operations according to the
+  direction they are used in. Schemas in request bodies are resolved in the
+  ``"load"`` direction (``dump_only`` fields are excluded) and schemas in
+  responses in the ``"dump"`` direction (``load_only`` fields are excluded),
+  so a single marshmallow schema may be documented as two distinct components:
+  one for requests (named after the schema, suffixed with ``"Input"``) and one
+  for responses. Nested schemas are resolved in the same direction, and the
+  generated names do not depend on the order endpoints are registered in.
+  Schemas registered explicitly with ``spec.components.schema`` are unchanged
+  and are used as fallback in both directions.
+
 6.10.1 (2026-11-03)
 *******************
 

@@ -13,6 +13,17 @@ formats.
 It inspects field attributes to automatically document properties
 such as read/write-only, range and length constraints, etc.
 
+When resolving schemas in path operations, ``MarshmallowPlugin`` takes the
+direction a schema is used in into account. Schemas in request bodies are
+resolved in the ``"load"`` direction (``dump_only`` fields are excluded) and
+schemas in responses in the ``"dump"`` direction (``load_only`` fields are
+excluded), so a single marshmallow schema may be documented as two distinct
+components: one for requests (named after the schema, suffixed with
+``"Input"``) and one for responses. Nested schemas are resolved in the same
+direction. Schemas registered explicitly with
+``spec.components.schema <apispec.core.Components.schema>`` are not split and
+are used as fallback in both directions.
+
 OpenAPI properties can also be passed as metadata to the ``Field`` instance
 if they can't be inferred from the field attributes (`description`,...), or to
 override automatic documentation (`readOnly`,...). A metadata attribute is used
@@ -168,12 +179,16 @@ class MarshmallowPlugin(BasePlugin):
         assert self.converter is not None, "init_spec has not yet been called"
         return self.converter.map_to_openapi_type(field_cls, *args)
 
-    def schema_helper(self, name, _, schema=None, **kwargs):
+    def schema_helper(self, name, _, schema=None, direction=None, **kwargs):
         """Definition helper that allows using a marshmallow
         :class:`Schema <marshmallow.Schema>` to provide OpenAPI
         metadata.
 
         :param type|Schema schema: A marshmallow Schema class or instance.
+        :param str|None direction: direction the schema is used in. May be
+            `None`, `"load"` or `"dump"`. `"load"` excludes `dump_only` fields
+            and `"dump"` excludes `load_only` fields, both from the schema
+            itself and from the nested schemas it references.
         """
         if schema is None:
             return None
@@ -181,11 +196,14 @@ class MarshmallowPlugin(BasePlugin):
         schema_instance = resolve_schema_instance(schema)
 
         schema_key = make_schema_key(schema_instance)
-        self.warn_if_schema_already_in_spec(schema_key)
+        ref_key = (schema_key, direction)
+        self.warn_if_schema_already_in_spec(ref_key)
         assert self.converter is not None, "init_spec has not yet been called"
-        self.converter.refs[schema_key] = name
+        self.converter.refs[ref_key] = name
 
-        json_schema = self.converter.schema2jsonschema(schema_instance)
+        json_schema = self.converter.schema2jsonschema(
+            schema_instance, direction=direction
+        )
 
         return json_schema
 
@@ -231,12 +249,16 @@ class MarshmallowPlugin(BasePlugin):
         assert self.resolver  # needed for mypy
         self.resolver.resolve_operations(operations)
 
-    def warn_if_schema_already_in_spec(self, schema_key: tuple) -> None:
+    def warn_if_schema_already_in_spec(self, ref_key: tuple) -> None:
         """Method to warn the user if the schema has already been added to the
         spec.
+
+        :param tuple ref_key: the (schema key, direction) pair identifying the
+            schema in the spec.
         """
         assert self.converter  # needed for mypy
-        if schema_key in self.converter.refs:
+        if ref_key in self.converter.refs:
+            schema_key = ref_key[0]
             warnings.warn(
                 f"{schema_key[0]} has already been added to the spec. Adding it twice may "
                 "cause references to not resolve properly.",

@@ -334,7 +334,7 @@ class TestMarshmallowSchemaToParameters:
         assert len(res) == 1
         param = res[0]
         assert param["in"] == "body"
-        assert param["schema"] == {"$ref": "#/definitions/User"}
+        assert param["schema"] == {"$ref": "#/definitions/UserInput"}
 
     # json/body is invalid for OpenAPI 3
     @pytest.mark.parametrize("openapi", ("2.0",), indirect=True)
@@ -347,7 +347,7 @@ class TestMarshmallowSchemaToParameters:
         assert len(res_nodump) == 1
         param = res_nodump[0]
         assert param["in"] == "body"
-        assert param["schema"] == build_ref(openapi.spec, "schema", "User")
+        assert param["schema"] == build_ref(openapi.spec, "schema", "UserInput")
 
     # json/body is invalid for OpenAPI 3
     @pytest.mark.parametrize("openapi", ("2.0",), indirect=True)
@@ -361,7 +361,7 @@ class TestMarshmallowSchemaToParameters:
         param = res[0]
         assert param["in"] == "body"
         assert param["schema"]["type"] == "array"
-        assert param["schema"]["items"] == {"$ref": "#/definitions/User"}
+        assert param["schema"]["items"] == {"$ref": "#/definitions/UserInput"}
 
     def test_schema_query(self, openapi):
         class UserSchema(Schema):

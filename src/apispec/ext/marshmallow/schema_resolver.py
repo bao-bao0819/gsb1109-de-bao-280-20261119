@@ -18,6 +18,12 @@ class SchemaResolver:
     def resolve_operations(self, operations, **kwargs):
         """Resolve marshmallow Schemas in a dict mapping operation to OpenApi `Operation Object
         <https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.2.md#operationObject>`_
+
+        Schemas in request bodies are resolved in the `"load"` direction
+        (`dump_only` fields are excluded) and schemas in responses are resolved
+        in the `"dump"` direction (`load_only` fields are excluded), so a single
+        marshmallow Schema may be documented as two distinct components: one for
+        requests (suffixed with `"Input"`) and one for responses.
         """
 
         for operation in operations.values():
@@ -30,9 +36,9 @@ class SchemaResolver:
             if self.openapi_version.major >= 3:
                 self.resolve_callback(operation.get("callbacks", {}))
                 if "requestBody" in operation:
-                    self.resolve_schema(operation["requestBody"])
+                    self.resolve_schema(operation["requestBody"], direction="load")
             for response in operation.get("responses", {}).values():
-                self.resolve_response(response)
+                self.resolve_response(response, direction="dump")
 
     def resolve_callback(self, callbacks):
         """Resolve marshmallow Schemas in a dict mapping callback name to OpenApi `Callback Object
@@ -162,7 +168,7 @@ class SchemaResolver:
                 resolved.append(parameter)
         return resolved
 
-    def resolve_response(self, response):
+    def resolve_response(self, response, direction: str | None = None):
         """Resolve marshmallow Schemas in OpenAPI `Response Objects
         <https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.2.md#responseObject>`_.
         Schemas may appear in either a Media Type Object or a Header Object.
@@ -188,13 +194,15 @@ class SchemaResolver:
             }
 
         :param dict response: the response object to resolve.
+        :param str|None direction: direction to resolve the schemas in. May be
+            `None`, `"load"` or `"dump"`.
         """
-        self.resolve_schema(response)
+        self.resolve_schema(response, direction=direction)
         if "headers" in response:
             for header in response["headers"].values():
-                self.resolve_schema(header)
+                self.resolve_schema(header, direction=direction)
 
-    def resolve_schema(self, data):
+    def resolve_schema(self, data, direction: str | None = None):
         """Resolve marshmallow Schemas in an OpenAPI component or header -
         modifies the input dictionary to translate marshmallow Schemas to OpenAPI
         Schema Objects or Reference Objects.
@@ -219,21 +227,27 @@ class SchemaResolver:
 
         :param dict|str data: either a parameter or response dictionary that may
             contain a schema, or a reference provided as string
+        :param str|None direction: direction to resolve the schemas in. May be
+            `None`, `"load"` or `"dump"`.
         """
         if not isinstance(data, dict):
             return
 
         # OAS 2 component or OAS 3 parameter or header
         if "schema" in data:
-            data["schema"] = self.resolve_schema_dict(data["schema"])
+            data["schema"] = self.resolve_schema_dict(
+                data["schema"], direction=direction
+            )
         # OAS 3 component except header
         if self.openapi_version.major >= 3:
             if "content" in data:
                 for content in data["content"].values():
                     if "schema" in content:
-                        content["schema"] = self.resolve_schema_dict(content["schema"])
+                        content["schema"] = self.resolve_schema_dict(
+                            content["schema"], direction=direction
+                        )
 
-    def resolve_schema_dict(self, schema):
+    def resolve_schema_dict(self, schema, direction: str | None = None):
         """Resolve a marshmallow Schema class, object, or a string that resolves
         to a Schema class or a schema reference or an OpenAPI Schema Object
         containing one of the above to an OpenAPI Schema Object or Reference Object.
@@ -280,22 +294,29 @@ class SchemaResolver:
             }
 
         :param string|Schema|dict schema: the schema to resolve.
+        :param str|None direction: direction to resolve the schema in. May be
+            `None`, `"load"` or `"dump"`.
         """
         if isinstance(schema, dict):
             if schema.get("type") == "array" and "items" in schema:
-                schema["items"] = self.resolve_schema_dict(schema["items"])
+                schema["items"] = self.resolve_schema_dict(
+                    schema["items"], direction=direction
+                )
             if schema.get("type") == "object" and "properties" in schema:
                 schema["properties"] = {
-                    k: self.resolve_schema_dict(v)
+                    k: self.resolve_schema_dict(v, direction=direction)
                     for k, v in schema["properties"].items()
                 }
             for keyword in ("oneOf", "anyOf", "allOf"):
                 if keyword in schema:
                     schema[keyword] = [
-                        self.resolve_schema_dict(s) for s in schema[keyword]
+                        self.resolve_schema_dict(s, direction=direction)
+                        for s in schema[keyword]
                     ]
             if "not" in schema:
-                schema["not"] = self.resolve_schema_dict(schema["not"])
+                schema["not"] = self.resolve_schema_dict(
+                    schema["not"], direction=direction
+                )
             return schema
 
-        return self.converter.resolve_nested_schema(schema)
+        return self.converter.resolve_nested_schema(schema, direction=direction)

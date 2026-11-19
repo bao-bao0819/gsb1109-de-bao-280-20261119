@@ -10,6 +10,26 @@ class BaseInstanceLoader:
     def get_instance(self, row):
         raise NotImplementedError
 
+    def add_instance(self, instance):
+        """
+        Hook called after an instance has been persisted during import.
+
+        Loaders which cache instances can override this to make the instance
+        available to subsequent rows of the same import.  Does nothing by
+        default.
+        """
+        pass
+
+    def remove_instance(self, instance):
+        """
+        Hook called after an instance has been deleted during import.
+
+        Loaders which cache instances can override this to stop returning the
+        instance for subsequent rows of the same import.  Does nothing by
+        default.
+        """
+        pass
+
 
 class ModelInstanceLoader(BaseInstanceLoader):
     """
@@ -40,6 +60,13 @@ class CachedInstanceLoader(ModelInstanceLoader):
     Loads all possible model instances in dataset avoid hitting database for
     every ``get_instance`` call.
 
+    Instances persisted or deleted during the import are added to or removed
+    from the cache, so that a repeated import id within one dataset is handled
+    consistently with :class:`ModelInstanceLoader`.  The cache is scoped to
+    the resource's queryset, so instances outside of
+    :meth:`~import_export.resources.ModelResource.get_queryset` are never
+    returned.
+
     This instance loader work only when there is one ``import_id_fields``
     field.
     """
@@ -57,7 +84,10 @@ class CachedInstanceLoader(ModelInstanceLoader):
         # that get_instance() can raise MultipleObjectsReturned instead of
         # silently returning one of them, consistent with ModelInstanceLoader.
         self._duplicate_ids = set()
-        if self.dataset.dict and self.pk_field.column_name in self.dataset.dict[0]:
+        self._has_pk_column = bool(self.dataset.dict) and (
+            self.pk_field.column_name in self.dataset.dict[0]
+        )
+        if self._has_pk_column:
             ids = [self.pk_field.clean(row) for row in self.dataset.dict]
             qs = self.get_queryset().filter(**{"%s__in" % self.pk_field.attribute: ids})
 
@@ -78,3 +108,16 @@ class CachedInstanceLoader(ModelInstanceLoader):
                 )
             return self.all_instances.get(key)
         return None
+
+    def add_instance(self, instance):
+        if not self._has_pk_column:
+            return
+        key = self.pk_field.get_value(instance)
+        if key is not None:
+            self.all_instances[key] = instance
+
+    def remove_instance(self, instance):
+        if not self._has_pk_column:
+            return
+        key = self.pk_field.get_value(instance)
+        self.all_instances.pop(key, None)

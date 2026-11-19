@@ -792,6 +792,8 @@ class Resource(metaclass=DeclarativeMetaclass):
                         # create a copy before deletion so id fields are retained
                         row_result.instance = deepcopy(instance)
                     self.delete_instance(instance, row, **kwargs)
+                    if self._is_db_write(kwargs):
+                        instance_loader.remove_instance(instance)
                     if not skip_diff:
                         diff.compare_with(self, None)
             else:
@@ -812,6 +814,8 @@ class Resource(metaclass=DeclarativeMetaclass):
                     self.validate_instance(instance, import_validation_errors)
                     self.save_instance(instance, new, row, **kwargs)
                     self.save_m2m(instance, row, **kwargs)
+                    if self._is_db_write(kwargs):
+                        instance_loader.add_instance(instance)
                 row_result.add_instance_info(instance)
                 if self._meta.store_instance:
                     row_result.instance = instance
@@ -1224,6 +1228,19 @@ class Resource(metaclass=DeclarativeMetaclass):
 
     def _is_dry_run(self, kwargs):
         return kwargs.get("dry_run", False)
+
+    def _is_db_write(self, kwargs):
+        """
+        Return ``True`` if row changes are persisted to the database
+        immediately, mirroring the conditions under which
+        :meth:`~import_export.resources.ModelResource.save_instance` and
+        :meth:`~import_export.resources.ModelResource.delete_instance` write
+        to the database (i.e. bulk mode is off, and this is not a dry run
+        without transactions).
+        """
+        return not self._meta.use_bulk and (
+            self._is_using_transactions(kwargs) or not self._is_dry_run(kwargs)
+        )
 
     def _check_import_id_fields(self, headers):
         """

@@ -26,6 +26,7 @@ from beangulp import cache
 from beangulp import exceptions
 from beangulp import extract
 from beangulp import identify
+from beangulp import receipt
 from beangulp import utils
 from beangulp.importer import Importer, ImporterProtocol, Adapter
 
@@ -40,6 +41,7 @@ __all__ = [
     "exceptions",
     "extract",
     "identify",
+    "receipt",
     "utils",
 ]
 
@@ -69,6 +71,16 @@ def _walk(file_or_dirs, log):
     help="Existing Beancount ledger for de-duplication.",
 )
 @click.option("--reverse", "-r", is_flag=True, help="Sort entries in reverse order.")
+@click.option(
+    "--receipt",
+    "receipt_path",
+    is_flag=False,
+    flag_value=receipt.FILENAME,
+    default=None,
+    metavar="FILE",
+    help="Record successfully extracted documents in this receipt file. "
+    "The default file name is used when FILE is omitted.",
+)
 @click.option("--failfast", "-x", is_flag=True, help="Stop processing at the first error.")
 @click.option("--quiet", "-q", count=True, help="Suppress all output.")
 @click.pass_obj
@@ -78,6 +90,7 @@ def _extract(
     output: io.TextIOBase,
     existing: Optional[str],
     reverse: bool,
+    receipt_path: Optional[str],
     failfast: bool,
     quiet: bool,
 ):
@@ -89,6 +102,10 @@ def _extract(
     or to the standard output in Beancount ledger format in sections
     associated to the source document.
 
+    When a receipt file is specified, each successfully extracted
+    document is recorded there as pending. The receipt can then be
+    passed to the archive command, which files only those documents.
+
     """
     verbosity = -quiet
     log = utils.logger(verbosity, err=True)
@@ -97,6 +114,9 @@ def _extract(
     # Load the ledger, if one is specified.
     existing_entries = loader.load_file(existing)[0] if existing else []
 
+    # Remember document hashes so the receipt can detect a document
+    # that changed between extraction and archival.
+    digests = {}
     extracted: List[extract.ExtractedEntry] = []
     for filename in _walk(src, log):
         with errors:
@@ -111,6 +131,7 @@ def _extract(
             # Extract entries.
             entries = extract.extract_from_file(importer, filename, existing_entries)
             account = importer.account(filename)
+            digests[filename] = utils.sha1sum(filename)
 
             extracted.append((filename, entries, account, importer))
             log(" OK", fg="green")
@@ -130,8 +151,31 @@ def _extract(
     for func in ctx.hooks:
         extracted = func(extracted, existing_entries)
 
+    # Count duplicates before serialization, which removes the marker.
+    duplicate_counts = {
+        filename: sum(1 for entry in entries if entry.meta.get(extract.DUPLICATE))
+        for filename, entries, account, importer in extracted
+    }
+
     # Serialize entries.
     extract.print_extracted_entries(extracted, output)
+
+    # Record the documents whose entries are awaiting confirmation.
+    if receipt_path:
+        receipt_file = receipt.Receipt.load(receipt_path)
+        output_name = getattr(output, "name", None)
+        for filename, entries, account, importer in extracted:
+            receipt_file.record_extracted(
+                filename,
+                digests.get(filename) or utils.sha1sum(filename),
+                size=os.path.getsize(filename),
+                importer=importer.name,
+                account=account,
+                output=output_name,
+                entries=len(entries),
+                duplicates=duplicate_counts.get(filename, 0),
+            )
+        receipt_file.save()
 
     if errors:
         sys.exit(1)
@@ -155,6 +199,16 @@ def _extract(
 @click.option(
     "--dry-run", "-n", is_flag=True, help="Just print where the files would be moved."
 )
+@click.option(
+    "--receipt",
+    "receipt_path",
+    is_flag=False,
+    flag_value=receipt.FILENAME,
+    default=None,
+    metavar="FILE",
+    help="Archive only documents recorded as pending in this receipt file. "
+    "The default file name is used when FILE is omitted.",
+)
 @click.option("--failfast", "-x", is_flag=True, help="Stop processing at the first error.")
 @click.option("--quiet", "-q", count=True, help="Suppress all output.")
 @click.pass_obj
@@ -164,6 +218,7 @@ def _archive(
     destination: str,
     dry_run: bool,
     overwrite: bool,
+    receipt_path: Optional[str],
     failfast: bool,
     quiet: bool,
 ):
@@ -182,6 +237,13 @@ def _archive(
     specified with the --destination DIR options, it is assumed to be
     directory in which the ingest script is located.
 
+    When a receipt file is specified, only documents recorded there as
+    pending are filed, and each document is moved independently. A
+    failed move is recorded in the receipt without preventing the other
+    documents from being filed. Documents already recorded as archived
+    are skipped, so a subsequent run retries only the moves that failed
+    and keeps the existing extraction records intact.
+
     """
     # If the output directory is not specified, move the files at the
     # root where the import script is located. Providing this default
@@ -194,7 +256,32 @@ def _archive(
     verbosity = -quiet
     log = utils.logger(verbosity, err=True)
     errors = exceptions.ExceptionsTrap(log)
+    receipt_file = receipt.Receipt.load(receipt_path) if receipt_path else None
     renames = []
+
+    # Reconcile documents whose move was interrupted by a previous
+    # run. If the recorded destination holds the extracted content,
+    # the copy completed: remove the source if it is still there and
+    # mark the document archived. Otherwise the move is retried
+    # normally below.
+    reconciled = False
+    if receipt_file is not None and not dry_run:
+        for record in receipt_file.files.values():
+            if record.get("status") == receipt.STATUS_ARCHIVED:
+                continue
+            source = record["source"]
+            target = (record.get("archive") or {}).get("destination")
+            if not target or not os.path.exists(target):
+                continue
+            digest = record.get("sha1")
+            if digest and utils.sha1sum(target) != digest:
+                continue
+            if os.path.exists(source):
+                os.unlink(source)
+            receipt_file.record_archived(source, target, sha1=digest)
+            reconciled = True
+        if reconciled:
+            receipt_file.save()
 
     for filename in _walk(src, log):
         with errors:
@@ -206,6 +293,20 @@ def _archive(
             # Signal processing of this document.
             log(" ...", nl=False)
 
+            record = None
+            digest = None
+            if receipt_file is not None:
+                record = receipt_file.get(filename)
+                if record is None:
+                    log(" SKIP (not extracted)", fg="yellow")
+                    continue
+                if record.get("status") == receipt.STATUS_ARCHIVED:
+                    log(" SKIP (already archived)", fg="yellow")
+                    continue
+                digest = utils.sha1sum(filename)
+                if record.get("sha1") and record["sha1"] != digest:
+                    raise exceptions.Error("Document changed since extraction.", filename)
+
             destpath = archive.filepath(importer, filename)
 
             # Prepend destination directory path.
@@ -216,8 +317,23 @@ def _archive(
             if collisions:
                 raise exceptions.Error("Collision in destination file path.", destpath)
 
-            # Check if the destination file already exists.
+            # Check if the destination file already exists. When the
+            # recorded move failed but an identical copy is present,
+            # treat the move as completed instead of refusing forever.
             if not overwrite and os.path.exists(destpath):
+                if (
+                    receipt_file is not None
+                    and not dry_run
+                    and record.get("sha1") == utils.sha1sum(destpath)
+                ):
+                    os.unlink(filename)
+                    receipt_file.record_archived(
+                        filename, destpath, sha1=record.get("sha1")
+                    )
+                    receipt_file.save()
+                    log(" OK (completed interrupted move)", fg="green")
+                    log(f"  {destpath:}")
+                    continue
                 raise exceptions.Error("Destination file already exists.", destpath)
 
             renames.append((filename, destpath))
@@ -227,14 +343,56 @@ def _archive(
         if failfast and errors:
             break
 
-    # If there are any errors, stop here.
-    if errors:
-        log("# Errors detected: documents will not be filed.")
-        sys.exit(1)
+    # Without a receipt, preserve the all-or-nothing behavior.
+    if receipt_file is None:
+        # If there are any errors, stop here.
+        if errors:
+            log("# Errors detected: documents will not be filed.")
+            sys.exit(1)
 
-    if not dry_run:
-        for filename, destpath in renames:
-            archive.move(filename, destpath)
+        if not dry_run:
+            for filename, destpath in renames:
+                archive.move(filename, destpath)
+        return
+
+    if dry_run:
+        if errors:
+            log("# Errors detected: documents will not be filed.")
+            sys.exit(1)
+        return
+
+    # File documents one at a time. A failure is recorded in the
+    # receipt and does not prevent the remaining documents from being
+    # filed; the next run retries only the failed moves.
+    for filename, destpath in renames:
+        with errors:
+            record = receipt_file.get(filename)
+            receipt_file.record_moving(filename, destpath, sha1=record.get("sha1"))
+            receipt_file.save()
+            try:
+                archive.move(filename, destpath)
+            except Exception as exc:
+                receipt_file.record_archive_failed(
+                    filename,
+                    destpath,
+                    str(exc),
+                    sha1=record.get("sha1"),
+                )
+                receipt_file.save()
+                raise exceptions.Error(
+                    "Unable to move document.", destpath, str(exc)
+                ) from exc
+
+            receipt_file.record_archived(
+                filename,
+                destpath,
+                sha1=record.get("sha1"),
+            )
+            receipt_file.save()
+
+    if errors:
+        log("# Errors detected: some documents were not filed.")
+        sys.exit(1)
 
 
 @click.command("identify")

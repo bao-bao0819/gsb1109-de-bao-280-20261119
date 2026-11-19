@@ -39,6 +39,29 @@ There are five directories demonstrated here:
   files dowloaded from your statement sources.
 
 
+## Resuming an interrupted import
+
+Passing `--receipt FILE` to `extract` and `archive` makes the two steps
+resumable by automation. Extraction records every document whose entries
+were generated and are awaiting confirmation. Archival files only those
+recorded documents, one at a time, and records the outcome of each move.
+
+```bash
+python import.py extract ./Downloads -o pending.beancount --receipt receipt.json
+# Review pending.beancount, then:
+python import.py archive ./Downloads -o ./documents --receipt receipt.json
+```
+
+The receipt is JSON keyed by source path. Each record keeps the document
+hash, the extraction details (`extracted`), and the archival outcome
+(`archive`). A document starts as `pending`. Before a move it is marked
+`moving`; after a successful move it becomes `archived`. A failed move is
+recorded as `failed` while the document stays `pending`, so the next run
+retries only that move and leaves the extraction record untouched. Moves
+interrupted after the copy but before the receipt update are reconciled
+on the next run when the destination content still matches the recorded
+hash.
+
 ## Example Files Organization - Simpler
 
 Note that you could further simplify and merge some of these together for your

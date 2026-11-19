@@ -146,3 +146,72 @@ Cleanup
 -------
 
   >>> rmtree(temp)
+
+
+Resumable archival with a receipt
+----------------------------------
+
+A receipt records which documents have been extracted and which have
+been filed. The archive command files only documents recorded as
+pending, and a failed move can be retried without moving the documents
+that already succeeded.
+
+Create fresh directories and extract with a receipt:
+
+  >>> temp = mkdtemp()
+  >>> downloads = path.join(temp, 'downloads')
+  >>> documents = path.join(temp, 'documents')
+  >>> receipt = path.join(temp, 'receipt.json')
+  >>> mkdir(downloads)
+  >>> mkdir(documents)
+  >>> fnames = ['aaa.csv', 'bbb.csv']
+  >>> for fname in fnames:
+  ...     with open(path.join(downloads, fname), 'w') as f:
+  ...         pass
+
+  >>> output = path.join(temp, 'output.beancount')
+  >>> r = run('extract', downloads, '-o', output, '--receipt', receipt)
+  >>> r.exit_code
+  0
+
+Each extracted document is recorded as pending:
+
+  >>> import json
+  >>> with open(receipt) as f:
+  ...     data = json.load(f)
+  >>> sorted(record['status'] for record in data['files'].values())
+  ['pending', 'pending']
+
+Add an unrelated download after extraction. It is not recorded and is
+left alone by the archive command:
+
+  >>> with open(path.join(downloads, 'not-extracted.csv'), 'w') as f:
+  ...     pass
+
+  >>> r = run('archive', downloads, '-o', documents, '--receipt', receipt)
+  >>> r.exit_code
+  0
+  >>> path.exists(path.join(downloads, 'not-extracted.csv'))
+  True
+
+Both recorded documents are now archived:
+
+  >>> with open(receipt) as f:
+  ...     data = json.load(f)
+  >>> sorted(record['status'] for record in data['files'].values())
+  ['archived', 'archived']
+
+Running archive again does not move those documents a second time:
+
+  >>> for fname in ['aaa.csv', 'bbb.csv']:
+  ...     with open(path.join(downloads, fname), 'w') as f:
+  ...         pass
+  >>> r = run('archive', downloads, '-o', documents, '--receipt', receipt)
+  >>> r.exit_code
+  0
+  >>> path.exists(path.join(downloads, 'aaa.csv'))
+  True
+
+Cleanup:
+
+  >>> rmtree(temp)

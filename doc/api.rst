@@ -56,6 +56,7 @@ The :class:`Tibs` and :class:`Dtype` classes are the most fundamental ones to us
             + read()
             + peek()
             + parse()
+            + try_parse()
         }
         Reader --* "1" Tibs : contains
         Mutibs .. Tibs : converts to/from

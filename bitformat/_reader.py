@@ -8,6 +8,77 @@ from ._dtypes import Dtype, DtypeSingle
 from ._common import DtypeKind
 
 
+class _FieldState:
+    """A snapshot of a fieldtype's mutable parsing state."""
+
+    def __init__(self, fieldtype: FieldType, memo: dict[int, tuple]) -> None:
+        self._fieldtype = fieldtype
+        memo[id(fieldtype)] = ("field", self, fieldtype)
+        self._attributes = {
+            name: _snapshot_value(value, memo) for name, value in fieldtype.__dict__.items()
+        }
+
+    def restore(self) -> None:
+        attributes = self._fieldtype.__dict__
+        for name in list(attributes):
+            if name not in self._attributes:
+                del attributes[name]
+        for name, snapshot in self._attributes.items():
+            attributes[name] = _restore_value(snapshot)
+
+
+def _snapshot_value(value: Any, memo: dict[int, tuple]) -> tuple:
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+    if isinstance(value, FieldType):
+        _FieldState(value, memo)
+        return memo[value_id]
+    if isinstance(value, dict):
+        snapshot = ("dict", {}, value)
+        memo[value_id] = snapshot
+        snapshot[1].update({key: _snapshot_value(item, memo) for key, item in value.items()})
+        return snapshot
+    if isinstance(value, list):
+        snapshot = ("list", [], value)
+        memo[value_id] = snapshot
+        snapshot[1].extend(_snapshot_value(item, memo) for item in value)
+        return snapshot
+    if isinstance(value, tuple):
+        snapshot = ("tuple", tuple(_snapshot_value(item, memo) for item in value), value)
+        memo[value_id] = snapshot
+        return snapshot
+    if isinstance(value, set):
+        snapshot = ("set", set(), value)
+        memo[value_id] = snapshot
+        snapshot[1].update(_restore_value(_snapshot_value(item, memo)) for item in value)
+        return snapshot
+    return ("value", value, value)
+
+
+def _restore_value(snapshot: tuple) -> Any:
+    kind, value, original = snapshot
+    if kind == "field":
+        value.restore()
+        return original
+    if kind == "dict":
+        restored = {key: _restore_value(item) for key, item in value.items()}
+        original.clear()
+        original.update(restored)
+        return original
+    if kind == "list":
+        restored = [_restore_value(item) for item in value]
+        original[:] = restored
+        return original
+    if kind == "tuple":
+        return tuple(_restore_value(item) for item in value)
+    if kind == "set":
+        original.clear()
+        original.update(value)
+        return original
+    return value
+
+
 class Reader:
     """
     Wraps a :class:`Tibs` or :class:`Mutibs` object and a bit position to allow reading and parsing as a stream of bits.
@@ -17,6 +88,7 @@ class Reader:
     - ``read()``: Read from the current bit position, and interpret according to the given format.
     - ``peek()``: Peek from the current bit position, and interpret according to the given format without changing the pos.
     - ``parse()``: Parse a fieldtype from the current bit position, returning the number of bits parsed.
+    - ``try_parse()``: Try to parse a fieldtype, rolling back if it doesn't match.
 
     **Properties:**
 
@@ -103,15 +175,42 @@ class Reader:
     def parse(self, f: FieldType, /) -> int:
         """Parse a fieldtype from the current bit position, returning the number of bits parsed.
 
+        If the parse doesn't match the data then the bit position and the fieldtype's parsed values
+        are restored before the :class:`ValueError` is raised, so another fieldtype can be tried
+        from the same position.
+
         :param f: The fieldtype to parse.
         :return: The number of bits parsed.
 
         :raises TypeError: If `f` is not a subclass of :class:`FieldType`.
         """
+        return self._parse(f, "parse", suppress=False)
+
+    def try_parse(self, f: FieldType, /) -> int | None:
+        """Try to parse a fieldtype from the current bit position, rolling back if it doesn't match.
+
+        If the parse raises a :class:`ValueError` then the bit position and the fieldtype's parsed
+        values are restored, and ``None`` is returned so that another fieldtype can be tried from
+        the same position. On success this behaves exactly like :meth:`parse`.
+
+        :param f: The fieldtype to parse.
+        :return: The number of bits parsed, or ``None`` if the parse didn't match.
+        """
+        return self._parse(f, "try_parse", suppress=True)
+
+    def _parse(self, f: FieldType, method_name: str, *, suppress: bool) -> int | None:
+        if not isinstance(f, FieldType):
+            raise TypeError(f"{method_name}() requires a FieldType. Got {f!r} of type {type(f)}.")
+        pos = self._pos
+        state = _FieldState(f, {})
         try:
-            bits_parsed = f.parse(self._bits[self._pos :])
-        except AttributeError:
-            raise TypeError(f"parse() requires a FieldType. Got {f!r} of type {type(f)}.")
+            bits_parsed = f.parse(self._bits[pos:])
+        except ValueError:
+            state.restore()
+            self._pos = pos
+            if suppress:
+                return None
+            raise
         self._pos += bits_parsed
         return bits_parsed
 

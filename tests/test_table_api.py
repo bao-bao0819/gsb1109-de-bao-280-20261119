@@ -480,8 +480,29 @@ async def test_sortable_argument_errors(ds_client):
     response = await ds_client.get(
         "/fixtures/sortable.json?_sort=sortable_with_nulls&_sort_desc=sortable"
     )
-    assert (
-        response.json()["error"] == "Cannot use _sort and _sort_desc at the same time"
+    assert response.status_code == 200
+    data = response.json()
+    # _sort and _sort_desc name different columns, so they form a multi-column
+    # sort: NULLs come first, then the non-NULL first-column values ascend
+    first_column = [row["sortable_with_nulls"] for row in data["rows"]]
+    non_null = [value for value in first_column if value is not None]
+    assert non_null == sorted(non_null)
+    if non_null:
+        assert all(
+            value is None
+            for value in first_column[: first_column.index(non_null[0])]
+        )
+    # The pagination link preserves every level of the sort order
+    if data["next_url"]:
+        assert "_sort=sortable_with_nulls" in data["next_url"]
+        assert "_sort_desc=sortable" in data["next_url"]
+    # Reusing the same column in two sort arguments is still an error
+    response = await ds_client.get(
+        "/fixtures/sortable.json?_sort=sortable&_sort_desc=sortable"
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == (
+        "Cannot sort by the same column more than once: sortable"
     )
 
 
@@ -1705,7 +1726,7 @@ async def test_sort_excluded_column_with_expanded_labels(ds_client, path):
     response = await ds_client.get(path)
     assert response.status_code == 200
     if ".json" in path:
-        assert response.json()["next"] == "i:2,2"
+        assert response.json()["next"] == "v2.0.attraction_id|i:2,2"
 
 
 @pytest.mark.parametrize(

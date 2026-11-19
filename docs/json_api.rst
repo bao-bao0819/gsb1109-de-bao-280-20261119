@@ -282,6 +282,8 @@ Pagination
 
 The default JSON representation includes a ``"next_url"`` key which can be used to access the next page of results. If that key is null or missing then it means you have reached the final page of results.
 
+For tables, pagination uses a keyset (seek) cursor rather than an offset: each ``"next"`` token captures the full ordered tuple of the last row on the page - every ``?_sort=`` / ``?_sort_desc=`` column followed by the primary key (or ``rowid``). Following the tokens therefore reads the rows in exactly the order the first page used, with no rows skipped or repeated even when the sorted columns contain duplicates or NULLs, and the cursor predicate can be answered with an index range search instead of scanning earlier rows. Because the token also records its sort order, changing the sort while keeping an old ``?_next=`` returns a 400 error telling you to restart from the first page.
+
 Other representations include pagination information in the ``link`` HTTP header. That header will look something like this::
 
     link: <https://latest.datasette.io/fixtures/sortable.json?_next=d%2Cv>; rel="next"
@@ -1537,10 +1539,17 @@ Special table arguments
     passed to ``datasette serve``. Use ``max`` to get ``max_returned_rows``.
 
 ``?_sort=COLUMN``
-    Sorts the results by the specified column.
+    Sorts the results by the specified column. This argument may be given more
+    than once; each value adds another sort level applied in order, so
+    ``?_sort=station&_sort_desc=created_at`` sorts by ``station`` ascending and
+    then by ``created_at`` descending. The primary key (or ``rowid`` for tables
+    without one) is always used as the final, unique tie-breaker.
 
 ``?_sort_desc=COLUMN``
-    Sorts the results by the specified column in descending order.
+    Sorts the results by the specified column in descending order. Like
+    ``?_sort=`` it may be repeated and combined with ``?_sort=`` to build a
+    multi-column sort order. A column used twice in the same sort order is a
+    400 error.
 
 ``?_search=keywords``
     For SQLite tables that have been configured for
@@ -1599,7 +1608,14 @@ Special table arguments
 
 ``?_next=TOKEN``
     Pagination by continuation token - pass the token that was returned in the
-    ``"next"`` property by the previous page.
+    ``"next"`` property by the previous page. For tables the token is a keyset
+    cursor over the current sort order and the primary key, so paging through
+    every page returns the rows in exactly the order of the first page,
+    including when sort columns repeat or contain NULLs. The token records the
+    sort order it was created for: reusing it after changing ``?_sort=`` or
+    ``?_sort_desc=`` returns a 400 error asking you to drop the token and
+    start again from the first page. Views, which have no primary key, use a
+    plain offset instead.
 
 ``?_facet=column``
     Facet by column. Can be applied multiple times, see :ref:`facets`. Only works on the default JSON output, not on any of the custom shapes.

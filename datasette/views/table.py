@@ -32,8 +32,6 @@ from datasette.utils import (
     WriteJsonValueError,
     add_cors_headers,
     await_me_maybe,
-    compound_keys_after_sql,
-    compound_keys_at_or_before_sql,
     decode_write_json_rows,
     escape_sqlite,
     filters_should_redirect,
@@ -82,6 +80,7 @@ from .table_extras import (
     precompute_database_action_permissions,
     precompute_table_action_permissions,
     resolve_table_extras,
+    sort_description_en,
     table_extra_registry,
 )
 
@@ -1593,12 +1592,20 @@ class TableCountView(BaseView):
             sortable_columns = await _sortable_columns_for_table(
                 self.ds, db.name, table_name, use_rowid
             )
-            sort, sort_desc, _ = await _sort_order(
+            sort, sort_desc, sort_columns, _ = await _sort_order(
                 table_metadata, sortable_columns, request, ""
             )
             params = dict(params)
-            before_clause = _at_or_before_next_where_clause(
-                _next, sort, sort_desc, pks, use_rowid, params
+            try:
+                cursor_sort_columns, cursor_values = _decode_next(_next)
+                _validate_cursor_sort(cursor_sort_columns, sort_columns)
+            except BadRequest as ex:
+                return Response.error(str(ex), status=400)
+            before_clause = _keyset_where_clause(
+                _keyset_key_columns(sort_columns, pks, use_rowid),
+                cursor_values,
+                params,
+                inclusive=True,
             )
             if before_clause is None:
                 return Response.error("Invalid _next", status=400)
@@ -1861,31 +1868,52 @@ async def _sortable_columns_for_table(datasette, database_name, table_name, use_
 
 
 async def _sort_order(table_metadata, sortable_columns, request, order_by):
-    sort = request.args.get("_sort")
-    sort_desc = request.args.get("_sort_desc")
-
-    if not sort and not sort_desc:
+    # Each ?_sort= / ?_sort_desc= is one level of the sort order, in the order
+    # the arguments appear in the query string - including interleaved ones -
+    # so ?_sort=station&_sort_desc=created_at sorts by station then created_at.
+    # request.args groups values by key, which would lose that ordering, so the
+    # raw query string is parsed with parse_qsl() instead.
+    sort_args = [
+        (column, key == "_sort_desc")
+        for key, column in urllib.parse.parse_qsl(
+            request.query_string, keep_blank_values=True
+        )
+        if key in ("_sort", "_sort_desc") and column
+    ]
+    if not sort_args:
         sort = table_metadata.get("sort")
         sort_desc = table_metadata.get("sort_desc")
+        if sort:
+            sort_args = [(sort, False)]
+        elif sort_desc:
+            sort_args = [(sort_desc, True)]
+        else:
+            sort = sort_desc = None
+    else:
+        sort = sort_args[0][0] if not sort_args[0][1] else None
+        sort_desc = sort_args[0][0] if sort_args[0][1] else None
 
-    if sort and sort_desc:
-        raise DatasetteError(
-            "Cannot use _sort and _sort_desc at the same time", status=400
-        )
+    # The first sort column keeps the legacy scalar names so templates,
+    # extras and ?_col= handling continue to work unchanged.
+    sort_columns = []
+    order_by_parts = []
+    seen_columns = set()
+    for column, descending in sort_args:
+        if column not in sortable_columns:
+            raise DatasetteError(f"Cannot sort table by {column}", status=400)
+        if column in seen_columns:
+            raise DatasetteError(
+                f"Cannot sort by the same column more than once: {column}",
+                status=400,
+            )
+        seen_columns.add(column)
+        quoted = escape_sqlite(column)
+        sort_columns.append((column, descending))
+        order_by_parts.append(f"{quoted} desc" if descending else quoted)
 
-    if sort:
-        if sort not in sortable_columns:
-            raise DatasetteError(f"Cannot sort table by {sort}", status=400)
-
-        order_by = escape_sqlite(sort)
-
-    if sort_desc:
-        if sort_desc not in sortable_columns:
-            raise DatasetteError(f"Cannot sort table by {sort_desc}", status=400)
-
-        order_by = f"{escape_sqlite(sort_desc)} desc"
-
-    return sort, sort_desc, order_by
+    if sort_columns:
+        order_by = ", ".join(order_by_parts)
+    return sort, sort_desc, sort_columns, order_by
 
 
 async def table_view(datasette, request):
@@ -2158,117 +2186,190 @@ def _decode_sort_value(value):
     return tilde_decode(value)
 
 
-def _parse_next(_next, sort, sort_desc):
-    """Split a ?_next= cursor into (sort_value, primary key components)."""
-    sort_value = None
-    components = _next.split(",")
-    # If a sort order is applied and there are multiple components,
-    # the first of these is the sort value
-    if (sort or sort_desc) and (len(components) > 1):
-        sort_value = _decode_sort_value(components.pop(0))
-    return sort_value, [tilde_decode(component) for component in components]
+# Every cursor carries this marker plus the sort order it was built for, so a
+# token reused against a different ?_sort= / ?_sort_desc= order can be rejected
+# instead of silently returning rows in the wrong place.
+_CURSOR_MARKER = "v2"
 
 
-def _at_or_before_next_where_clause(_next, sort, sort_desc, pks, use_rowid, params):
-    """SQL clause selecting the rows up to and including a ?_next= cursor - the
-    rows on earlier pages. Returns None if the cursor is not valid.
+def _encode_sort_spec(sort_columns):
+    # Each sort level is two "."-separated tokens: a direction flag ("0" for
+    # ascending, "1" for descending) and the tilde-encoded column name. "." is
+    # escaped by tilde_encode(), so it can only ever be the delimiter here, even
+    # for column names containing dots, dashes or other punctuation.
+    levels = []
+    for column, descending in sort_columns:
+        levels.append("1" if descending else "0")
+        levels.append(tilde_encode(column))
+    return ".".join(levels)
 
-    This is the inverse of _next_where_clauses(), written out directly rather
-    than as "not (...)" so that SQLite can use an index range search on the
-    primary key (or on the sort column, if it is indexed)."""
-    sort_value, components = _parse_next(_next, sort, sort_desc)
-    if use_rowid:
-        if len(components) != 1:
-            return None
-        pk_clause = f"rowid <= :p{len(params)}"
-        params[f"p{len(params)}"] = components[0]
-    else:
-        if len(components) != len(pks):
-            return None
-        param_len = len(params)
-        pk_clause = compound_keys_at_or_before_sql(pks, param_len)
-        for i, pk_value in enumerate(components):
-            params[f"p{param_len + i}"] = pk_value
-    if not (sort or sort_desc):
-        return pk_clause
-    # Rows are ordered by the sort column then the primary key. SQLite puts
-    # nulls first in ascending order and last in descending order.
-    column = escape_sqlite(sort or sort_desc)
-    if sort_value is None:
-        if sort:
-            # Only nulls come before, up to the cursor's primary key
-            return f"({column} is null and {pk_clause})"
-        # Every non-null value comes before the nulls
-        return f"({column} is not null or ({column} is null and {pk_clause}))"
-    p = f":p{len(params)}"
-    params[f"p{len(params)}"] = sort_value
-    if sort:
-        return (
-            f"({column} is null or {column} < {p}"
-            f" or ({column} = {p} and {pk_clause}))"
+
+def _encode_next(sort_columns, sort_values, pk_values):
+    """Build the opaque ?_next= token for the row at the end of the page."""
+    marker = _CURSOR_MARKER
+    if sort_columns:
+        marker = f"{marker}.{_encode_sort_spec(sort_columns)}"
+    value_parts = [_encode_sort_value(value) for value in sort_values]
+    value_parts.extend(tilde_encode(str(value)) for value in pk_values)
+    return f"{marker}|{','.join(value_parts)}"
+
+
+def _decode_next(_next):
+    """Split a ?_next= token into (sort_columns, cursor values).
+
+    sort_columns is a list of (column, descending) tuples; cursor values hold
+    the sort values followed by the primary key components, each with its
+    stored type preserved."""
+    if "|" not in _next:
+        raise BadRequest("Invalid _next")
+    marker, values_part = _next.split("|", 1)
+    marker_parts = marker.split(".") if marker else []
+    if not marker_parts or marker_parts[0] != _CURSOR_MARKER:
+        raise BadRequest("Invalid _next")
+    level_parts = marker_parts[1:]
+    if len(level_parts) % 2:
+        raise BadRequest("Invalid _next")
+    sort_columns = []
+    for i in range(0, len(level_parts), 2):
+        direction, encoded = level_parts[i], level_parts[i + 1]
+        if direction not in ("0", "1") or not encoded:
+            raise BadRequest("Invalid _next")
+        sort_columns.append((tilde_decode(encoded), direction == "1"))
+    raw_values = values_part.split(",") if values_part else []
+    values = [_decode_sort_value(component) for component in raw_values]
+    return sort_columns, values
+
+
+def _validate_cursor_sort(cursor_sort_columns, sort_columns):
+    """A cursor only makes sense with the exact sort order it was issued for."""
+    if cursor_sort_columns != sort_columns:
+        raise BadRequest(
+            "_next token was created with a different sort order - remove it "
+            "and start again from the first page"
         )
-    return f"({column} > {p} or ({column} = {p} and {pk_clause}))"
 
 
-def _next_where_clauses(_next, sort, sort_desc, pks, use_rowid, params):
-    """SQL clauses selecting the rows at and after a ?_next= keyset cursor.
+def _null_safe_equal(column, param, *, nullable, value):
+    # Primary key and rowid columns are NOT NULL, so a plain "=" keeps the
+    # predicate index-friendly. A sort column can be NULL: when the cursor
+    # value is NULL the matching rows are the NULL group, otherwise "=" again.
+    if nullable and value is None:
+        return f"{column} is null"
+    return f"{column} = {param}"
 
-    Adds the cursor's values to params and returns a list of where clauses."""
-    clauses = []
-    sort_value, components = _parse_next(_next, sort, sort_desc)
 
-    # Figure out the SQL for next-based-on-primary-key first
-    next_by_pk_clauses = []
+def _strictly_after(column, descending, param, *, nullable, value):
+    # Rows that rank strictly after the cursor at this tuple level, assuming
+    # every earlier column matches. SQLite sorts NULLs first when ascending and
+    # last when descending. Written with simple comparisons and explicit NULL
+    # branches so SQLite can use an index range search.
+    if not nullable:
+        # Primary key / rowid tie-breaker: always NOT NULL and ascending
+        return f"{column} > {param}"
+    if descending:
+        if value is None:
+            # NULLs sort last in descending order: nothing follows a NULL here
+            return None
+        return f"({column} < {param} or {column} is null)"
+    if value is None:
+        # NULLs sort first in ascending order: every non-NULL value follows
+        return f"{column} is not null"
+    return f"{column} > {param}"
+
+
+def _strictly_before(column, descending, param, *, nullable, value):
+    # The inverse of _strictly_after(): rows ranking strictly before the cursor.
+    if not nullable:
+        return f"{column} < {param}"
+    if descending:
+        if value is None:
+            return f"{column} is not null"
+        return f"{column} > {param}"
+    if value is None:
+        # NULLs sort first: nothing ranks before a NULL here
+        return None
+    return f"({column} < {param} or {column} is null)"
+
+
+def _keyset_key_columns(sort_columns, pks, use_rowid):
+    # The full tuple the rows are ordered by: requested sort columns first,
+    # then the primary key (or rowid) as the unique, NOT NULL tie-breaker.
+    # Each entry is (quoted column, descending, nullable).
+    key_columns = [
+        (escape_sqlite(column), descending, True)
+        for column, descending in sort_columns
+    ]
     if use_rowid:
-        next_by_pk_clauses.append(f"rowid > :p{len(params)}")
-        params[f"p{len(params)}"] = components[0]
+        key_columns.append(("rowid", False, False))
     else:
-        # Apply the tie-breaker based on primary keys
-        if len(components) == len(pks):
-            param_len = len(params)
-            next_by_pk_clauses.append(compound_keys_after_sql(pks, param_len))
-            for i, pk_value in enumerate(components):
-                params[f"p{param_len + i}"] = pk_value
+        key_columns.extend((escape_sqlite(pk), False, False) for pk in pks)
+    return key_columns
 
-    # Now add the sort SQL, which may incorporate next_by_pk_clauses
-    if sort or sort_desc:
-        if sort_value is None:
-            if sort_desc:
-                # Just items where column is null ordered by pk
-                clauses.append(
-                    "({column} is null and {next_clauses})".format(
-                        column=escape_sqlite(sort_desc),
-                        next_clauses=" and ".join(next_by_pk_clauses),
-                    )
-                )
-            else:
-                clauses.append(
-                    "({column} is not null or ({column} is null and {next_clauses}))".format(
-                        column=escape_sqlite(sort),
-                        next_clauses=" and ".join(next_by_pk_clauses),
-                    )
-                )
-        else:
-            clauses.append(
-                "({column} {op} :p{p}{extra_desc_only} or ({column} = :p{p} and {next_clauses}))".format(
-                    column=escape_sqlite(sort or sort_desc),
-                    op=">" if sort else "<",
-                    p=len(params),
-                    extra_desc_only=(
-                        ""
-                        if sort
-                        else f" or {escape_sqlite(sort or sort_desc)} is null"
-                    ),
-                    next_clauses=" and ".join(next_by_pk_clauses),
-                )
+
+def _keyset_where_clause(key_columns, values, params, *, inclusive):
+    """Keyset pagination predicate over the ordered tuple of key columns.
+
+    With inclusive=False it selects rows strictly after the cursor (the next
+    page); with inclusive=True it selects rows up to and including it (used to
+    count the rows on earlier pages). Every OR branch compares the earlier
+    tuple columns with "=" and the first differing column with a range test, so
+    SQLite can answer it with an index range search.
+
+    Returns None if the number of cursor values does not match the key columns.
+    """
+    if len(values) != len(key_columns):
+        return None
+    base_index = len(params)
+    or_clauses = []
+    for i, ((column, descending, nullable), value) in enumerate(
+        zip(key_columns, values)
+    ):
+        param = f":p{base_index + i}"
+        params[param[1:]] = value
+        and_clauses = [
+            _null_safe_equal(
+                earlier_column,
+                f":p{base_index + j}",
+                nullable=earlier_nullable,
+                value=values[j],
             )
-            params[f"p{len(params)}"] = sort_value
-    else:
-        clauses.extend(next_by_pk_clauses)
-    return clauses
+            for j, (
+                earlier_column,
+                _earlier_descending,
+                earlier_nullable,
+            ) in enumerate(key_columns[:i])
+        ]
+        terminal = (
+            _strictly_before(
+                column, descending, param, nullable=nullable, value=value
+            )
+            if inclusive
+            else _strictly_after(
+                column, descending, param, nullable=nullable, value=value
+            )
+        )
+        if terminal is not None:
+            and_clauses.append(terminal)
+            or_clauses.append("(" + " and ".join(and_clauses) + ")")
+    if inclusive:
+        # The cursor row itself: every tuple element matches, NULLs included
+        or_clauses.append(
+            "("
+            + " and ".join(
+                _null_safe_equal(
+                    column,
+                    f":p{base_index + j}",
+                    nullable=nullable,
+                    value=values[j],
+                )
+                for j, (column, _descending, nullable) in enumerate(key_columns)
+            )
+            + ")"
+        )
+    return "(" + "\n  or\n".join(or_clauses) + ")"
 
 
-def _page_position(datasette, request, is_view, sort, sort_desc, pks, use_rowid):
+def _page_position(datasette, request, is_view, sort_columns, pks, use_rowid):
     """Context for the "you are not on the first page" strip, or None on page 1."""
     _next = request.args.get("_next")
     if not _next:
@@ -2286,13 +2387,15 @@ def _page_position(datasette, request, is_view, sort, sort_desc, pks, use_rowid)
     }
     if is_view:
         return position
-    sort_value, components = _parse_next(_next, sort, sort_desc)
-    if (sort or sort_desc) and len(_next.split(",")) > 1:
-        position["after_column"] = sort or sort_desc
-        position["after_value"] = None if sort_value is None else str(sort_value)
+    cursor_sort_columns, values = _decode_next(_next)
+    _validate_cursor_sort(cursor_sort_columns, sort_columns)
+    if sort_columns:
+        first_value = values[0]
+        position["after_column"] = sort_columns[0][0]
+        position["after_value"] = None if first_value is None else str(first_value)
     else:
         position["after_column"] = "rowid" if use_rowid else ", ".join(pks)
-        position["after_value"] = ", ".join(components)
+        position["after_value"] = ", ".join(str(value) for value in values)
     return position
 
 
@@ -2399,10 +2502,6 @@ async def table_view_data(
         select_specified_columns = f"rowid, {select_specified_columns}"
         select_all_columns = f"rowid, {select_all_columns}"
         order_by = "rowid"
-        order_by_pks = "rowid"
-    else:
-        order_by_pks = ", ".join([escape_sqlite(pk) for pk in pks])
-        order_by = order_by_pks
 
     if is_view:
         order_by = ""
@@ -2431,7 +2530,7 @@ async def table_view_data(
         datasette, database_name, table_name, use_rowid
     )
 
-    sort, sort_desc, order_by = await _sort_order(
+    sort, sort_desc, sort_columns, order_by = await _sort_order(
         table_metadata, sortable_columns, request, order_by
     )
 
@@ -2457,14 +2556,28 @@ async def table_view_data(
             # _next is an offset
             offset = f" offset {int(_next)}"
         else:
-            where_clauses.extend(
-                _next_where_clauses(_next, sort, sort_desc, pks, use_rowid, params)
+            cursor_sort_columns, cursor_values = _decode_next(_next)
+            _validate_cursor_sort(cursor_sort_columns, sort_columns)
+            next_clause = _keyset_where_clause(
+                _keyset_key_columns(sort_columns, pks, use_rowid),
+                cursor_values,
+                params,
+                inclusive=False,
             )
+            if next_clause is None:
+                raise BadRequest("Invalid _next")
+            where_clauses.append(next_clause)
 
-    # The first page needs this tie-breaker too: the ?_next= cursor assumes that
-    # rows with the same sort value come back in primary key order
-    if (sort or sort_desc) and not is_view:
-        order_by = f"{order_by}, {order_by_pks}"
+    # Tables are ordered by the sort columns followed by the primary key (or
+    # rowid) tie-breaker; the ?_next= cursor is a tuple over that exact order,
+    # including on the first page, so ties and NULLs never skip or repeat rows.
+    if not is_view:
+        order_by = ", ".join(
+            f"{column} desc" if descending else column
+            for column, descending, _nullable in _keyset_key_columns(
+                sort_columns, pks, use_rowid
+            )
+        )
 
     where_clause = ""
     if where_clauses:
@@ -2583,8 +2696,7 @@ async def table_view_data(
         rows,
         pks,
         use_rowid,
-        sort,
-        sort_desc,
+        sort_columns,
         page_size,
         is_view,
     )
@@ -2662,6 +2774,7 @@ async def table_view_data(
         extra_human_descriptions=extra_human_descriptions,
         sort=sort,
         sort_desc=sort_desc,
+        sort_columns=sort_columns,
         sortable_columns=sortable_columns,
         extras=extras,
         extra_registry=table_extra_registry,
@@ -2727,13 +2840,7 @@ async def table_view_data(
                         )
                     ]
                 ),
-                "sort_description_en": (
-                    "sorted by {}{}".format(
-                        sort or sort_desc, " descending" if sort_desc else ""
-                    )
-                    if (sort or sort_desc)
-                    else ""
-                ),
+                "sort_description_en": sort_description_en(sort_columns),
                 "url_csv": url_csv,
                 "url_csv_path": url_csv_path,
                 "url_tsv_path": tsv_export_path(datasette, request),
@@ -2749,7 +2856,7 @@ async def table_view_data(
             }
         )
         data["page_position"] = _page_position(
-            datasette, request, is_view, sort, sort_desc, pks, use_rowid
+            datasette, request, is_view, sort_columns, pks, use_rowid
         )
         # if no sort specified AND table has a single primary key,
         # set sort to that so arrow is displayed
@@ -2810,6 +2917,18 @@ async def table_view_data(
     return data, rows[:page_size], columns, expanded_columns, sql, next_url
 
 
+def _cursor_pk_values(cursor_row, pks, use_rowid):
+    if use_rowid:
+        return [cursor_row["rowid"]]
+    values = []
+    for pk in pks:
+        value = cursor_row[pk]
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+        values.append(value)
+    return values
+
+
 async def _next_value_and_url(
     datasette,
     db,
@@ -2819,8 +2938,7 @@ async def _next_value_and_url(
     rows,
     pks,
     use_rowid,
-    sort,
-    sort_desc,
+    sort_columns,
     page_size,
     is_view,
 ):
@@ -2829,40 +2947,49 @@ async def _next_value_and_url(
     if 0 < page_size < len(rows):
         if is_view:
             next_value = int(_next or 0) + page_size
+            added_args = {"_next": next_value}
         else:
-            next_value = path_from_row_pks(rows[-2], pks, use_rowid)
-        # If there's a sort or sort_desc, add that value as a prefix
-        if (sort or sort_desc) and not is_view:
-            try:
-                prefix = rows[-2][sort or sort_desc]
-            except (IndexError, KeyError):
-                # sort/sort_desc column missing from SELECT - look up value by PK instead
-                # Tables with no primary key paginate on rowid
+            cursor_row = rows[-2]
+            pk_values = _cursor_pk_values(cursor_row, pks, use_rowid)
+            sort_values = []
+            missing_columns = []
+            for column, _descending in sort_columns:
+                try:
+                    value = cursor_row[column]
+                except (IndexError, KeyError):
+                    # The sort column can be missing from the SELECT thanks to ?_col=
+                    missing_columns.append(column)
+                    value = None
+                else:
+                    if isinstance(value, dict) and "value" in value:
+                        value = value["value"]
+                sort_values.append(value)
+            if missing_columns:
+                # Look the hidden sort columns up for the cursor row, by primary key
                 lookup_pks = pks or ["rowid"]
-                prefix_where_clause = " and ".join(
+                lookup_where = " and ".join(
                     f"{escape_sqlite(pk)} = :pk{i}" for i, pk in enumerate(lookup_pks)
                 )
-                prefix_lookup_sql = (
-                    f"select {escape_sqlite(sort or sort_desc)} "
-                    f"from {escape_sqlite(table_name)} where {prefix_where_clause}"
-                )
-                prefix = (
-                    await db.execute(
-                        prefix_lookup_sql,
-                        {**{f"pk{i}": rows[-2][pk] for i, pk in enumerate(lookup_pks)}},
+                lookup_sql = (
+                    "select {} from {} where {}".format(
+                        ", ".join(escape_sqlite(column) for column in missing_columns),
+                        escape_sqlite(table_name),
+                        lookup_where,
                     )
-                ).single_value()
-            if isinstance(prefix, dict) and "value" in prefix:
-                prefix = prefix["value"]
-            prefix = _encode_sort_value(prefix)
-            next_value = f"{prefix},{next_value}"
-            added_args = {"_next": next_value}
-            if sort:
-                added_args["_sort"] = sort
-            else:
-                added_args["_sort_desc"] = sort_desc
-        else:
-            added_args = {"_next": next_value}
+                )
+                lookup_params = {
+                    f"pk{i}": cursor_row[pk] for i, pk in enumerate(lookup_pks)
+                }
+                looked_up = (await db.execute(lookup_sql, lookup_params)).first()
+                for i, (column, _descending) in enumerate(sort_columns):
+                    if column in missing_columns:
+                        sort_values[i] = looked_up[column]
+            next_value = _encode_next(sort_columns, sort_values, pk_values)
+            added_args = [("_next", next_value)]
+            for column, descending in sort_columns:
+                added_args.append(
+                    ("_sort_desc" if descending else "_sort", column)
+                )
         next_url = datasette.absolute_url(
             request,
             datasette.urls.modify(request, replace=added_args),

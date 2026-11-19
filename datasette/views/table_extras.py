@@ -15,6 +15,18 @@ from datasette.utils import (
 )
 
 
+def sort_description_en(sort_columns):
+    # sort_columns is a list of (column, descending) tuples, in sort order
+    if not sort_columns:
+        return ""
+    return "sorted by {}".format(
+        ", then ".join(
+            f"{column} descending" if descending else column
+            for column, descending in sort_columns
+        )
+    )
+
+
 @dataclass(frozen=True)
 class TableExtraContext:
     datasette: object
@@ -47,6 +59,7 @@ class TableExtraContext:
     extra_human_descriptions: list
     sort: str | None
     sort_desc: str | None
+    sort_columns: list
     sortable_columns: set
     extras: set
     extra_registry: ExtraRegistry
@@ -309,11 +322,8 @@ class HumanDescriptionEnExtra(Extra):
         human_description_en = context.filters.human_description_en(
             extra=context.extra_human_descriptions
         )
-        if context.sort or context.sort_desc:
-            sorted_by = "sorted by {}{}".format(
-                (context.sort or context.sort_desc),
-                " descending" if context.sort_desc else "",
-            )
+        if context.sort_columns:
+            sorted_by = sort_description_en(context.sort_columns)
             human_description_en = " ".join(
                 [b for b in [human_description_en, sorted_by] if b]
             )

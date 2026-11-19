@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from datasette.app import Datasette
 from datasette.utils import tilde_encode
+from datasette.utils.asgi import BadRequest
 
 PAGE_SIZE = 4
 
@@ -147,7 +148,9 @@ async def test_sorted_scalar_cursor_primary_keys(
     "token", ["i:no", "i:9223372036854775808", "f:no", "f:nan", "f:0x1p+99999", "b:zz"]
 )
 async def test_invalid_sorted_scalar_cursor(pages_ds, token):
-    query = urllib.parse.urlencode({"_sort": "score", "_next": token + ",1"})
+    query = urllib.parse.urlencode(
+        {"_sort": "score", "_next": f"v2.0.score|{token},1"}
+    )
     for method, path in [
         ("get", "/pages/items.json"),
         ("post", "/pages/items/-/count"),
@@ -175,12 +178,11 @@ async def test_invalid_sorted_scalar_cursor(pages_ds, token):
     ],
 )
 def test_parse_sorted_scalar_cursor(raw, expected):
-    from datasette.views.table import _parse_next
+    from datasette.views.table import _decode_sort_value
 
-    value, components = _parse_next(raw + ",key~2C1", "score", None)
+    value = _decode_sort_value(raw)
     assert value == expected
     assert type(value) is type(expected)
-    assert components == ["key,1"]
 
 
 @pytest.mark.parametrize(
@@ -206,14 +208,13 @@ def test_parse_sorted_scalar_cursor(raw, expected):
     ],
 )
 def test_sort_scalar_round_trip(value):
-    from datasette.views.table import _encode_sort_value, _parse_next
+    from datasette.views.table import _decode_sort_value, _encode_sort_value
 
-    decoded, components = _parse_next(_encode_sort_value(value) + ",1", "score", None)
+    decoded = _decode_sort_value(_encode_sort_value(value))
     assert decoded == value
     assert type(decoded) is type(value)
     if isinstance(value, float):
         assert decoded.hex() == value.hex()
-    assert components == ["1"]
 
 
 @pytest.mark.parametrize(
@@ -263,7 +264,7 @@ async def test_sorted_blob_cursor_with_trace(tmp_path, path):
     ds = Datasette([db_path], settings={"trace_debug": True})
     try:
         first = (await ds.client.get("/pages/items.json?_size=1&_sort=score")).json()
-        assert first["next"] == "b:00,1"
+        assert first["next"] == "v2.0.score|b:00,1"
         response = await ds.client.get(
             path + "?_size=1&_sort=score&_trace=1&_next=" + first["next"]
         )
@@ -428,13 +429,20 @@ async def test_bar_on_first_page(pages_ds):
     # Fewer than 5 rows on the page, so no second bar below the table
     assert footer is None
     assert header.select_one("a.page-position-next")["href"] == (
-        f"http://localhost/pages/items?_size={PAGE_SIZE}&_next=4"
+        f"http://localhost/pages/items?_size={PAGE_SIZE}&_next=v2%7C4"
     )
 
 
 async def test_bar_on_later_page(pages_ds):
+    # Get a real cursor from the first page, then view the second page as HTML
+    first = await pages_ds.client.get(
+        f"/pages/items.json?_size={PAGE_SIZE}&score__gte=2&_sort=score"
+    )
+    next_token = first.json()["next"]
+    encoded_next = urllib.parse.quote(next_token, safe="")
     response = await pages_ds.client.get(
-        f"/pages/items?_size={PAGE_SIZE}&score__gte=2&_sort=score&_next=3,7"
+        f"/pages/items?_size={PAGE_SIZE}&score__gte=2&_sort=score&_next="
+        + encoded_next
     )
     soup, header, footer = bars(response.text)
     # The heading shows the count and the filter description
@@ -448,8 +456,8 @@ async def test_bar_on_later_page(pages_ds):
     assert header["data-page-rows"] == "4"
     assert header["data-total"] == "12"
     assert header["data-count-before-url"] == (
-        "/pages/items/-/count?_size=4&score__gte=2&_sort=score&_next=3,7"
-        "&_count=before"
+        "/pages/items/-/count?_size=4&score__gte=2&_sort=score"
+        f"&_next={encoded_next}&_count=before"
     )
     assert link_text(header) == ["Back to first page", "Next page"]
     assert footer is None
@@ -462,8 +470,12 @@ async def test_bar_on_later_page(pages_ds):
 @pytest.mark.parametrize(
     "query,expected",
     [
-        ("_next=8", "Continuing after id = 8"),
-        ("_sort=score&_next=$null,9", "Continuing after score = null"),
+        ("_next=v2%7C8", "Continuing after id = 8"),
+        (
+            "_sort=score&_next="
+            + urllib.parse.quote("v2.0.score|$null,9", safe=""),
+            "Continuing after score = null",
+        ),
     ],
 )
 async def test_bar_fallback_describes_cursor(pages_ds, query, expected):
@@ -477,7 +489,9 @@ async def test_bar_fallback_describes_cursor(pages_ds, query, expected):
 
 
 async def test_bar_on_last_page(pages_ds):
-    response = await pages_ds.client.get(f"/pages/items?_size={PAGE_SIZE}&_next=16")
+    response = await pages_ds.client.get(
+        f"/pages/items?_size={PAGE_SIZE}&_next=v2%7C16"
+    )
     _, header, footer = bars(response.text)
     assert link_text(header) == ["Back to first page"]
     assert footer is None
@@ -487,7 +501,7 @@ async def test_bar_on_last_page(pages_ds):
     "query,expected_links",
     [
         ("_size=5", ["Next page"]),
-        ("_size=5&_next=5", ["Back to first page", "Next page"]),
+        ("_size=5&_next=v2%7C5", ["Back to first page", "Next page"]),
     ],
 )
 async def test_footer_bar_on_pages_with_five_or_more_rows(
@@ -505,7 +519,9 @@ async def test_bar_keeps_truncated_count_in_heading(pages_ds):
     # When the count is truncated the heading keeps its "count all" button
     # and the bar does not claim a total
     pages_ds.get_database("pages").count_limit = 5
-    response = await pages_ds.client.get(f"/pages/items?_size={PAGE_SIZE}&_next=4")
+    response = await pages_ds.client.get(
+        f"/pages/items?_size={PAGE_SIZE}&_next=v2%7C4"
+    )
     soup, header, _ = bars(response.text)
     assert soup.select_one("button.count-all") is not None
     assert "data-total" not in header.attrs
@@ -520,10 +536,10 @@ async def test_bar_base_url(tmp_path):
         "insert into t values (1), (2), (3), (4), (5);"
     )
     try:
-        response = await ds.client.get("/pages/t?_size=2&_next=2")
+        response = await ds.client.get("/pages/t?_size=2&_next=v2%7C2")
         _, header, _ = bars(response.text)
         assert header["data-count-before-url"] == (
-            "/prefix/pages/t/-/count?_size=2&_next=2&_count=before"
+            "/prefix/pages/t/-/count?_size=2&_next=v2%7C2&_count=before"
         )
         assert header.select_one("a.page-position-first")["href"] == (
             "/prefix/pages/t?_size=2"
@@ -537,18 +553,18 @@ async def test_bar_base_url(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "pks,use_rowid,next_value",
+    "pks,use_rowid,cursor_values",
     [
-        (["pk1", "pk2"], False, "b,2"),
-        (["id"], False, "10"),
-        ([], True, "10"),
+        (["pk1", "pk2"], False, ["b", "2"]),
+        (["id"], False, ["10"]),
+        ([], True, ["10"]),
     ],
 )
-def test_count_before_uses_primary_key_index(pks, use_rowid, next_value):
+def test_count_before_uses_primary_key_index(pks, use_rowid, cursor_values):
     # The count of earlier rows should be an index range search, not a scan
     # of the whole table - so its cost grows with how far into the table the
     # page is rather than with the size of the table
-    from datasette.views.table import _at_or_before_next_where_clause
+    from datasette.views.table import _keyset_key_columns, _keyset_where_clause
 
     conn = sqlite3.connect(":memory:")
     if use_rowid:
@@ -560,8 +576,11 @@ def test_count_before_uses_primary_key_index(pks, use_rowid, next_value):
             )
         )
     params = {}
-    clause = _at_or_before_next_where_clause(
-        next_value, None, None, pks, use_rowid, params
+    clause = _keyset_where_clause(
+        _keyset_key_columns([], pks, use_rowid),
+        cursor_values,
+        params,
+        inclusive=True,
     )
     plan = " ".join(
         row[-1]
@@ -569,4 +588,198 @@ def test_count_before_uses_primary_key_index(pks, use_rowid, next_value):
             f"explain query plan select count(*) from t where {clause}", params
         )
     )
-    assert plan.startswith("SEARCH"), plan
+    assert "SEARCH" in plan and "SCAN" not in plan, plan
+
+
+def _multi_sort_ds():
+    # A large archive table: the site column and the timestamp column both
+    # repeat, and many timestamps are NULL - the case keyset pagination has to
+    # handle without skipping or repeating rows.
+    ds = Datasette(settings={"default_page_size": 3, "max_returned_rows": 1000})
+    db = ds.add_memory_database("archive")
+    return ds, db
+
+
+async def test_multi_column_sort_pagination_matches_snapshot():
+    ds, db = _multi_sort_ds()
+    await db.execute_write(
+        "create table events (id integer primary key, site text, ts text, note text)"
+    )
+    rows = [
+        ("b", None, "b-null-1"),
+        ("a", "2026-01-02", "a2"),
+        ("a", "2026-01-02", "a2-dup"),
+        ("a", "2026-01-01", "a1"),
+        ("a", None, "a-null"),
+        ("b", "2026-01-03", "b3"),
+        ("b", None, "b-null-2"),
+        ("c", "2026-01-01", "c1"),
+        ("a", "2026-01-02", "a2-dup2"),
+    ]
+    await db.execute_write_many(
+        "insert into events (site, ts, note) values (?, ?, ?)", rows
+    )
+    await ds.invoke_startup()
+    # The snapshot ordering: site ascending, then timestamp descending, with the
+    # primary key as the unique final tie-breaker
+    expected = [
+        row["note"]
+        for row in (
+            await db.execute(
+                "select note from events order by site asc, ts desc, id asc"
+            )
+        ).dicts()
+    ]
+    path = "/archive/events.json?_sort=site&_sort_desc=ts"
+    seen = []
+    tokens = []
+    while path:
+        response = await ds.client.get(path)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        seen.extend(row["note"] for row in data["rows"])
+        if data["next"] is None:
+            break
+        tokens.append(data["next"])
+        # The opaque token records the exact multi-column sort order
+        assert data["next"].startswith("v2.0.site.1.ts|")
+        path = data["next_url"].removeprefix("http://localhost")
+    ds.close()
+    # Re-reading from the first page with the tokens returns the snapshot order
+    assert seen == expected
+    assert sorted(seen) == sorted(note for _site, _ts, note in rows)
+    assert len(seen) == len(set(seen))
+    assert tokens
+
+
+@pytest.mark.parametrize(
+    "reuse_query",
+    [
+        "",  # token from a sorted request reused with no sort at all
+        "_sort_desc=score",
+        "_sort=name",
+        "_sort=score&_sort=id",
+    ],
+)
+async def test_next_token_rejected_when_sort_order_changes(pages_ds, reuse_query):
+    first = await pages_ds.client.get(
+        "/pages/items.json?_size=2&_sort=score"
+    )
+    token = first.json()["next"]
+    assert token.startswith("v2.0.score|")
+    # Reusing it under the same sort order still works
+    ok = await pages_ds.client.get(
+        "/pages/items.json?_size=2&_sort=score"
+        + "&_next="
+        + urllib.parse.quote(token, safe="")
+    )
+    assert ok.status_code == 200
+    # Under any other sort order it is rejected with a restart-from-page-one hint
+    mismatch = await pages_ds.client.get(
+        "/pages/items.json?_size=2&"
+        + reuse_query
+        + ("&" if reuse_query else "")
+        + "_next="
+        + urllib.parse.quote(token, safe="")
+    )
+    assert mismatch.status_code == 400
+    message = mismatch.json()["error"]
+    assert message == (
+        "_next token was created with a different sort order - remove it "
+        "and start again from the first page"
+    )
+    # The HTML interface surfaces the same 400 rather than silently mis-paging
+    html_mismatch = await pages_ds.client.get(
+        "/pages/items?_size=2&"
+        + reuse_query
+        + ("&" if reuse_query else "")
+        + "_next="
+        + urllib.parse.quote(token, safe="")
+    )
+    assert html_mismatch.status_code == 400
+
+
+def test_cursor_encodes_and_validates_sort_spec():
+    from datasette.views.table import (
+        _decode_next,
+        _encode_next,
+        _validate_cursor_sort,
+    )
+
+    sort_columns = [("site", False), ("ts", True)]
+    token = _encode_next(sort_columns, ["a", None], [7])
+    # Primary key components are tilde-encoded text (the sort values keep
+    # their stored type, so the NULL timestamp is encoded as $null)
+    assert token == "v2.0.site.1.ts|a,$null,7"
+    cursor_sort_columns, values = _decode_next(token)
+    assert cursor_sort_columns == sort_columns
+    assert values == ["a", None, "7"]
+    # Exact same order is accepted
+    _validate_cursor_sort(cursor_sort_columns, sort_columns)
+    # A different direction, column or missing level is rejected
+    for other in [
+        [("site", False), ("ts", False)],
+        [("site", False)],
+        [("site", False), ("created", True)],
+        [("ts", True), ("site", False)],
+    ]:
+        with pytest.raises(BadRequest):
+            _validate_cursor_sort(cursor_sort_columns, other)
+
+
+async def test_multi_column_sort_human_description():
+    ds, db = _multi_sort_ds()
+    await db.execute_write(
+        "create table events (id integer primary key, site text, ts text)"
+    )
+    await db.execute_write_many(
+        "insert into events (site, ts) values (?, ?)",
+        [("a", "2026-01-01"), ("a", None), ("b", "2026-01-02")],
+    )
+    await ds.invoke_startup()
+    response = await ds.client.get(
+        "/archive/events.json?_sort=site&_sort_desc=ts"
+        "&_extra=human_description_en&_size=2"
+    )
+    assert response.status_code == 200
+    assert (
+        response.json()["human_description_en"]
+        == "sorted by site, then ts descending"
+    )
+    ds.close()
+
+
+async def test_sorting_by_same_column_twice_is_rejected(pages_ds):
+    response = await pages_ds.client.get(
+        "/pages/items.json?_sort=score&_sort_desc=score"
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == (
+        "Cannot sort by the same column more than once: score"
+    )
+
+
+async def test_interleaved_sort_arguments_keep_their_query_string_order():
+    # Grouping all _sort values before _sort_desc would lose the order of
+    # interleaved arguments; the cursor must record the actual order requested.
+    from datasette.views.table import _decode_next
+
+    ds, db = _multi_sort_ds()
+    await db.execute_write(
+        'create table t (id integer primary key, "a.b" text, "x-y" text, "col name" text)'
+    )
+    await db.execute_write_many(
+        'insert into t ("a.b", "x-y", "col name") values (?, ?, ?)',
+        [("1", "a", "p"), ("1", "a", "p"), ("2", "b", "q"), (None, "c", None)],
+    )
+    await ds.invoke_startup()
+    path = "/archive/t.json?_sort=a.b&_sort_desc=x-y&_sort=col+name"
+    response = await ds.client.get(path)
+    assert response.status_code == 200
+    cursor_sort_columns, _ = _decode_next(response.json()["next"])
+    assert cursor_sort_columns == [
+        ("a.b", False),
+        ("x-y", True),
+        ("col name", False),
+    ]
+    ds.close()

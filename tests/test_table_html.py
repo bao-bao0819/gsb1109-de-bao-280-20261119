@@ -584,7 +584,9 @@ async def test_facets_persist_through_filter_form(ds_client):
 
 
 async def test_next_does_not_persist_in_hidden_field(ds_client):
-    response = await ds_client.get("/fixtures/searchable?_size=1&_next=1")
+    response = await ds_client.get(
+        "/fixtures/searchable?_size=1&_next=v2%7C1"
+    )
     assert response.status_code == 200
     inputs = Soup(response.text, "html.parser").find("form").find_all("input")
     hiddens = [i for i in inputs if i["type"] == "hidden"]
@@ -2064,7 +2066,7 @@ async def test_table_page_column_statistics_filter(ds_client):
     # Column statistics use the table's current filters. Pagination from
     # ?_next= is not part of the filter and numeric parameters keep their type.
     response = await ds_client.get(
-        "/fixtures/facetable?planet_int__gt=0&state=CA&_where=pk+<+10&_next=2"
+        "/fixtures/facetable?planet_int__gt=0&state=CA&_where=pk+<+10&_next=v2%7C2"
     )
     assert response.status_code == 200
     table_data = table_data_from_soup(Soup(response.text, "html.parser"))
@@ -2585,7 +2587,7 @@ async def test_row_export_dialog_scope(ds_client, path, expected_scope):
             "/fixtures/facetable?_sort=pk&_facet=state",
         ),
         (
-            "/fixtures/facetable?state=CA&_next=5&_where=_city_id%3D1",
+            "/fixtures/facetable?state=CA&_next=v2%7C5&_where=_city_id%3D1",
             "/fixtures/facetable?_where=_city_id%3D1",
         ),
     ],
@@ -2713,7 +2715,7 @@ async def test_custom_table_include():
         ("?_sort_desc=bad", "Cannot sort table by bad"),
         (
             "?_sort=state&_sort_desc=state",
-            "Cannot use _sort and _sort_desc at the same time",
+            "Cannot sort by the same column more than once: state",
         ),
     ),
 )
@@ -2898,7 +2900,9 @@ async def test_facet_total():
 
 async def test_sort_rowid_with_next(ds_client):
     # https://github.com/simonw/datasette/issues/1470
-    response = await ds_client.get("/fixtures/binary_data?_size=1&_next=1&_sort=rowid")
+    response = await ds_client.get(
+        "/fixtures/binary_data?_size=1&_next=v2.0.rowid%7C1%2C1&_sort=rowid"
+    )
     assert response.status_code == 200
 
 

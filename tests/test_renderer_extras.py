@@ -70,8 +70,8 @@ async def test_table_renderer_receives_declared_extras(ds, db):
     assert response.json() == {
         "page": {
             # Tables always include these two
-            "next": "1",
-            "next_url": "http://localhost/data/dogs.declared?age__gt=3&_size=1&_next=1",
+            "next": "v2|1",
+            "next_url": "http://localhost/data/dogs.declared?age__gt=3&_size=1&_next=v2%7C1",
             # The count is of every matching row, not just this page
             "count": 2,
             "count_truncated": False,

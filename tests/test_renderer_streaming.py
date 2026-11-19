@@ -110,7 +110,7 @@ async def test_row_stream_is_the_current_page_by_default(ds):
     assert response.headers["content-type"] == "application/x-ndjson"
     assert _ids(response) == list(range(1, 11))
     # There is a next page
-    assert "_next=10" in response.headers["link"]
+    assert "_next=v2%7C10" in response.headers["link"]
 
 
 @pytest.mark.parametrize("table", ("numbers", "numbers_view"))
@@ -234,7 +234,7 @@ async def test_error_fetching_a_later_page_aborts_the_response(ds, monkeypatch):
     monkeypatch.setattr(table, "table_view_data", broken_on_third_page)
     with pytest.raises(ValueError, match="database went away"):
         await ds.client.get("/data/numbers.csv?_stream=1&_size=10")
-    assert calls == [None, "10", "20"]
+    assert calls == [None, "v2|10", "v2|20"]
 
 
 @pytest.mark.parametrize(
@@ -325,7 +325,7 @@ async def test_export_dialog_groups_formats_that_can_stream(ds):
     from bs4 import BeautifulSoup
 
     # A later page, so "Include all rows" is offered for this small table
-    response = await ds.client.get("/data/numbers?_next=10")
+    response = await ds.client.get("/data/numbers?_next=v2%7C10")
     dialog = BeautifulSoup(response.text, "html.parser").select_one("#export-dialog")
     form = dialog.select_one("form.export-csv-form")
     # Formats that accept row_stream share the form with TSV and CSV, so
@@ -380,7 +380,7 @@ async def test_export_dialog_binary_format_that_can_stream(ds):
     try:
         binary_ds = _make_datasette()
         await _add_numbers(binary_ds)
-        response = await binary_ds.client.get("/data/numbers?_next=10")
+        response = await binary_ds.client.get("/data/numbers?_next=v2%7C10")
         binary_ds.close()
     finally:
         pm.unregister(name="binary_renderer")

@@ -341,6 +341,24 @@ class TestSelectGroupBy(QueryParserTestBase):
                                 ast.Column('x')]),
                             ast.Constant(0)))))
 
+    def test_having_without_groupby(self):
+        self.assertParse(
+            "SELECT count(*) HAVING count(*) = 0;",
+            Select([ast.Target(ast.Function('count', [ast.Asterisk()]), None)],
+                   having=ast.Equal(
+                       ast.Function('count', [ast.Asterisk()]),
+                       ast.Constant(0))))
+
+    def test_having_after_groupby(self):
+        self.assertParse(
+            "SELECT count(x) GROUP BY a HAVING sum(x) = 0 ORDER BY a;",
+            Select([ast.Target(ast.Function('count', [ast.Column('x')]), None)],
+                   group_by=ast.GroupBy([ast.Column('a')],
+                       ast.Equal(
+                           ast.Function('sum', [ast.Column('x')]),
+                           ast.Constant(0))),
+                   order_by=[ast.OrderBy(ast.Column('a'), ast.Ordering.ASC)]))
+
     def test_groupby_numbers(self):
         self.assertParse(
             "SELECT * GROUP BY 1;",

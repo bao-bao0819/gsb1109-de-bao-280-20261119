@@ -469,6 +469,25 @@ class TestCompileSelectGroupBy(CompileSelectBase):
         """)
         self.assertEqual([0, 1, 2], query.group_indexes)
 
+    def test_compile_having_without_group_by(self):
+        query = self.compile("""
+          SELECT count(*) HAVING count(*) = 0;
+        """)
+        self.assertEqual([], query.group_indexes)
+        self.assertIsNotNone(query.having_index)
+
+    def test_compile_having_without_group_by_implicit(self):
+        query = self.compile("""
+          SELECT payee, count(*) HAVING count(*) = 0;
+        """)
+        self.assertEqual([0], query.group_indexes)
+        self.assertIsNotNone(query.having_index)
+
+    def test_compile_having_non_aggregate_no_group_by(self):
+        with self.assertRaises(CompilationError) as assertion:
+            self.compile("SELECT count(*) HAVING flag;")
+        self.assertRegex(str(assertion.exception), 'the HAVING clause must be an aggregate')
+
     def test_compile_group_by_reconcile(self):
         # Check that no invisible column is created if redundant.
         query = self.compile("""

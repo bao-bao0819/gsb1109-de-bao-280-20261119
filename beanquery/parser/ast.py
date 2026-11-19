@@ -66,9 +66,17 @@ class Node:
 def node(name, fields):
     """Manufacture an AST node class."""
 
+    dataclass_fields = []
+    for field in fields.split():
+        if field.endswith('?'):
+            dataclass_fields.append((field.rstrip('?'), type(None), dataclasses.field(default=None)))
+        else:
+            dataclass_fields.append(field)
+    dataclass_fields.append(('parseinfo', type(None), dataclasses.field(default=None, compare=False, repr=False)))
+
     return dataclasses.make_dataclass(
         name,
-        [*fields.split(), ('parseinfo', None, dataclasses.field(default=None, compare=False, repr=False))],
+        dataclass_fields,
         bases=(Node,),
         **({'slots': True} if sys.version_info[:2] >= (3, 10) else {}))
 
@@ -81,11 +89,12 @@ def node(name, fields):
 #   from_clause: An instance of 'From', or None if absent.
 #   where_clause: A root expression node, or None if absent.
 #   group_by: An instance of 'GroupBy', or None if absent.
+#   having: An expression tree for the global HAVING clause, or None if absent.
 #   order_by: An instance of 'OrderBy', or None if absent.
 #   pivot_by: An instance of 'PivotBy', or None if absent.
 #   limit: An integer, or None is absent.
 #   distinct: A boolean value (True), or None if absent.
-Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct')
+Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct having?')
 
 # A select query that produces final balances for accounts.
 # This is equivalent to

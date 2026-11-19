@@ -177,6 +177,11 @@ class BQLParser(Parser):
             self.name_last_node('group_by')
             self._define(['group_by'], [])
         with self._optional():
+            self._token('HAVING')
+            self._expression_()
+            self.name_last_node('having')
+            self._define(['having'], [])
+        with self._optional():
             self._token('ORDER')
             self._token('BY')
 
@@ -199,7 +204,7 @@ class BQLParser(Parser):
             self._integer_()
             self.name_last_node('limit')
             self._define(['limit'], [])
-        self._define(['distinct', 'from_clause', 'group_by', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
+        self._define(['distinct', 'from_clause', 'group_by', 'having', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
 
     @tatsumasu()
     def _subselect_(self):

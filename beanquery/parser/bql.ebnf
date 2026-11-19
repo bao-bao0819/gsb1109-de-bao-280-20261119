@@ -28,6 +28,7 @@ select::Select
       ['FROM' from_clause:(_table | subselect | from)]
       ['WHERE' where_clause:expression]
       ['GROUP' 'BY' group_by:groupby]
+      ['HAVING' having:expression]
       ['ORDER' 'BY' order_by:','.{order}+]
       ['PIVOT' 'BY' pivot_by:pivotby]
       ['LIMIT' limit:integer]

@@ -192,6 +192,15 @@ def execute_select(query):
                 for c_expr in c_aggregate_exprs:
                     c_expr.update(store, context)
 
+        # An aggregate query without a GROUP-BY clause always returns a single
+        # row, even when no input row matched. Create an empty aggregation
+        # store for it: aggregations initialized to their identity value
+        # (count() to zero, sum() to NULL) are finalized and returned.
+        # Conversely, a grouped query returns no row when no input matched,
+        # since there is no group to report.
+        if not aggregates and not group_indexes:
+            aggregates[()] = create()
+
         # Iterate over all the aggregations.
         for key, store in aggregates.items():
             key_iter = iter(key)

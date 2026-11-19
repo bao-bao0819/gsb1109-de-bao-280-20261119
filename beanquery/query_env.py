@@ -788,19 +788,33 @@ class SumInt(query_compile.EvalAggregator):
     def __init__(self, context, operands):
         super().__init__(context, operands, operands[0].dtype)
 
+    def initialize(self, store):
+        # The sum of no values, or of only NULL values, is NULL.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle] += value
+            if store[self.handle] is None:
+                store[self.handle] = value
+            else:
+                store[self.handle] += value
 
 
 @aggregator([Decimal], name='sum')
 class SumDecimal(query_compile.EvalAggregator):
     """Calculate the sum of the numerical argument."""
+    def initialize(self, store):
+        # The sum of no values, or of only NULL values, is NULL.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle] += value
+            if store[self.handle] is None:
+                store[self.handle] = value
+            else:
+                store[self.handle] += value
 
 
 @aggregator([amount.Amount], name='sum')

@@ -123,6 +123,21 @@ class Compiler:
         new_targets, group_indexes, having_index = self._compile_group_by(node.group_by, c_targets)
         c_targets.extend(new_targets)
 
+        # Process a top-level HAVING clause. This is only allowed for
+        # aggregate queries and, when no GROUP-BY clause is present, it
+        # applies to the single row produced by the global aggregation.
+        if node.having is not None:
+            if having_index is not None:
+                raise CompilationError('the HAVING clause can only be specified once')
+            c_expr = self._compile(node.having)
+            if not is_aggregate(c_expr):
+                raise CompilationError('the HAVING clause must be an aggregate expression')
+            having_index = len(c_targets)
+            c_targets.append(EvalTarget(c_expr, None, True))
+            if group_indexes is None:
+                group_indexes = [index for index, c_target in enumerate(c_targets)
+                                 if not c_target.is_aggregate]
+
         # Process the ORDER-BY clause.
         new_targets, order_spec = self._compile_order_by(node.order_by, c_targets)
         c_targets.extend(new_targets)

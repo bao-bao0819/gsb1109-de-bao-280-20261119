@@ -1113,6 +1113,146 @@ class TestExecuteAggregatedQuery(QueryBase):
             ])
 
 
+class TestExecuteEmptyAggregatedQuery(QueryBase):
+
+    INPUT = """
+
+      2010-01-01 open Assets:Bank:Checking
+      2010-01-01 open Expenses:Restaurant
+
+      2010-02-23 * "Bla"
+        Assets:Bank:Checking       100.00 USD
+        Expenses:Restaurant       -100.00 USD
+
+    """
+
+    NO_ROWS = "WHERE account = 'NoSuchAccount'"
+
+    def test_global_aggregates_no_rows(self):
+        # A global aggregation (no GROUP-BY) always returns a single row.
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT count(*), count(account), sum(number), sum(1)
+            {self.NO_ROWS};
+            """,
+            [
+                ('count(*)', int),
+                ('count(account)', int),
+                ('sum(number)', Decimal),
+                ('sum(1)', int),
+            ],
+            [
+                (0, 0, None, None),
+            ])
+
+    def test_global_aggregates_no_rows_inventory(self):
+        # The sum of an inventory over no rows is an empty inventory.
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT sum(position) {self.NO_ROWS};
+            """,
+            [
+                ('sum(position)', inventory.Inventory),
+            ],
+            [
+                (inventory.from_string(''),),
+            ])
+
+    def test_grouped_aggregates_no_rows(self):
+        # A grouped aggregation returns no row when there are no input rows:
+        # there is no group to report.
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT account, count(*), sum(number)
+            {self.NO_ROWS}
+            GROUP BY account;
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+                ('sum(number)', Decimal),
+            ],
+            [])
+
+    def test_global_having_no_rows(self):
+        # The global summary row is filtered according to its aggregate values.
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT count(*), sum(number)
+            {self.NO_ROWS}
+            HAVING count(*) > 0;
+            """,
+            [
+                ('count(*)', int),
+                ('sum(number)', Decimal),
+            ],
+            [])
+
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT count(*), sum(number)
+            {self.NO_ROWS}
+            HAVING count(*) = 0 AND sum(number) IS NULL;
+            """,
+            [
+                ('count(*)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                (0, None),
+            ])
+
+    def test_global_having_with_rows(self):
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT count(*), sum(number)
+            HAVING sum(number) = 0;
+            """,
+            [
+                ('count(*)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                (2, D('0.00')),
+            ])
+
+    def test_grouped_having_no_rows(self):
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT account, count(*)
+            {self.NO_ROWS}
+            GROUP BY account
+            HAVING count(*) > 0;
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+            ],
+            [])
+
+    def test_global_having_implicit_group_by(self):
+        # A non-aggregate target without GROUP-BY makes the query grouped.
+        self.check_query(
+            self.INPUT,
+            f"""
+            SELECT account, count(*)
+            {self.NO_ROWS}
+            HAVING count(*) = 0;
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+            ],
+            [])
+
+
 class TestExecuteOptions(QueryBase):
 
     INPUT = """

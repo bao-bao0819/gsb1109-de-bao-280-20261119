@@ -613,7 +613,10 @@ EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 #     group by. All the targets referenced here should be non-aggregates. In fact,
 #     this list of indexes should always cover all non-aggregates in 'c_targets'.
 #     And this list may well include some invisible columns if only specified in
-#     the GROUP BY clause.
+#     the GROUP BY clause. An empty list identifies a global aggregation that
+#     always produces a single summary row.
+#   having_index: The index of an invisible target holding the HAVING clause
+#     expression, or None if there is no HAVING clause.
 #   order_spec: A list of (integer indexes, sort order) tuples.
 #     This list may refer to either aggregates or non-aggregates.
 #   limit: An optional integer used to cut off the number of result rows returned.

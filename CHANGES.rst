@@ -1,6 +1,14 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- Aggregate queries without a ``GROUP BY`` clause now return a single
+  summary row even when no input row matches the query.  ``count()``
+  returns zero and ``sum()`` returns ``NULL`` when there are no
+  non-``NULL`` values to add (an empty inventory for inventory
+  arguments).  Grouped queries keep returning no row in this case.  A
+  ``HAVING`` clause can now be used without a ``GROUP BY`` clause and
+  is evaluated against the summary row.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

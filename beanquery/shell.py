@@ -629,8 +629,10 @@ class BQLShell(DispatchingShell):
         template = textwrap.dedent("""
 
           The list of comma-separated target expressions may consist of columns,
-          simple functions and aggregate functions. If you use any aggregate
-          function, you must also provide a GROUP-BY clause.
+          simple functions and aggregate functions. Aggregate queries may
+          optionally use a GROUP-BY clause and a HAVING clause to filter the
+          aggregated rows. Without GROUP-BY, aggregates produce a single
+          summary row, also when no input row matches the query.
 
           Columns
           -------

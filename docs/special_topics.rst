@@ -4,6 +4,50 @@ Special Topics
 Solutions to specific problems are documented here.
 
 
+Checking Compatibility Between Two Releases
+--------------------------------------------
+
+Before releasing a new API version, compare the previous and new OpenAPI
+documents to find changes that could break already-deployed clients:
+
+.. code-block:: python
+
+    from apispec import compare_specs
+
+    report = compare_specs("v1.yaml", "v2.yaml")
+
+    print(report.compatible)  # False if a breaking change was found
+    for change in report.breaking_changes:
+        print(change.operation, change.property, change.kind)
+
+The report detects:
+
+- required request properties added to an operation, including properties that
+  became required;
+- optional response properties added to an operation;
+- request enums that were narrowed (values removed or an enum constraint added);
+- response enums that were narrowed, reported as informational.
+
+Schemas are resolved before they are compared. Renaming a component while
+updating all of its references is therefore not reported as a breaking change.
+
+Each change exposes ``operation``, ``method``, ``path``, ``location``,
+``property``, ``kind``, ``breaking``, and ``message``. ``property`` is a path
+such as ``body.priority``, ``query.region``, ``200.body.eta``, or
+``body.tags[]``.
+
+The checker is also available as a command:
+
+.. code-block:: shell
+
+    python -m apispec.compat old.yaml new.yaml
+    python -m apispec.compat old.yaml new.yaml --json
+    python -m apispec.compat old.yaml new.yaml --breaking-only
+
+The command exits with status ``1`` when breaking changes are found. Pass
+``--no-fail`` to always exit with status ``0``.
+
+
 Adding Additional Fields To Schema Objects
 ------------------------------------------
 

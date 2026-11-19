@@ -1,11 +1,40 @@
 """Contains main apispec classes: `APISpec` and `BasePlugin`"""
 
+from __future__ import annotations
+
 import typing
 
 from .core import APISpec
 from .plugin import BasePlugin
 
-__all__ = ["APISpec", "BasePlugin"]
+if typing.TYPE_CHECKING:
+    from .compat import (
+        CompatibilityIssue,
+        CompatibilityReport,
+        compare_specs,
+        find_breaking_changes,
+        is_compatible,
+    )
+
+__all__ = [
+    "APISpec",
+    "BasePlugin",
+    "CompatibilityIssue",
+    "CompatibilityReport",
+    "compare_specs",
+    "find_breaking_changes",
+    "is_compatible",
+]
+
+_COMPAT_NAMES = frozenset(
+    {
+        "CompatibilityIssue",
+        "CompatibilityReport",
+        "compare_specs",
+        "find_breaking_changes",
+        "is_compatible",
+    }
+)
 
 
 def __getattr__(name: str) -> typing.Any:
@@ -21,5 +50,10 @@ def __getattr__(name: str) -> typing.Any:
             stacklevel=2,
         )
         return importlib.metadata.version("apispec")
+
+    if name in _COMPAT_NAMES:
+        from . import compat
+
+        return getattr(compat, name)
 
     raise AttributeError(name)

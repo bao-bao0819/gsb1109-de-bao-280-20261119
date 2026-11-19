@@ -95,6 +95,15 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR("Import errors!"))
             for error in result.base_errors:
                 self.stderr.write(repr(error.error), self.style.ERROR)
+            for batch_error in result.batch_errors:
+                self.stderr.write(
+                    self.style.ERROR(
+                        f"Bulk {batch_error.operation} failed for input rows "
+                        f"{batch_error.row_start} to {batch_error.row_end} "
+                        f"(object ids: {', '.join(map(str, batch_error.object_ids))})"
+                        f" - {repr(batch_error.error)}"
+                    )
+                )
             for line, errors in result.row_errors():
                 for error in errors:
                     self.stderr.write(

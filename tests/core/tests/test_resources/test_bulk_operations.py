@@ -1,12 +1,13 @@
 from unittest import mock
 
 import tablib
-from core.models import Book, UUIDBook
+from core.models import Book, Category, UUIDBook
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
 from import_export import exceptions, fields, resources, widgets
 from import_export.instance_loaders import ModelInstanceLoader
+from import_export.results import BatchError
 
 
 class BulkTest(TestCase):
@@ -669,3 +670,248 @@ class BulkUUIDBookDeleteTest(BulkTest):
         self.assertEqual(10, UUIDBook.objects.count())
         self.resource.import_data(self.dataset)
         self.assertEqual(0, UUIDBook.objects.count())
+
+
+class NoTransactionCategoryResource(resources.ModelResource):
+    """A bulk resource which forces commits without an outer transaction,
+    so that a failed batch is genuinely not persisted while other batches
+    are (the large-scale bulk import scenario)."""
+
+    class Meta:
+        model = Category
+        use_bulk = True
+        batch_size = 5
+
+    def import_data(
+        self,
+        dataset,
+        dry_run=False,
+        raise_errors=False,
+        use_transactions=None,
+        collect_failed_rows=False,
+        **kwargs,
+    ):
+        return self.import_data_inner(
+            dataset,
+            dry_run,
+            raise_errors,
+            False,
+            collect_failed_rows,
+            **kwargs,
+        )
+
+
+class BatchErrorReceiptTest(TransactionTestCase):
+    def setUp(self):
+        # Category.name has a unique constraint, providing a real database
+        # constraint violation at the point bulk_create() is executed.
+        self.occupied = Category.objects.create(id=100, name="device-100")
+        # the first batch (rows 1-5) succeeds; the second batch (rows 6-10)
+        # contains a duplicate name and therefore fails as a whole
+        self.rows = [
+            (1, "name-1"),
+            (2, "name-2"),
+            (3, "name-3"),
+            (4, "name-4"),
+            (5, "name-5"),
+            (6, "name-6"),
+            (7, "name-7"),
+            (8, "name-8"),
+            (9, "name-9"),
+            (10, "device-100"),
+        ]
+        self.dataset = tablib.Dataset(*self.rows, headers=["id", "name"])
+
+    def test_failed_batch_receipt_identifies_rows_and_object_ids(self):
+        resource = NoTransactionCategoryResource()
+
+        result = resource.import_data(self.dataset, raise_errors=False)
+
+        self.assertTrue(result.has_errors())
+        self.assertEqual(1, len(result.batch_errors))
+        batch_error = result.batch_errors[0]
+        self.assertEqual("create", batch_error.operation)
+        self.assertEqual(6, batch_error.row_start)
+        self.assertEqual(10, batch_error.row_end)
+        self.assertEqual([6, 7, 8, 9, 10], batch_error.row_numbers)
+        # the supplied device numbers are echoed back so the input can be
+        # identified and resubmitted
+        self.assertEqual([6, 7, 8, 9, 10], batch_error.object_ids)
+
+    def test_successful_batch_is_persisted_and_failed_batch_is_not(self):
+        resource = NoTransactionCategoryResource()
+
+        result = resource.import_data(self.dataset, raise_errors=False)
+
+        # only the first batch plus the pre-existing row are present
+        self.assertEqual(6, Category.objects.count())
+        self.assertTrue(Category.objects.filter(id=5).exists())
+        self.assertFalse(Category.objects.filter(id=6).exists())
+        self.assertFalse(Category.objects.filter(id=10).exists())
+        # failed rows must not be reported as successfully imported
+        self.assertEqual(5, result.totals["new"])
+        self.assertEqual(5, result.totals["error"])
+        failed_numbers = {r.row_number for r in result.rows if r.batch_failed}
+        self.assertEqual({6, 7, 8, 9, 10}, failed_numbers)
+        self.assertTrue(all(not r.batch_failed for r in result.rows[:5]))
+        self.assertEqual(5, len(result.valid_rows()))
+
+    def test_failed_rows_can_be_resubmitted_from_the_receipt(self):
+        resource = NoTransactionCategoryResource()
+        result = resource.import_data(self.dataset, raise_errors=False)
+        batch_error = result.batch_errors[0]
+
+        # rebuild the failed input from the row range / device numbers carried
+        # in the receipt, correcting the offending value
+        rows_by_id = {row[0]: row for row in self.rows}
+        resubmit_rows = []
+        for object_id in batch_error.object_ids:
+            original = rows_by_id[object_id]
+            if object_id == 10:
+                resubmit_rows.append((original[0], "name-10"))
+            else:
+                resubmit_rows.append(original)
+        resubmit_dataset = tablib.Dataset(*resubmit_rows, headers=["id", "name"])
+
+        retry_result = NoTransactionCategoryResource().import_data(
+            resubmit_dataset, raise_errors=False
+        )
+
+        self.assertFalse(retry_result.has_errors())
+        self.assertEqual([], retry_result.batch_errors)
+        self.assertEqual(11, Category.objects.count())
+        self.assertEqual(5, retry_result.totals["new"])
+        self.assertTrue(Category.objects.filter(id=10, name="name-10").exists())
+
+    def test_all_batches_successful_reports_no_errors(self):
+        dataset = tablib.Dataset(
+            *[(i, f"ok-{i}") for i in range(1, 11)], headers=["id", "name"]
+        )
+
+        result = NoTransactionCategoryResource().import_data(
+            dataset, raise_errors=False
+        )
+
+        self.assertFalse(result.has_errors())
+        self.assertEqual([], result.batch_errors)
+        self.assertEqual(10, result.totals["new"])
+        self.assertEqual(0, result.totals["error"])
+        self.assertTrue(all(not r.batch_failed for r in result.rows))
+        self.assertEqual(11, Category.objects.count())
+
+
+class BatchErrorMockTest(TestCase):
+    @mock.patch("core.models.Category.objects.bulk_create")
+    def test_batch_error_is_raised_when_raise_errors_is_true(self, mock_bulk_create):
+        mock_bulk_create.side_effect = ValidationError("invalid field")
+        resource = NoTransactionCategoryResource()
+        dataset = tablib.Dataset(
+            *[(i, f"name-{i}") for i in range(1, 6)], headers=["id", "name"]
+        )
+
+        with self.assertRaises(exceptions.ImportError):
+            resource.import_data(dataset, raise_errors=True)
+
+    @mock.patch("core.models.Category.objects.bulk_create")
+    def test_batch_error_is_gathered_on_dry_run(self, mock_bulk_create):
+        mock_bulk_create.side_effect = ValidationError("invalid field")
+
+        class _CategoryResource(resources.ModelResource):
+            class Meta:
+                model = Category
+                use_bulk = True
+                batch_size = 5
+
+        dataset = tablib.Dataset(
+            *[(i, f"name-{i}") for i in range(1, 6)], headers=["id", "name"]
+        )
+        result = _CategoryResource().import_data(
+            dataset, dry_run=True, raise_errors=False
+        )
+
+        self.assertTrue(result.has_errors())
+        self.assertEqual(1, len(result.batch_errors))
+        self.assertEqual("create", result.batch_errors[0].operation)
+        self.assertEqual([1, 2, 3, 4, 5], result.batch_errors[0].row_numbers)
+
+    def test_update_batch_failure_reports_existing_object_ids(self):
+        books = [Book.objects.create(name=f"book-{i}") for i in range(5)]
+        dataset = tablib.Dataset(
+            *[(b.id, "UPDATED") for b in books], headers=["id", "name"]
+        )
+
+        class _BookResource(resources.ModelResource):
+            class Meta:
+                model = Book
+                use_bulk = True
+                batch_size = 5
+                fields = ("id", "name")
+                import_id_fields = ("id",)
+
+        with mock.patch("core.models.Book.objects.bulk_update") as mock_bulk_update:
+            mock_bulk_update.side_effect = ValidationError("invalid field")
+            result = _BookResource().import_data(dataset, raise_errors=False)
+
+        self.assertTrue(result.has_errors())
+        batch_error = result.batch_errors[0]
+        self.assertEqual("update", batch_error.operation)
+        self.assertEqual(1, batch_error.row_start)
+        self.assertEqual(5, batch_error.row_end)
+        self.assertEqual([b.id for b in books], batch_error.object_ids)
+        self.assertEqual(5, result.totals["error"])
+
+    def test_delete_batch_failure_reports_operation_and_row_range(self):
+        books = [Book.objects.create(name=f"book-{i}") for i in range(5)]
+        dataset = tablib.Dataset(
+            *[(b.id, b.name) for b in books], headers=["id", "name"]
+        )
+
+        class _DeleteResource(resources.ModelResource):
+            def for_delete(self, row, instance):
+                return True
+
+            class Meta:
+                model = Book
+                use_bulk = True
+                batch_size = 5
+                skip_diff = True
+
+        with mock.patch("core.models.Book.objects.filter") as mock_filter:
+            mock_filter.return_value.delete.side_effect = Exception("delete failed")
+            result = _DeleteResource().import_data(dataset, raise_errors=False)
+
+        self.assertTrue(result.has_errors())
+        batch_error = result.batch_errors[0]
+        self.assertEqual("delete", batch_error.operation)
+        self.assertEqual(1, batch_error.row_start)
+        self.assertEqual(5, batch_error.row_end)
+        self.assertEqual([b.id for b in books], batch_error.object_ids)
+        self.assertEqual(5, result.totals["error"])
+
+
+class BatchErrorTest(TestCase):
+    def test_repr_includes_operation_rows_and_ids(self):
+        error = BatchError(
+            error=ValidationError("boom"),
+            row_start=11,
+            row_end=20,
+            object_ids=[11, 12],
+            operation="create",
+        )
+
+        text = repr(error)
+        self.assertIn("create", text)
+        self.assertIn("11-20", text)
+        self.assertIn("[11, 12]", text)
+
+    def test_row_numbers_defaults_to_inclusive_range(self):
+        error = BatchError(
+            error=ValidationError("boom"),
+            row_start=2,
+            row_end=4,
+            object_ids=[],
+            operation="update",
+        )
+
+        self.assertEqual([2, 3, 4], error.row_numbers)
+        self.assertEqual(2, error.number)

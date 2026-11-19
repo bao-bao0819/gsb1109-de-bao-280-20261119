@@ -5,6 +5,7 @@ from unittest import mock
 from unittest.mock import patch
 
 from core.models import Book
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
@@ -29,6 +30,13 @@ class BookResourceWithError(ModelResource):
 
     class Meta:
         model = Book
+
+
+class BulkBookResource(ModelResource):
+    class Meta:
+        model = Book
+        use_bulk = True
+        batch_size = 1
 
 
 class ImportCommandTest(TestCase):
@@ -154,6 +162,27 @@ class ImportCommandTest(TestCase):
 
             assert "Import base errors" in self.err.getvalue()
             self.assertEqual(Book.objects.count(), 0)
+
+    def test_import_command_reports_failed_batch(self):
+        with mock.patch("core.models.Book.objects.bulk_create") as mock_bulk_create:
+            mock_bulk_create.side_effect = ValidationError("invalid field")
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".csv") as tmp_csv:
+                tmp_csv.write(CSV_CONTENT)
+                tmp_csv.seek(0)
+                with self.assertRaises(SystemExit):
+                    call_command(
+                        "import",
+                        "core.tests.test_command_import.BulkBookResource",
+                        tmp_csv.name,
+                        stdout=self.out,
+                        stderr=self.err,
+                        interactive=False,
+                    )
+
+        output = self.err.getvalue()
+        self.assertIn("Import errors!", output)
+        self.assertIn("Bulk create failed for input rows 1 to 1", output)
+        self.assertEqual(Book.objects.count(), 0)
 
     def test_import_command_interactive(self):
         with mock.patch("builtins.input", side_effect=lambda msg: "no"):

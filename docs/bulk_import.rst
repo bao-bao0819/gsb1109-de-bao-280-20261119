@@ -28,8 +28,17 @@ Caveats
   then that batch will fail.  It's also possible that transactions can be left in a corrupted state.  Other batches may
   be successfully persisted, meaning that you may have a partially successful import.
 
-* In bulk mode, exceptions are not linked to a row.  Any exceptions raised by bulk operations are logged and returned
-  as critical (non-validation) errors (and re-raised if ``raise_errors`` is true).
+* In bulk mode, exceptions are not linked to a single row.  Any exceptions raised by bulk operations are logged and
+  returned as critical (non-validation) errors (and re-raised if ``raise_errors`` is true).  Each failed batch is
+  recorded on the result as a :class:`~import_export.results.BatchError`
+  (``result.batch_errors``), carrying the 1-based input row range (``row_start`` / ``row_end``), the exact
+  ``row_numbers`` and the primary keys of the affected objects (``object_ids``).  Use these values to identify and
+  resubmit the rows from the failed batch; you do not need to fall back to row-by-row writes to locate the failure.
+
+* Rows which belonged to a failed batch are marked via ``RowResult.batch_failed`` and are counted under the ``error``
+  total rather than ``new`` / ``update`` / ``delete``, so a failed batch is never reported as successfully imported.
+  Rows from batches which were persisted successfully continue to be reported normally, allowing a partially successful
+  import to be distinguished from a fully failed one.
 
 * If there is the potential for concurrent writes to a table during a bulk operation, then you need to consider the
   potential impact of this.  Refer to :ref:`concurrent-writes` for more information.

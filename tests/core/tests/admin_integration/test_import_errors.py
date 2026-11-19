@@ -13,7 +13,15 @@ from django.test.testcases import TestCase
 from django.test.utils import override_settings
 from django.utils.translation import gettext_lazy as _
 
+from import_export import resources
 from import_export.exceptions import FieldError
+
+
+class BulkBookResource(resources.ModelResource):
+    class Meta:
+        model = Book
+        use_bulk = True
+        batch_size = 1
 
 
 class ImportErrorHandlingTests(AdminTestMixin, TestCase):
@@ -305,3 +313,35 @@ class TestImportErrorMessageFormat(AdminTestMixin, TestCase):
         self.assertNotIn("import-error-display-row", content)
         self.assertIn("import-error-display-traceback", content)
         self.assertIn("Traceback (most recent call last)", content)
+
+
+class TestBatchErrorDisplay(AdminTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.csvdata = "id,name,author_email\r\n" "1,Ulysses,test@example.com\r\n"
+        self.filedata = StringIO(self.csvdata)
+        self.data = {"format": "0", "import_file": self.filedata}
+        self._prepend_form_prefix(self.data)
+        self.model_admin = BookAdmin(Book, AdminSite())
+        self.model_admin.resource_classes = [BulkBookResource]
+
+        factory = RequestFactory()
+        self.request = factory.post(self.book_import_url, self.data, follow=True)
+        self.request.user = User.objects.create_user("admin1")
+
+    def test_batch_error_is_rendered_in_import_response(self):
+        with mock.patch("core.models.Book.objects.bulk_create") as mock_bulk_create:
+            mock_bulk_create.side_effect = ValidationError("invalid field")
+            response = self.model_admin.import_action(self.request)
+
+        result = response.context_data["result"]
+        self.assertTrue(result.has_errors())
+        self.assertEqual(1, len(result.batch_errors))
+
+        response.render()
+        content = response.content.decode()
+        self.assertIn("Bulk create failed", content)
+        self.assertIn("input rows 1 to 1", content)
+        self.assertIn("Object ids", content)
+        # the failed batch must not be presented as a successful preview row
+        self.assertEqual(0, len(result.valid_rows()))

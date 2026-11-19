@@ -25,7 +25,7 @@ from django.utils.translation import gettext_lazy as _
 from . import exceptions, widgets
 from .declarative import DeclarativeMetaclass, ModelDeclarativeMetaclass
 from .fields import Field
-from .results import Error, Result, RowResult
+from .results import BatchError, Error, Result, RowResult
 from .utils import atomic_if_using_transaction, get_related_model
 
 logger = logging.getLogger(__name__)
@@ -140,6 +140,47 @@ class Diff:
         return [f.get_value(instance) for f in self.fields]
 
 
+class PendingBatch:
+    """
+    Holds the model instances for a bulk operation together with the 1-based
+    input row range they belong to, so that a failed bulk operation can be
+    reported with enough information to identify and resubmit the rows.
+    """
+
+    def __init__(self, operation):
+        self.operation = operation
+        self.instances = []
+        #: The 1-based number of every input row held in this batch.
+        self.row_numbers = []
+        self.first_row = None
+        self.last_row = None
+
+    def add(self, instance, row_number):
+        self.row_numbers.append(row_number)
+        if self.first_row is None:
+            self.first_row = row_number
+        self.last_row = row_number
+        self.instances.append(instance)
+
+    def object_ids(self):
+        return [getattr(instance, "pk", None) for instance in self.instances]
+
+    def clear(self):
+        self.instances.clear()
+        self.row_numbers.clear()
+        self.first_row = None
+        self.last_row = None
+
+    def __iter__(self):
+        return iter(self.instances)
+
+    def __getitem__(self, index):
+        return self.instances[index]
+
+    def __len__(self):
+        return len(self.instances)
+
+
 class Resource(metaclass=DeclarativeMetaclass):
     """
     Resource defines how objects are mapped to their import and export
@@ -163,10 +204,11 @@ class Resource(metaclass=DeclarativeMetaclass):
         # cls.fields.
         self.fields = deepcopy(self.fields)
 
-        # lists to hold model instances in memory when bulk operations are enabled
-        self.create_instances = []
-        self.update_instances = []
-        self.delete_instances = []
+        # pending model instances for bulk operations, grouped into batches
+        # together with the input row range each batch belongs to
+        self.create_instances = PendingBatch("create")
+        self.update_instances = PendingBatch("update")
+        self.delete_instances = PendingBatch("delete")
 
         # whether any created row supplied an explicit pk value
         # (see ModelResource.after_import())
@@ -278,6 +320,30 @@ class Resource(metaclass=DeclarativeMetaclass):
             and "__" not in field.attribute  # exclude related fields
         ]
 
+    def handle_batch_error(self, result, error, batch, raise_errors=False):
+        """
+        Records the failure of a bulk operation batch against the result.
+
+        Unlike a row-level error, a bulk failure cannot be attributed to a
+        single row.  The :class:`~import_export.results.BatchError` captures
+        the whole affected row range and the object identifiers, so that the
+        failed input can be identified and resubmitted.
+        """
+        logger.debug(error, exc_info=error)
+        if result is not None:
+            result.append_batch_error(
+                BatchError(
+                    error=error,
+                    row_start=batch.first_row,
+                    row_end=batch.last_row,
+                    row_numbers=batch.row_numbers,
+                    object_ids=batch.object_ids(),
+                    operation=batch.operation,
+                )
+            )
+        if raise_errors:
+            raise exceptions.ImportError(error, number=batch.first_row)
+
     def bulk_create(
         self, using_transactions, dry_run, raise_errors, batch_size=None, result=None
     ):
@@ -287,10 +353,12 @@ class Resource(metaclass=DeclarativeMetaclass):
         if len(self.create_instances) > 0 and (using_transactions or not dry_run):
             try:
                 self._meta.model.objects.bulk_create(
-                    self.create_instances, batch_size=batch_size
+                    self.create_instances.instances, batch_size=batch_size
                 )
             except Exception as e:
-                self.handle_import_error(result, e, raise_errors)
+                self.handle_batch_error(
+                    result, e, self.create_instances, raise_errors
+                )
             finally:
                 self.create_instances.clear()
 
@@ -303,12 +371,14 @@ class Resource(metaclass=DeclarativeMetaclass):
         if len(self.update_instances) > 0 and (using_transactions or not dry_run):
             try:
                 self._meta.model.objects.bulk_update(
-                    self.update_instances,
+                    self.update_instances.instances,
                     self.get_bulk_update_fields(),
                     batch_size=batch_size,
                 )
             except Exception as e:
-                self.handle_import_error(result, e, raise_errors)
+                self.handle_batch_error(
+                    result, e, self.update_instances, raise_errors
+                )
             finally:
                 self.update_instances.clear()
 
@@ -319,10 +389,12 @@ class Resource(metaclass=DeclarativeMetaclass):
         """
         if len(self.delete_instances) > 0 and (using_transactions or not dry_run):
             try:
-                delete_ids = [o.pk for o in self.delete_instances]
+                delete_ids = [o.pk for o in self.delete_instances.instances]
                 self._meta.model.objects.filter(pk__in=delete_ids).delete()
             except Exception as e:
-                self.handle_import_error(result, e, raise_errors)
+                self.handle_batch_error(
+                    result, e, self.delete_instances, raise_errors
+                )
             finally:
                 self.delete_instances.clear()
 
@@ -378,10 +450,11 @@ class Resource(metaclass=DeclarativeMetaclass):
             # (checked before save because bulk_create can populate pks)
             self._pk_supplied_on_create = True
         if self._meta.use_bulk:
+            row_number = kwargs.get("row_number")
             if is_create:
-                self.create_instances.append(instance)
+                self.create_instances.add(instance, row_number)
             else:
-                self.update_instances.append(instance)
+                self.update_instances.add(instance, row_number)
         elif not self._is_using_transactions(kwargs) and self._is_dry_run(kwargs):
             # we don't have transactions and we want to do a dry_run
             pass
@@ -449,7 +522,7 @@ class Resource(metaclass=DeclarativeMetaclass):
         """
         self.before_delete_instance(instance, row, **kwargs)
         if self._meta.use_bulk:
-            self.delete_instances.append(instance)
+            self.delete_instances.add(instance, kwargs.get("row_number"))
         elif not self._is_using_transactions(kwargs) and self._is_dry_run(kwargs):
             # we don't have transactions and we want to do a dry_run
             pass
@@ -964,10 +1037,12 @@ class Resource(metaclass=DeclarativeMetaclass):
                     instance_loader,
                     **kwargs,
                 )
+                row_result.row_number = i
             if self._meta.use_bulk:
-                # persist a batch of rows
-                # because this is a batch, any exceptions are logged and not associated
-                # with a specific row
+                # persist a batch of rows.  A batch failure cannot be
+                # attributed to a single row, so it is recorded against the
+                # whole row range (see Result.batch_errors) and the affected
+                # row results are marked as failed once the import completes.
                 if len(self.create_instances) == self._meta.batch_size:
                     with atomic_if_using_transaction(
                         using_transactions, using=db_connection
@@ -1034,6 +1109,9 @@ class Resource(metaclass=DeclarativeMetaclass):
                 self.bulk_delete(
                     using_transactions, dry_run, raise_errors, result=result
                 )
+            # reflect any failed batches on the affected row results so that
+            # unpersisted rows are not reported as successfully imported
+            result.mark_batch_failed_rows()
 
         try:
             with atomic_if_using_transaction(using_transactions, using=db_connection):

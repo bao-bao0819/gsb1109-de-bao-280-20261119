@@ -91,6 +91,28 @@
           <div class="traceback">{{ error.traceback|linebreaks }}</div>
         </li>
         {% endfor %}
+        {% block batch_error_list %}
+        {% for batch_error in result.batch_errors %}
+          <li class="import-error-li">
+            <div class="import-error-display-message">
+              {% blocktranslate with operation=batch_error.operation start=batch_error.row_start end=batch_error.row_end trimmed %}
+                Bulk {{ operation }} failed for input rows {{ start }} to {{ end }}. These rows were not persisted and can be resubmitted.
+              {% endblocktranslate %}
+            </div>
+            <div class="import-error-display-row">
+              {% translate "Row numbers" %}: {{ batch_error.row_numbers|join:", " }}
+              <br>
+              {% translate "Object ids" %}: {{ batch_error.object_ids|join:", " }}
+            </div>
+            {% if "message" in import_error_display %}
+            <div class="import-error-display-message">{{ batch_error.error }}</div>
+            {% endif %}
+            {% if "traceback" in import_error_display %}
+            <div class="import-error-display-traceback">{{ batch_error.traceback|linebreaks }}</div>
+            {% endif %}
+          </li>
+        {% endfor %}
+        {% endblock %}
         {% block import_error_list %}
         {% for line, errors in result.row_errors %}
           {% for error in errors %}

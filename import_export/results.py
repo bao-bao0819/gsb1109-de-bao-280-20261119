@@ -78,6 +78,13 @@ class RowResult:
         #: Retain the raw values associated with each imported row.
         self.row_values = {}
 
+        #: The 1-based number of the input row which produced this result.
+        self.row_number = None
+
+        #: ``True`` when the row belonged to a bulk operation batch which failed
+        #: and was therefore not persisted.
+        self.batch_failed = False
+
         #: The instance id (used in Admin UI)
         self.object_id = None
 
@@ -197,6 +204,68 @@ class ErrorRow:
         self.errors = errors
 
 
+class BatchError:
+    """
+    Represents the failure of a single bulk operation batch.
+
+    A batch groups a contiguous range of input rows.  When bulk mode is
+    enabled the underlying exception cannot be attributed to a single row,
+    therefore the whole batch is recorded as failed.  The row range and the
+    object identifiers are retained so that the affected input can be
+    identified and resubmitted.
+    """
+
+    def __init__(
+        self,
+        error,
+        row_start,
+        row_end,
+        object_ids,
+        operation,
+        row_numbers=None,
+        number=None,
+    ):
+        """
+        :param error: Instance of the Exception raised by the bulk operation.
+        :param row_start: The 1-based number of the first input row in the
+            failed batch.
+        :param row_end: The 1-based number of the last input row in the
+            failed batch.
+        :param object_ids: A list of the primary keys of the model instances
+            in the failed batch.  ``None`` is used for instances which have
+            not yet been assigned a primary key.
+        :param operation: The bulk operation which failed, one of
+            ``"create"``, ``"update"`` or ``"delete"``.
+        :param row_numbers: The 1-based number of every input row held in the
+            failed batch.  Defaults to the inclusive range ``row_start`` to
+            ``row_end``.
+        :param number: Alias for ``row_start`` (optional).
+        """
+        self.error = error
+        self.row_start = row_start
+        self.row_end = row_end
+        self.object_ids = list(object_ids)
+        self.operation = operation
+        if row_numbers is None:
+            row_numbers = list(range(row_start, row_end + 1))
+        self.row_numbers = list(row_numbers)
+        self.number = number if number is not None else row_start
+
+    def __repr__(self):
+        return (
+            f"<BatchError: {self.error!r} "
+            f"operation={self.operation!r} "
+            f"rows={self.row_start}-{self.row_end} "
+            f"row_numbers={self.row_numbers!r} "
+            f"object_ids={self.object_ids!r}>"
+        )
+
+    @cached_property
+    def traceback(self):
+        lines = traceback.format_exception(self.error)
+        return "".join(lines)
+
+
 class Result:
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -208,6 +277,8 @@ class Result:
         self.invalid_rows = []
         #: The collection of rows which had generic errors.
         self.error_rows = []
+        #: The collection of bulk operation batches which failed.
+        self.batch_errors = []
         #: A custom Dataset containing only failed rows and associated errors.
         self.failed_dataset = Dataset()
         self.totals = OrderedDict(
@@ -223,7 +294,31 @@ class Result:
         self.total_rows = 0
 
     def valid_rows(self):
-        return [r for r in self.rows if r.import_type in RowResult.valid_import_types]
+        return [
+            r
+            for r in self.rows
+            if r.import_type in RowResult.valid_import_types and not r.batch_failed
+        ]
+
+    def mark_batch_failed_rows(self):
+        """
+        Marks the row results which belonged to a failed bulk batch and moves
+        their totals from the persisted import types to the error total.
+
+        This ensures that rows which were never written to the database are
+        not reported as successfully imported.
+        """
+        failed_rows = {
+            number
+            for batch_error in self.batch_errors
+            for number in batch_error.row_numbers
+        }
+        for row_result in self.rows:
+            if row_result.row_number in failed_rows and not row_result.batch_failed:
+                row_result.batch_failed = True
+                if row_result.import_type in self.totals:
+                    self.totals[row_result.import_type] -= 1
+                self.totals[RowResult.IMPORT_TYPE_ERROR] += 1
 
     def append_row_result(self, row_result):
         self.rows.append(row_result)
@@ -254,6 +349,16 @@ class Result:
     def append_error_row(self, number, row, errors):
         self.error_rows.append(ErrorRow(number=number, errors=errors))
 
+    def append_batch_error(self, batch_error):
+        """
+        Records a bulk operation batch which could not be persisted.
+
+        :param batch_error: A :class:`BatchError` describing the failed
+            batch, including the input row range and object identifiers
+            which can be used to resubmit the affected rows.
+        """
+        self.batch_errors.append(batch_error)
+
     def increment_row_result_total(self, row_result):
         if row_result.import_type:
             self.totals[row_result.import_type] += 1
@@ -264,7 +369,7 @@ class Result:
     def has_errors(self):
         """Returns a boolean indicating whether the import process resulted in
         any critical (non-validation) errors for this result."""
-        return bool(self.base_errors or self.row_errors())
+        return bool(self.base_errors or self.row_errors() or self.batch_errors)
 
     def has_validation_errors(self):
         """Returns a boolean indicating whether the import process resulted in

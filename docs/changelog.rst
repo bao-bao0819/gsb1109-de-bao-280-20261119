@@ -22,6 +22,7 @@ Enhancements
 - Allow ``Resource`` subclasses to be subscripted, e.g. ``ModelResource[MyModel]`` (`2069 <https://github.com/django-import-export/django-import-export/issues/2069>`_)
 - ``ForeignKeyWidget``, ``CachedForeignKeyWidget`` and ``ManyToManyWidget`` now accept the related model as an ``"app_label.ModelName"`` string, resolved via the app registry (`2202 <https://github.com/django-import-export/django-import-export/issues/2202>`_)
 - Refactor bulk updates to use attribute not field (`2145 <https://github.com/django-import-export/django-import-export/issues/2145>`_)
+- Failed bulk operation batches are now reported on the result as :class:`~import_export.results.BatchError` instances (``result.batch_errors``), each carrying the affected input row range, row numbers and object ids so the rows can be resubmitted.  Rows in a failed batch are marked via ``RowResult.batch_failed`` and counted as errors instead of being reported as successfully imported.
 
 Fixes
 #####

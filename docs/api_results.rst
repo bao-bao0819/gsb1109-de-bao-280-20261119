@@ -21,3 +21,9 @@ InvalidRow
 
 .. autoclass:: import_export.results.InvalidRow
    :members:
+
+BatchError
+----------
+
+.. autoclass:: import_export.results.BatchError
+   :members:

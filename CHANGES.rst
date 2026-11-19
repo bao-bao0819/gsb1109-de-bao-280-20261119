@@ -1,6 +1,16 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- A new ``jsonl`` output format has been added. It emits one JSON
+  object per result row using the original query column names as
+  field names. Amounts are split into separate ``number`` and
+  ``currency`` fields, positions and inventories are rendered as
+  structured objects and arrays rather than squeezed into a single
+  cell, and numbers (including high precision decimals) are rendered
+  verbatim so they round-trip exactly. Missing values (``NULL``),
+  empty strings and empty inventories are represented distinctly as
+  JSON ``null``, ``""`` and ``[]`` respectively.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

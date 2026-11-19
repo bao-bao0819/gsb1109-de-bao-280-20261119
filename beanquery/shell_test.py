@@ -2,6 +2,7 @@ __copyright__ = "Copyright (C) 2014-2016  Martin Blais"
 __license__ = "GNU GPLv2"
 
 import functools
+import json
 import re
 import sys
 import textwrap
@@ -377,6 +378,42 @@ class TestShell(ClickTestCase):
             ---  ---
             111  222
         '''))
+
+    @test_utils.docfile
+    def test_format_jsonl(self, filename):
+        """
+        """
+        r = self.main(filename, '--format=jsonl', "SELECT 111 AS one, 'text' AS two FROM #")
+        self.assertEqual(r.stdout, '{"one": 111, "two": "text"}\n')
+        record = json.loads(r.stdout)
+        self.assertEqual(record, {'one': 111, 'two': 'text'})
+
+    @test_utils.docfile
+    def test_format_jsonl_postings(self, filename):
+        """
+        2013-01-01 open Assets:Broker
+        2013-01-01 open Expenses:Food
+
+        2013-04-05 * "Invest"
+          Assets:Broker  2 RGAGX {172.55 USD}
+          Expenses:Food
+        """
+        r = self.main(
+            filename, '--format=jsonl',
+            "SELECT narration, position, balance FROM postings "
+            "WHERE account = 'Assets:Broker'")
+        records = [json.loads(line) for line in r.stdout.splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['narration'], 'Invest')
+        position = records[0]['position']
+        self.assertEqual(position['units'], {'number': '2', 'currency': 'RGAGX'})
+        self.assertEqual(position['cost']['number'], '172.55')
+        self.assertEqual(position['cost']['currency'], 'USD')
+        # Inventories are arrays of positions, never a single cell.
+        self.assertEqual(
+            records[0]['balance'],
+            [{'units': {'number': '2', 'currency': 'RGAGX'},
+              'cost': position['cost']}])
 
 
 if __name__ == '__main__':

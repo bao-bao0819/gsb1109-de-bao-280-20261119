@@ -67,7 +67,7 @@ Add some documents:
   ...         pass
 
 Run in dry-run mode:
-  
+
   >>> r = run('archive', downloads, '-o', documents, '-n')
   >>> r.exit_code
   0
@@ -100,46 +100,154 @@ Now for real:
   >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.bbb.csv'))
   True
 
-Trying to move a documents over an exisiting file:
+A re-download with the same name and identical content is not filed again:
 
   >>> with open(path.join(downloads, 'bbb.csv'), 'w') as f:
   ...     pass
 
   >>> r = run('archive', downloads, '-o', documents)
   >>> r.exit_code
-  1
+  0
   >>> print(r.output)
   * .../downloads/aaa.txt
-  * .../downloads/bbb.csv ... ERROR
+  * .../downloads/bbb.csv ... DUPLICATE
     .../documents/Assets/Tests/1970-01-01.bbb.csv
-    Destination file already exists.
   * .../downloads/zzz.txt
-  # Errors detected: documents will not be filed.
+
+  >>> path.exists(path.join(downloads, 'bbb.csv'))
+  False
+  >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.bbb.csv'))
+  True
+  >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.bbb.1.csv'))
+  False
+
+A re-download with corrected content keeps both versions:
+
+  >>> with open(path.join(downloads, 'bbb.csv'), 'w') as f:
+  ...     _ = f.write('corrected')
+
+  >>> r = run('archive', downloads, '-o', documents)
+  >>> r.exit_code
+  0
+  >>> print(r.output)
+  * .../downloads/aaa.txt
+  * .../downloads/bbb.csv ... OK
+    .../documents/Assets/Tests/1970-01-01.bbb.1.csv
+  * .../downloads/zzz.txt
+
+  >>> path.exists(path.join(downloads, 'bbb.csv'))
+  False
+  >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.bbb.csv'))
+  True
+  >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.bbb.1.csv'))
+  True
+
+Both versions can be retrieved by content:
+
+  >>> with open(path.join(documents, 'Assets/Tests/1970-01-01.bbb.csv')) as f:
+  ...     print(f.read())
+
+  >>> with open(path.join(documents, 'Assets/Tests/1970-01-01.bbb.1.csv')) as f:
+  ...     print(f.read())
+  corrected
+
+Filing the same corrected re-download again remains a duplicate:
+
+  >>> with open(path.join(downloads, 'bbb.csv'), 'w') as f:
+  ...     _ = f.write('corrected')
+
+  >>> r = run('archive', downloads, '-o', documents)
+  >>> r.exit_code
+  0
+  >>> print(r.output)
+  * .../downloads/aaa.txt
+  * .../downloads/bbb.csv ... DUPLICATE
+    .../documents/Assets/Tests/1970-01-01.bbb.1.csv
+  * .../downloads/zzz.txt
+
+  >>> path.exists(path.join(downloads, 'bbb.csv'))
+  False
 
 Cleanup documents directory:
 
   >>> rmtree(documents)
   >>> mkdir(documents)
-  
-Collision in destination filename:
 
-  >>> fnames = ['aaa.txt', 'bbb.csv', 'zzz.txt', 'error.foo']
-  >>> for fname in fnames:
+Two files in the same run with the same canonical name are versioned:
+
+  >>> mkdir(path.join(downloads, 'again'))
+  >>> for fname, content in [('bbb.csv', 'one'), ('again/bbb.csv', 'two')]:
   ...     with open(path.join(downloads, fname), 'w') as f:
-  ...         pass
+  ...         _ = f.write(content)
 
   >>> r = run('archive', downloads, '-o', documents)
   >>> r.exit_code
-  1
+  0
   >>> print(r.output)
   * .../downloads/aaa.txt
   * .../downloads/bbb.csv ... OK
     .../documents/Assets/Tests/1970-01-01.bbb.csv
-  * .../downloads/error.foo ... ERROR
-    .../documents/Assets/Tests/1970-01-01.bbb.csv
-    Collision in destination file path.
   * .../downloads/zzz.txt
-  # Errors detected: documents will not be filed.
+  * .../downloads/again/bbb.csv ... OK
+    .../documents/Assets/Tests/1970-01-01.bbb.1.csv
+
+  >>> rmtree(path.join(downloads, 'again'))
+
+Collision with a different file requires an explicit overwrite:
+
+  >>> with open(path.join(documents, 'Assets/Tests/1970-01-01.bbb.csv')) as f:
+  ...     original = f.read()
+
+  >>> with open(path.join(downloads, 'bbb.csv'), 'w') as f:
+  ...     _ = f.write('replacement')
+
+  >>> r = run('archive', downloads, '-o', documents, '-f')
+  >>> r.exit_code
+  0
+  >>> print(r.output)
+  * .../downloads/aaa.txt
+  * .../downloads/bbb.csv ... REPLACE
+    .../documents/Assets/Tests/1970-01-01.bbb.csv
+  * .../downloads/zzz.txt
+
+  >>> with open(path.join(documents, 'Assets/Tests/1970-01-01.bbb.csv')) as f:
+  ...     print(f.read())
+  replacement
+
+  >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.bbb.1.csv'))
+  True
+
+An error while processing leaves all documents unfiled:
+
+  >>> class FailingImporter(Importer):
+  ...     def identify(self, filepath):
+  ...         return path.basename(filepath) == 'failing.foo'
+  ...     def filename(self, filepath):
+  ...         return path.join('nested', 'name.pdf')
+
+  >>> rmtree(documents)
+  >>> mkdir(documents)
+  >>> with open(path.join(downloads, 'failing.foo'), 'w') as f:
+  ...     _ = f.write('unfiled')
+  >>> failing_importer = FailingImporter('test.Failing', 'Assets:Tests', None)
+  >>> failing = beangulp.Ingest(importers + [failing_importer])
+  >>> r = runner.invoke(
+  ...     failing.cli, ['archive', downloads, '-o', documents], catch_exceptions=False
+  ... )
+
+  >>> r.exit_code
+  1
+  >>> 'ERROR' in r.output
+  True
+  >>> 'contains path separator' in r.output
+  True
+  >>> '# Errors detected: documents will not be filed.' in r.output
+  True
+
+  >>> path.exists(path.join(downloads, 'aaa.txt'))
+  True
+  >>> path.exists(path.join(documents, 'Assets/Tests/1970-01-01.aaa.txt'))
+  False
 
 
 Cleanup

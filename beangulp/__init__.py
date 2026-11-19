@@ -150,7 +150,7 @@ def _extract(
     "--overwrite",
     "-f",
     is_flag=True,
-    help="Overwrite destination files with the same name.",
+    help="Replace a different file at the canonical destination path.",
 )
 @click.option(
     "--dry-run", "-n", is_flag=True, help="Just print where the files would be moved."
@@ -175,12 +175,23 @@ def _archive(
     the documents and with a file name composed by the document date
     and document name returned by the importer.
 
+    Documents are compared by content with the files already filed at
+    the same canonical path. Files with identical content are
+    deduplicated and the source copy is removed. Files with different
+    content are filed under a numbered suffix (for example
+    ``2016-02-15.statement.1.pdf``) so that both versions remain
+    available and can be retrieved.
+
     Documents are moved to their filing location only when no errors
-    are encountered processing all the input files.  Documents in the
-    destination directory are not overwritten, unless the --force
-    option is used.  When the directory hierarchy root is not
-    specified with the --destination DIR options, it is assumed to be
-    directory in which the ingest script is located.
+    are encountered processing all the input files. Each file is
+    written to a temporary name and atomically put in place, so an
+    interrupted run never leaves a partially written or missing
+    archived document: the previous version remains readable and the
+    next run completes the archival. Documents in the destination
+    directory are not overwritten, unless the --overwrite option is
+    used. When the directory hierarchy root is not specified with the
+    --destination DIR options, it is assumed to be directory in which
+    the ingest script is located.
 
     """
     # If the output directory is not specified, move the files at the
@@ -195,6 +206,7 @@ def _archive(
     log = utils.logger(verbosity, err=True)
     errors = exceptions.ExceptionsTrap(log)
     renames = []
+    reserved = {}
 
     for filename in _walk(src, log):
         with errors:
@@ -211,18 +223,25 @@ def _archive(
             # Prepend destination directory path.
             destpath = os.path.join(destination, destpath)
 
-            # Check for destination filename collisions.
-            collisions = [src for src, dst in renames if dst == destpath]
-            if collisions:
-                raise exceptions.Error("Collision in destination file path.", destpath)
+            checksum = archive.file_checksum(filename)
+            action, destpath = archive.resolve(
+                destpath, checksum, reserved, overwrite=overwrite
+            )
 
-            # Check if the destination file already exists.
-            if not overwrite and os.path.exists(destpath):
-                raise exceptions.Error("Destination file already exists.", destpath)
+            if action == archive.DUPLICATE:
+                renames.append((filename, destpath, action, checksum))
+                log(" DUPLICATE", fg="yellow")
+                log(f"  {destpath:}")
+                continue
 
-            renames.append((filename, destpath))
-            log(" OK", fg="green")
+            if action == archive.REPLACE:
+                log(" REPLACE", fg="yellow")
+            else:
+                log(" OK", fg="green")
             log(f"  {destpath:}")
+
+            reserved[destpath] = checksum
+            renames.append((filename, destpath, action, checksum))
 
         if failfast and errors:
             break
@@ -233,8 +252,22 @@ def _archive(
         sys.exit(1)
 
     if not dry_run:
-        for filename, destpath in renames:
-            archive.move(filename, destpath)
+        archive.cleanup(destination)
+        for filename, destpath, action, checksum in renames:
+            with errors:
+                if action == archive.DUPLICATE:
+                    archive.discard(filename, destpath)
+                else:
+                    archive.move(
+                        filename,
+                        destpath,
+                        checksum=checksum,
+                        overwrite=action == archive.REPLACE,
+                    )
+
+    if errors:
+        log("# Errors detected: some documents were not filed.")
+        sys.exit(1)
 
 
 @click.command("identify")

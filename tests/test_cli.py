@@ -99,3 +99,58 @@ def test_csvw2sqlite(tmp_path, mdname):
     cu.execute('select count(*) from `csv.txt`')
     assert cu.fetchone()[0] == 2
     conn.close()
+
+
+def test_csvwvalidate_columns(tmp_path, capsys):
+    md = tmp_path / 'md.json'
+    md.write_text(json.dumps({
+        "@context": "http://www.w3.org/ns/csvw",
+        "tables": [
+            {
+                "url": "items.csv",
+                "tableSchema": {
+                    "columns": [
+                        {"name": "ID", "datatype": "string"},
+                        {"name": "when",
+                         "datatype": {"base": "date", "format": "yyyy-MM-dd"}},
+                        {"name": "comment",
+                         "datatype": {"base": "string", "format": "[a-z]+"}},
+                        {"name": "FK", "datatype": "string"},
+                    ],
+                    "foreignKeys": [{
+                        "columnReference": ["FK"],
+                        "reference": {"resource": "targets.csv", "columnReference": ["ID"]},
+                    }],
+                },
+            },
+            {
+                "url": "targets.csv",
+                "tableSchema": {
+                    "columns": [
+                        {"name": "ID", "datatype": "string"},
+                        {"name": "notes",
+                         "datatype": {"base": "string", "format": "[a-z]+"}},
+                    ],
+                },
+            },
+        ],
+    }), encoding='utf-8')
+    (tmp_path / 'targets.csv').write_text("ID,notes\nt1,Broken Notes!\n", encoding='utf-8')
+    items = tmp_path / 'items.csv'
+    items.write_text("ID,when,comment,FK\ni1,2026-11-19,Not lowercase!,t1\n", encoding='utf-8')
+
+    # Invalid formats in unselected columns do not affect validation:
+    assert run(csvwvalidate, url=str(md), verbose=True, lax=False,
+               columns=['ID', 'when']) == 0
+    # Per-table column selections work, too:
+    assert run(csvwvalidate, url=str(md), verbose=True, lax=False,
+               columns=['items.csv:ID,when', 'targets.csv:ID']) == 0
+    # ... while selecting a broken column fails validation:
+    assert run(csvwvalidate, url=str(md), verbose=True, lax=False,
+               columns=['ID', 'comment']) != 0
+
+    # A broken foreign key is still caught - and reported with location:
+    items.write_text("ID,when,comment,FK\ni1,2026-11-19,ok,t9\n", encoding='utf-8')
+    assert run(csvwvalidate, url=str(md), verbose=True, lax=False, columns=['ID']) == 2
+    out, _ = capsys.readouterr()
+    assert 'items.csv:2' in out

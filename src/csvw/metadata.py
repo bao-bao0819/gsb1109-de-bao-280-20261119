@@ -1033,8 +1033,12 @@ class Table(TableLike):
             fpath.unlink()
         return rowcount
 
-    def check_primary_key(self, log=None, items=None) -> bool:
-        """Make sure primary keys are unique."""
+    def check_primary_key(self, log=None, items=None, columns=None) -> bool:
+        """Make sure primary keys are unique.
+
+        :param columns: Optional selection of columns to read. The primary key columns \
+        are always read, because they are required for the check.
+        """
         # We want to silence error logging when reading table rows, because we are not interested
         # in conversion errors here.
         nolog = logging.getLogger(__name__)
@@ -1045,10 +1049,13 @@ class Table(TableLike):
             warnings.warn('the items argument of check_primary_key '
                           'is deprecated (its content will be ignored)')  # pragma: no cover
         if self.tableSchema.primaryKey:
+            if columns is not None:
+                columns = set(columns) | set(self.tableSchema.primaryKey)
             get_pk = operator.itemgetter(*self.tableSchema.primaryKey)
             seen = set()
             # Read all rows in the table, ignoring errors:
-            for fname, lineno, row in self.iterdicts(log=nolog, with_metadata=True):
+            for fname, lineno, row in self.iterdicts(log=nolog, with_metadata=True,
+                                                     columns=columns):
                 pk = get_pk(row)
                 if pk in seen:
                     utils.log_or_raise(f'{fname}:{lineno} duplicate primary key: {pk}', log=log)
@@ -1096,11 +1103,18 @@ class Table(TableLike):
             parse_spec: RowParseSpec,
             header_cols: list[tuple[int, str, Column]],
             spec: TableParseSpec,
+            columns: Optional[set[str]] = None,
     ) -> RowType:
-        required = {h: j for j, h, c in header_cols if c and c.required}
+        required = {
+            h: j for j, h, c in header_cols
+            if c and c.required and (columns is None or c.header in columns)}
         res = parse_spec.row_implementation()
 
         for (j, k, col), v in zip(header_cols, row.row):
+            if columns is not None and (col.header if col else k) not in columns:
+                # The column is not selected for output, thus, its value is not parsed -
+                # i.e. invalid values w.r.t. the column's datatype go unnoticed.
+                continue
             # see http://w3c.github.io/csvw/syntax/#parsing-cells
             if col:
                 try:
@@ -1125,11 +1139,13 @@ class Table(TableLike):
 
         # Augment result with regular columns not provided in the data:
         for key in spec.colnames:
-            res.setdefault(key, None)
+            if columns is None or key in columns:
+                res.setdefault(key, None)
 
         # Augment result with virtual columns:
         for key, value_url in spec.virtualcols:
-            res[key] = value_url.expand(**res)
+            if columns is None or key in columns:
+                res[key] = value_url.expand(**res)
         return res
 
     def _get_header_cols(
@@ -1176,6 +1192,7 @@ class Table(TableLike):
             fname=None,
             _Row: type = collections.OrderedDict,  # pylint: disable=invalid-name
             strict=True,
+            columns: Optional[Iterable[str]] = None,
     ) -> Generator[Union[dict[str, Any], tuple[str, int, dict[str, Any]]], None, None]:
         """Iterate over the rows of the table
 
@@ -1195,10 +1212,14 @@ class Table(TableLike):
         :param strict: Flag signaling whether data is read strictly - i.e. raising `ValueError` \
         when invalid data is encountered - or not - i.e. only issueing a warning and returning \
         invalid data as `str` as provided by the undelying DSV reader.
+        :param columns: Optional selection of column names. If given, only these columns are \
+        parsed and included in the resulting dicts; values in other columns are not read \
+        (i.e. invalid values w.r.t. a column's datatype go unnoticed).
         :return: A generator of dicts or triples (fname, lineno, dict) if with_metadata
         """
         dialect = self._get_dialect()
         fname = fname or self.url.resolve(self.base)
+        columns = None if columns is None else set(columns)
 
         table_parse_spec = TableParseSpec.from_columns(self.tableSchema.columns)
 
@@ -1220,8 +1241,9 @@ class Table(TableLike):
                 if i == 0:
                     header_cols = self._get_header_cols(
                         header, table_parse_spec.colnames, strict, row)
-                    missing = table_parse_spec.requiredcols - \
-                        {c.header for j, h, c in header_cols if c}
+                    requiredcols = table_parse_spec.requiredcols if columns is None else \
+                        {c for c in table_parse_spec.requiredcols if c in columns}
+                    missing = requiredcols - {c.header for j, h, c in header_cols if c}
                     if missing:
                         raise ValueError(f'{fname} is missing required columns {missing}')
 
@@ -1231,6 +1253,7 @@ class Table(TableLike):
                     parse_spec,
                     header_cols,
                     table_parse_spec,
+                    columns=columns,
                 )
                 if not parse_spec.error:
                     yield (fname, lineno, res) if with_metadata else res
@@ -1361,17 +1384,22 @@ class TableGroup(TableLike):
             raise ValueError(f'Foreign key error: missing column "{e}" referenced') from e
         return fkis
 
-    def check_referential_integrity(self, data=None, log=None, strict=False):
+    def check_referential_integrity(self, data=None, log=None, strict=False, columns=None):
         """
         Strict validation does not allow for nullable foreign key columns.
+
+        :param columns: Optional `dict` mapping table names (i.e. `Table.local_name`) to \
+        selections of columns to read. Columns which the referential integrity checks \
+        depend on (foreign key and referenced columns) are always read.
         """
         if data is not None:
             warnings.warn('the data argument of check_referential_integrity '
                           'is deprecated (its content will be ignored)')  # pragma: no cover
+        columns = self._referential_integrity_columns(columns)
         if strict:
             for t in self.tables:
                 for fk in t.tableSchema.foreignKeys:
-                    for row in t:
+                    for row in t.iterdicts(columns=(columns or {}).get(t.local_name)):
                         if any(row.get(col) is None for col in fk.columnReference):
                             raise ValueError(
                                 f'Foreign key column is null: '
@@ -1399,8 +1427,25 @@ class TableGroup(TableLike):
             fks = collections.OrderedDict()
             for pk, kgrp in itertools.groupby(grp, lambda x: x.pk):
                 fks[tuple(pk)] = [(fk.source_table, tuple(fk.fk)) for fk in kgrp]
-            success = self._check_fks_referencing_table(success, target_table, fks, strict, log)
+            success = self._check_fks_referencing_table(
+                success, target_table, fks, strict, log, columns=columns)
         return success
+
+    def _referential_integrity_columns(
+            self, columns: Optional[dict[str, Iterable[str]]]) \
+            -> Optional[dict[str, set[str]]]:
+        """Amend a per-table column selection with the columns the fk checks depend on."""
+        if columns is None:
+            return None
+        needed = {t.local_name: set(columns.get(t.local_name, [])) for t in self.tables}
+        for t in self.tables:
+            for fk in t.tableSchema.foreignKeys:
+                if not fk.reference or not fk.reference.resource:
+                    continue
+                needed[t.local_name].update(fk.columnReference or [])
+                needed.setdefault(fk.reference.resource.string, set()).update(
+                    fk.reference.columnReference or [])
+        return needed
 
     @staticmethod
     def _check_fks_referencing_table(
@@ -1409,16 +1454,22 @@ class TableGroup(TableLike):
             fks: collections.OrderedDict[ColRefType, list[tuple[Table, ColRefType]]],
             strict: bool,
             log: logging.Logger,
+            columns: Optional[dict[str, set[str]]] = None,
     ) -> bool:
         """Check all foreign keys referencing the same table."""
         target_table = ReferencedTable(
-            target_table, collections.OrderedDict((fk, len(fk) == 1) for fk in fks), log)
+            target_table,
+            collections.OrderedDict((fk, len(fk) == 1) for fk in fks),
+            log,
+            columns=(columns or {}).get(target_table.local_name))
         # Now read the available primary keys for each foreign key constraint to the table.
         success = target_table.get_pks(success, strict)
         for pk, source_tables in fks.items():
             # For each foreign key constraint referencing `target_table` we check the fk values.
             for source_table, fk in source_tables:
-                success = target_table.check_fks(success, pk, source_table, fk)
+                success = target_table.check_fks(
+                    success, pk, source_table, fk,
+                    columns=(columns or {}).get(source_table.local_name))
         return success
 
 
@@ -1432,6 +1483,8 @@ class ReferencedTable:
     # single column or a composite key:
     pks: collections.OrderedDict[ColRefType, bool]
     log: logging.Logger
+    # An optional selection of columns to read from the table:
+    columns: Optional[set[str]] = None
     # We store values in table rows for each pk colref:
     refs: dict[ColRefType, set] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(set))
@@ -1439,7 +1492,7 @@ class ReferencedTable:
     def get_pks(self, success: bool, strict: bool) -> bool:
         """Read the actual fk values in the table."""
         itemgetters = {pk: operator.itemgetter(*pk) for pk in self.pks}
-        for row in self.table.iterdicts(log=self.log):
+        for row in self.table.iterdicts(log=self.log, columns=self.columns):
             for pk in self.pks:
                 vals = itemgetters[pk](row)
                 if vals in self.refs[pk]:
@@ -1482,12 +1535,14 @@ class ReferencedTable:
             pk: ColRefType,
             source_table: Table,
             fk: ColRefType,
+            columns: Optional[set[str]] = None,
     ) -> bool:
         """
         Check one fk constraint, i.e. whether the fk values in self.table actually can be found
         in `target_table`.
         """
-        for fname, lineno, item in source_table.iterdicts(log=self.log, with_metadata=True):
+        for fname, lineno, item in source_table.iterdicts(
+                log=self.log, with_metadata=True, columns=columns):
             item = RefValues(fname=fname, lineno=lineno, values=operator.itemgetter(*fk)(item))
             success = self._check_item(success, item, pk)
         return success
@@ -1507,6 +1562,12 @@ class RefValues:
 class CSVW:
     """
     Python API to read CSVW described data and convert it to JSON.
+
+    :param columns: Optional selection of columns to parse and return, either as an iterable \
+    of column names applied to all tables, or as a `dict` mapping table names (i.e. \
+    `Table.local_name`) to iterables of column names. Columns not selected here are not \
+    parsed, i.e. invalid values w.r.t. a column's datatype do not affect validation. Columns \
+    which referential integrity checks depend on are read in addition, as needed.
     """
     def __init__(
             self,
@@ -1514,6 +1575,7 @@ class CSVW:
             md_url: Optional[str] = None,
             validate: bool = False,
             strict: bool = True,
+            columns: Optional[Union[Iterable[str], dict[str, Iterable[str]]]] = None,
     ):
         self.warnings = []
         self._strict = strict
@@ -1541,6 +1603,11 @@ class CSVW:
                     if col.name and (re.search(r'\s', col.name) or col.name.startswith('_')):
                         col.name = None
             self.common_props = self.t.common_props
+        if columns is not None and not isinstance(columns, dict):
+            columns = [columns] if isinstance(columns, str) else columns
+            columns = {t.local_name: columns for t in self.tables}
+        self.columns = None if columns is None else \
+            {k: set(v) for k, v in columns.items()}
         if w:
             self.warnings.extend(w)
 
@@ -1564,6 +1631,10 @@ class CSVW:
             else:
                 self.t = Table.from_file(url, data=md)
 
+    def _columns_for(self, table: Table) -> Optional[set[str]]:
+        """The column selection for a table, if any."""
+        return None if self.columns is None else self.columns.get(table.local_name)
+
     @property
     def is_valid(self) -> bool:
         """
@@ -1578,11 +1649,13 @@ class CSVW:
             return False
         with warnings.catch_warnings(record=True) as w:
             for table in self.tables:
-                for _ in table.iterdicts(strict=False):
+                columns = self._columns_for(table)
+                for _ in table.iterdicts(strict=False, columns=columns):
                     pass
-                if not table.check_primary_key():  # pragma: no cover
+                if not table.check_primary_key(columns=columns):  # pragma: no cover
                     warnings.warn('Duplicate primary key')
-            if not self.tablegroup.check_referential_integrity(strict=self._strict):
+            if not self.tablegroup.check_referential_integrity(
+                    strict=self._strict, columns=self.columns):
                 warnings.warn('Referential integrity check failed')
         if w:
             self.warnings.extend(w)
@@ -1696,7 +1769,9 @@ class CSVW:
         row = [
             self._row_to_json(table, cols, row, rownum, rowsourcenum)
             for rownum, (_, rowsourcenum, row) in enumerate(
-                table.iterdicts(with_metadata=True, strict=False), start=1)
+                table.iterdicts(
+                    with_metadata=True, strict=False, columns=self._columns_for(table)),
+                start=1)
         ]
         if table._comments:  # pylint: disable=W0212
             res['rdfs:comment'] = [c[1] for c in table._comments]  # pylint: disable=W0212
@@ -1745,6 +1820,6 @@ class CSVW:
                 rownum))
 
         for col in table.tableSchema.columns:
-            if col.virtual:
+            if col.virtual and col.header in row:
                 triples.append(jsonld.Triple.from_col(table, col, row, col.header, None, rownum))
         return jsonld.group_triples(triples)

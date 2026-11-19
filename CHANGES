@@ -2,6 +2,16 @@ Changelog
 =========
 
 
+Version 4.3.0 (unreleased)
+--------------------------
+
+- Support selecting a subset of columns to parse and return when validating, via
+  `Table.iterdicts(columns=...)`, `CSVW(..., columns=...)` and `csvwvalidate --columns`.
+  Columns which referential integrity checks depend on are read in addition, as needed,
+  so invalid values in unselected columns do not affect validation, while broken foreign
+  keys are still reported with location.
+
+
 Version 4.2.0
 -------------
 

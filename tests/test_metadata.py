@@ -908,3 +908,112 @@ def test_CSVW():
     assert res.to_json()
     res = csvw.CSVW(FIXTURES / 'csv.txt-table-metadata.json')
     assert res.to_json()
+
+
+class TestColumnSelection:
+    """Selecting a subset of columns for parsing, output and validation."""
+    METADATA = {
+        "@context": "http://www.w3.org/ns/csvw",
+        "tables": [
+            {
+                "url": "items.csv",
+                "tableSchema": {
+                    "columns": [
+                        {"name": "ID", "datatype": "string"},
+                        {"name": "when", "datatype": {"base": "date", "format": "yyyy-MM-dd"}},
+                        {"name": "comment", "datatype": {"base": "string", "format": "[a-z]+"}},
+                        {"name": "FK", "datatype": "string"},
+                    ],
+                    "primaryKey": ["ID"],
+                    "foreignKeys": [{
+                        "columnReference": ["FK"],
+                        "reference": {"resource": "targets.csv", "columnReference": ["ID"]},
+                    }],
+                },
+            },
+            {
+                "url": "targets.csv",
+                "tableSchema": {
+                    "columns": [
+                        {"name": "ID", "datatype": "string"},
+                        {"name": "notes", "datatype": {"base": "string", "format": "[a-z]+"}},
+                    ],
+                    "primaryKey": ["ID"],
+                },
+            },
+        ],
+    }
+
+    @classmethod
+    def _make_csvw(cls, tmp_path, items=None, targets=None, **kw):
+        items = "ID,when,comment,FK\ni1,2026-11-19,ok,t1\ni2,2026-11-20,Not lowercase!,t2\n" \
+            if items is None else items
+        targets = "ID,notes\nt1,ok\nt2,Broken Notes!\n" if targets is None else targets
+        (tmp_path / 'items.csv').write_text(items, encoding='utf-8')
+        (tmp_path / 'targets.csv').write_text(targets, encoding='utf-8')
+        md = tmp_path / 'md.json'
+        md.write_text(json.dumps(cls.METADATA), encoding='utf-8')
+        return csvw.CSVW(str(md), **kw)
+
+    def test_iterdicts_projection(self, tmp_path):
+        ds = self._make_csvw(tmp_path)
+        table = ds.tables[0]
+        rows = list(table.iterdicts(columns=['ID', 'when']))
+        assert rows == [
+            {'ID': 'i1', 'when': datetime.datetime(2026, 11, 19)},
+            {'ID': 'i2', 'when': datetime.datetime(2026, 11, 20)},
+        ]
+        # Unselected columns are not parsed - invalid values go unnoticed, even in strict mode:
+        assert len(list(table.iterdicts(columns=['ID'], strict=True))) == 2
+        # ... while invalid values in selected columns are still reported:
+        with pytest.raises(ValueError):
+            list(table.iterdicts(columns=['ID', 'comment'], strict=True))
+
+    def test_columns_normalization(self, tmp_path):
+        ds = self._make_csvw(tmp_path, columns=['ID'])
+        assert ds.columns == {'items.csv': {'ID'}, 'targets.csv': {'ID'}}
+        ds = self._make_csvw(tmp_path, columns='ID')
+        assert ds.columns == {'items.csv': {'ID'}, 'targets.csv': {'ID'}}
+        ds = self._make_csvw(tmp_path, columns={'items.csv': ['ID']})
+        assert ds.columns == {'items.csv': {'ID'}}
+
+    def test_validation_ignores_unselected_columns(self, tmp_path):
+        # The invalid formats in the "big" comment/notes columns do not affect validation:
+        ds = self._make_csvw(tmp_path, columns=['ID', 'when'])
+        assert ds.is_valid
+        # Without a selection, they are parsed and fail validation:
+        ds = self._make_csvw(tmp_path)
+        with pytest.raises(ValueError):
+            ds.is_valid
+
+    def test_foreign_key_violation_reported_with_location(self, tmp_path):
+        ds = self._make_csvw(
+            tmp_path,
+            items="ID,when,comment,FK\ni1,2026-11-19,ok,t1\ni2,2026-11-20,ok,t3\n",
+            columns=['ID', 'when'])
+        with pytest.raises(ValueError, match=r'items\.csv:3'):
+            ds.is_valid
+
+    def test_check_primary_key_reads_pk_columns(self, tmp_path, mocker):
+        ds = self._make_csvw(
+            tmp_path,
+            items="ID,when,comment,FK\ni1,2026-11-19,ok,t1\ni1,2026-11-20,ok,t2\n")
+        # The primary key columns are read, even if not selected:
+        assert not ds.tables[0].check_primary_key(log=mocker.Mock(), columns=['when'])
+
+    def test_check_referential_integrity_columns(self, tmp_path):
+        columns = {'items.csv': ['ID'], 'targets.csv': ['ID']}
+        tg = self._make_csvw(tmp_path).tablegroup
+        assert tg.check_referential_integrity(columns=columns)
+        tg = self._make_csvw(
+            tmp_path, items="ID,when,comment,FK\ni1,2026-11-19,ok,t9\n").tablegroup
+        with pytest.raises(ValueError, match=r'items\.csv:2'):
+            tg.check_referential_integrity(columns=columns)
+
+    def test_to_json_projection(self, tmp_path):
+        ds = self._make_csvw(
+            tmp_path, columns={'items.csv': ['ID'], 'targets.csv': ['ID']})
+        data = ds.to_json()
+        tables = {t['url'].split('/')[-1]: t for t in data['tables']}
+        for row in tables['items.csv']['row']:
+            assert set(row['describes'][0]) == {'ID'}

@@ -55,6 +55,28 @@ such mechanisms. This part of the spec is implemented in :class:`csvw.CSVW`.
     >>> data.t
     TableGroup(...)
 
+Validating a selection of columns
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Validation via :attr:`csvw.CSVW.is_valid` (and the ``csvwvalidate`` command) can be restricted
+to a selection of columns, e.g. to only parse and return key columns, while skipping bulky
+description fields. Columns which referential integrity checks depend on are read in addition,
+as needed, so broken foreign keys are still reported - with location -, while invalid values
+in unselected columns do not affect validation:
+
+.. code-block:: python
+
+    >>> data = CSVW('md.json', columns={'items.csv': ['ID', 'when']})
+    >>> data.is_valid
+    True
+
+The same selection can be passed to the ``csvwvalidate`` command:
+
+.. code-block:: shell
+
+    csvwvalidate md.json --columns ID,when
+    csvwvalidate md.json --columns items.csv:ID,when targets.csv:ID
+
 .. autoclass:: csvw.CSVW
     :members:
 

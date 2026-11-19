@@ -75,10 +75,16 @@ def csvwvalidate(args=None, test=False):
         (['-v', '--verbose'], {'action': 'store_true', 'default': False}),
         (['-l', '--lax'], {'action': 'store_true', 'default': False,
                            'help': 'Allow null-valued foreign keys.'}),
+        (['-c', '--columns'], {'nargs': '+', 'default': None, 'metavar': 'COLS',
+                               'help': 'Only parse and return the specified columns, either as '
+                                       'comma-separated list applied to all tables, or per table '
+                                       'as "table:col1,col2". Columns needed to check foreign '
+                                       'keys are read in addition.'}),
     )
     ret = 0
     try:
-        csvw = CSVW(args.url, validate=True, strict=not args.lax)
+        csvw = CSVW(args.url, validate=True, strict=not args.lax,
+                    columns=_parse_columns(getattr(args, 'columns', None)))
         if csvw.is_valid:
             print(colored('OK', 'green', attrs=['bold']))
         else:
@@ -93,6 +99,19 @@ def csvwvalidate(args=None, test=False):
         if args.verbose:
             print(colored(str(e), 'blue'))
     return exit(ret, test=test)  # pylint: disable=R1722
+
+
+def _parse_columns(specs):
+    """Parse --columns specs into a column selection for CSVW."""
+    if not specs:
+        return None
+    if all(':' not in spec for spec in specs):
+        return {col for spec in specs for col in spec.split(',')}
+    res = {}
+    for spec in specs:
+        table, _, cols = spec.partition(':')
+        res.setdefault(table, set()).update(cols.split(','))
+    return res
 
 
 def csvw2datasette(args=None, test=False):

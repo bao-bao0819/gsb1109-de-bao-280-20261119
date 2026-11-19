@@ -356,6 +356,64 @@ def test_many_to_many_2(tg_with_foreign_keys):
     db._connection.close()
 
 
+def test_many_to_many_ord_column(tg_with_foreign_keys):
+    db = Database(tg_with_foreign_keys)
+    keys = ['x', 'y', 'x', 'x']
+    db.write(ref=[{'pk': '1', 'ref1': keys}], data=[{'v': 'x'}, {'v': 'y'}])
+    with db.connection() as conn:
+        cols = [row[1] for row in conn.execute('PRAGMA table_info(ref_data)')]
+        assert 'ord' in cols
+        rows = conn.execute('SELECT ref_pk, data_v, context, ord FROM ref_data').fetchall()
+        assert rows == [('1', 'x', 'ref1', 0), ('1', 'y', 'ref1', 1),
+                        ('1', 'x', 'ref1', 2), ('1', 'x', 'ref1', 3)]
+    db._connection.close()
+
+
+def test_many_to_many_order_does_not_depend_on_rowid(tg_with_foreign_keys):
+    db = Database(tg_with_foreign_keys)
+    keys = ['y', 'x', 'y', 'x', 'x']
+    db.write(ref=[{'pk': '1', 'ref1': keys}], data=[{'v': 'x'}, {'v': 'y'}])
+    # Re-order the association rows physically; read-back must still follow the list order.
+    with db.connection() as conn:
+        conn.execute('CREATE TABLE tmp AS SELECT * FROM ref_data ORDER BY ord DESC')
+        conn.execute('DELETE FROM ref_data')
+        conn.execute('INSERT INTO ref_data SELECT * FROM tmp')
+        conn.execute('DROP TABLE tmp')
+        conn.commit()
+    assert db.read()['ref'][0]['ref1'] == keys
+    db._connection.close()
+
+
+def test_many_to_many_legacy_association_table(tg_with_foreign_keys):
+    db = Database(tg_with_foreign_keys)
+    keys = ['y', 'x', 'y']
+    db.write(ref=[{'pk': '1', 'ref1': keys}], data=[{'v': 'x'}, {'v': 'y'}])
+    # Simulate a database written by an older csvw version, without an `ord` column.
+    with db.connection() as conn:
+        conn.execute('ALTER TABLE ref_data RENAME TO legacy_ref_data')
+        conn.execute(
+            'CREATE TABLE ref_data AS '
+            'SELECT ref_pk, data_v, context FROM legacy_ref_data')
+        conn.execute('DROP TABLE legacy_ref_data')
+        conn.commit()
+    assert db.read()['ref'][0]['ref1'] == keys
+    db._connection.close()
+
+
+def test_many_to_many_ord_with_translated_columns(tg_with_foreign_keys):
+    def translate(table, column=None):
+        return 'c_' + column if column is not None else 't_' + table
+
+    db = Database(tg_with_foreign_keys, translate=translate)
+    keys = ['y', 'x', 'y']
+    db.write(ref=[{'pk': '1', 'ref1': keys}], data=[{'v': 'x'}, {'v': 'y'}])
+    with db.connection() as conn:
+        cols = [row[1] for row in conn.execute('PRAGMA table_info(t_ref_data)')]
+        assert 'c_ord' in cols
+    assert db.read()['t_ref'][0]['c_ref1'] == keys
+    db._connection.close()
+
+
 def test_many_to_many_no_context(tg_with_foreign_keys):
     class DatabaseWithoutContext(Database):
         def association_table_context(self, table, column, fkey):

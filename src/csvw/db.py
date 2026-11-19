@@ -11,7 +11,10 @@ List-valued foreignKeys are supported as follows: For each pair of tables relate
 list-valued foreign key, an association table is created. To make it possible to distinguish
 multiple list-valued foreign keys between the same two tables, the association table has
 a column `context`, which stores the name of the foreign key column from which a row in the
-assocation table was created.
+assocation table was created. Since a list is an ordered sequence that may contain the same
+value more than once, the association table also has an integer column `ord` storing the
+position of a value within the list, so list order and multiplicity are represented in the
+database schema itself rather than relying on insertion order.
 
 Other list-valued columns work in two different ways: If the atomic datatype is `string`, the
 specified separator is used to create a concatenated string representation in the database field.
@@ -193,7 +196,8 @@ class TableSpec:
         We support "light-weight" many-to-many relationships by allowing list-valued foreign key
         columns in CSVW. In the database these columns are turned into an associative table, adding
         the name of the column as value a `context` column. Thus, multiple columns in a table my be
-        specified as targets of many-to-many relations with the same table.
+        specified as targets of many-to-many relations with the same table. An `ord` column records
+        the position of each value within the source list, preserving order and repeated values.
 
         .. seealso:: `<https://en.wikipedia.org/wiki/Associative_entity>`_
     """
@@ -261,7 +265,9 @@ class TableSpec:
         list-valued foreign key, an association table is created. To make it possible to distinguish
         multiple list-valued foreign keys between the same two tables, the association table has
         a column `context`, which stores the name of the foreign key column from which a row in the
-        assocation table was created.
+        assocation table was created. An additional integer column `ord` stores the position of the
+        referenced value within the list, so the original order - including repeated values - is
+        represented explicitly instead of relying on insertion order.
         """
         afk = ColSpec(f'{atable}_{apk}')
         bfk = ColSpec(f'{btable}_{bpk}')
@@ -270,7 +276,8 @@ class TableSpec:
             bfk.name += '_2'
         return cls(
             name=f'{atable}_{btable}',
-            columns=[afk, bfk, ColSpec('context')],
+            columns=[
+                afk, bfk, ColSpec('context'), ColSpec('ord', csvw_type='integer')],
             foreign_keys=[
                 ([afk.name], atable, [apk]),
                 ([bfk.name], btable, [bpk]),
@@ -407,6 +414,11 @@ class Database:
             return quoted(self.translate(tname, cname))
         return quoted(self.translate(tname))
 
+    def _table_columns(self, db: sqlite3.Connection, table: TableSpec) -> set[str]:
+        """List the columns of a table as present in the actual database."""
+        return {row[1] for row in db.execute(
+            f"PRAGMA table_info({self._qt(table.name)})")}
+
     def select_many_to_many(self, db, table, context) -> dict[str, Union[tuple[str, str], str]]:
         """Select data from an association table, grouped by first foreign key."""
         qt = functools.partial(self._qt, table.name)
@@ -414,9 +426,14 @@ class Database:
             context_sql = f"WHERE {qt('context')} = '{context}'"
         else:
             context_sql = ''
+        # Lists are ordered and may contain repeated values, so we order by the explicit
+        # position column if available and fall back to physical row order for databases
+        # written by older versions of csvw.
+        ord_col = self.translate(table.name, 'ord')
+        order_sql = qt('ord') if ord_col in self._table_columns(db, table) else 'rowid'
         sql = (f"SELECT {qt(table.columns[0].name)}, "
                f"       {qt(table.columns[1].name)}, COALESCE({qt('context')}, '') "
-               f"FROM {qt()} {context_sql}")
+               f"FROM {qt()} {context_sql} ORDER BY {order_sql}")
         references = collections.defaultdict(list)
         # Keep association rows intact: keys may contain whitespace, and
         # custom contexts may contain the delimiters used by string aggregation.
@@ -499,10 +516,12 @@ class Database:
                     atkey = tuple([t.many_to_many[k].name] +  # noqa: W504
                                   [c.name for c in t.many_to_many[k].columns])
                     # We distinguish None - meaning NULL - and [] - meaning no items - as
-                    # values of list-valued columns.
+                    # values of list-valued columns. The position of each value within the
+                    # list is recorded explicitly, so order and multiplicity survive even
+                    # if the association rows are re-sorted in the database.
                     refs[atkey].extend([
-                        tuple([pk] + list(self.association_table_context(t, k, vv)))
-                        for vv in (v or [])])
+                        tuple([pk] + list(self.association_table_context(t, k, vv)) + [i])
+                        for i, vv in enumerate(v or [])])
                 else:
                     if k not in cols:
                         if _skip_extra:

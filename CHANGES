@@ -2,6 +2,15 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Association tables for list-valued foreign keys now store an explicit integer `ord`
+  column with the position of each value in the list, so list order and repeated values
+  are represented in the database schema instead of relying on insertion order. Reading
+  falls back to physical row order for databases written by older versions.
+
+
 Version 4.2.0
 -------------
 

@@ -1,3 +1,5 @@
+import csv
+import io
 import urllib.parse
 
 import pytest
@@ -122,6 +124,45 @@ async def test_table_csv_with_invalid_labels():
         "2,3,,b,beta\r\n"
         "3,2,two,c,\r\n"
     )
+
+
+async def test_table_csv_stream_labels_null_first_page_and_label_collision():
+    # Streaming every row with ?_labels=1 must emit the _label headings up
+    # front, even if the first page of rows has only null foreign keys -
+    # later pages fill their labels into those same columns. The main table
+    # also has a real fk_label text column: both columns are kept, with
+    # stable names, and the output parses row by row with the csv module.
+    ds = Datasette()
+    await ds.invoke_startup()
+    db = ds.add_memory_database("csv_label_stream")
+    await db.execute_write_script("""
+        create table ref (id integer primary key, name text);
+        insert into ref (id, name) values (1, 'one'), (2, 'two');
+        create table main (
+            id integer primary key,
+            fk integer references ref(id),
+            fk_label text
+        );
+        insert into main (id, fk, fk_label) values
+            (1, null, 'existing-a'),
+            (2, null, 'existing-b'),
+            (3, 1, 'existing-c'),
+            (4, 2, 'existing-d');
+    """)
+    response = await ds.client.get(
+        "/csv_label_stream/main.csv?_labels=1&_stream=1&_size=2"
+    )
+    assert response.status_code == 200
+    rows = list(csv.reader(io.StringIO(response.text)))
+    assert rows == [
+        ["id", "fk", "fk_label", "fk_label"],
+        ["1", "", "", "existing-a"],
+        ["2", "", "", "existing-b"],
+        ["3", "1", "one", "existing-c"],
+        ["4", "2", "two", "existing-d"],
+    ]
+    # Every row has the same number of cells as the header
+    assert all(len(row) == len(rows[0]) for row in rows)
 
 
 async def test_table_csv_blob_columns(ds_client):

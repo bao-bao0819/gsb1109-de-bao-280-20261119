@@ -4,6 +4,7 @@ from core.tests.resources import BookResource
 from django.test import TestCase
 
 from import_export import fields, resources, widgets
+from import_export.results import RowResult
 
 
 class ForeignKeyM2MTest(TestCase):
@@ -127,3 +128,112 @@ class ForeignKeyM2MTest(TestCase):
         self.assertIn(cat2, book2.categories.all())
         self.assertIn(cat3, book2.categories.all())
         self.assertIn(cat4, book2.categories.all())
+
+
+class ManyToManyOrderInsensitiveSkipTest(TestCase):
+    """
+    Re-running an import must not report a row as updated when the
+    many-to-many column only changes its text ordering or repeats a value,
+    because the set of related objects is unchanged.  A row which genuinely
+    drops a related object must still be updated and the relation removed.
+    """
+
+    def _resource(self):
+        class BookM2MResource(resources.ModelResource):
+            categories = fields.Field(
+                attribute="categories",
+                widget=widgets.ManyToManyWidget(
+                    Category, field="name", separator="|"
+                ),
+            )
+
+            class Meta:
+                model = Book
+                skip_unchanged = True
+                report_skipped = True
+
+        return BookM2MResource()
+
+    def setUp(self):
+        self.green = Category.objects.create(name="green")
+        self.blue = Category.objects.create(name="blue")
+        self.equivalent_book = Book.objects.create(name="equivalent")
+        self.equivalent_book.categories.set([self.green, self.blue])
+        self.removed_book = Book.objects.create(name="removed")
+        self.removed_book.categories.set([self.green, self.blue])
+
+    def _dataset(self):
+        dataset = tablib.Dataset(headers=["id", "name", "categories"])
+        # the same relationship as "green|blue", reordered and duplicated
+        dataset.append(
+            [self.equivalent_book.pk, "equivalent", "blue|green|green"]
+        )
+        # the "green" relation is genuinely removed
+        dataset.append([self.removed_book.pk, "removed", "blue"])
+        return dataset
+
+    def test_equivalent_row_skipped_and_removal_updates(self):
+        result = self._resource().import_data(
+            self._dataset(), dry_run=False, raise_errors=True
+        )
+        equivalent_row, removed_row = result.rows
+
+        self.assertEqual(
+            equivalent_row.import_type, RowResult.IMPORT_TYPE_SKIP
+        )
+        self.assertEqual(removed_row.import_type, RowResult.IMPORT_TYPE_UPDATE)
+
+        self.equivalent_book.refresh_from_db()
+        self.removed_book.refresh_from_db()
+        self.assertSetEqual(
+            set(self.equivalent_book.categories.values_list("name", flat=True)),
+            {"green", "blue"},
+        )
+        self.assertSetEqual(
+            set(self.removed_book.categories.values_list("name", flat=True)),
+            {"blue"},
+        )
+        self.assertNotIn(self.green, self.removed_book.categories.all())
+
+    def test_rerunning_the_file_keeps_the_equivalent_row_skipped(self):
+        resource = self._resource()
+        first = resource.import_data(
+            self._dataset(), dry_run=False, raise_errors=True
+        )
+        second = resource.import_data(
+            self._dataset(), dry_run=False, raise_errors=True
+        )
+        # the equivalent row is never reported as an update, even on rerun
+        self.assertEqual(
+            first.rows[0].import_type, RowResult.IMPORT_TYPE_SKIP
+        )
+        self.assertEqual(
+            second.rows[0].import_type, RowResult.IMPORT_TYPE_SKIP
+        )
+        # the removal is applied on the first run; the same file then leaves
+        # the already-updated row unchanged on the second run
+        self.assertEqual(
+            first.rows[1].import_type, RowResult.IMPORT_TYPE_UPDATE
+        )
+        self.assertEqual(
+            second.rows[1].import_type, RowResult.IMPORT_TYPE_SKIP
+        )
+        self.equivalent_book.refresh_from_db()
+        self.removed_book.refresh_from_db()
+        self.assertSetEqual(
+            set(self.equivalent_book.categories.values_list("name", flat=True)),
+            {"green", "blue"},
+        )
+        self.assertSetEqual(
+            set(self.removed_book.categories.values_list("name", flat=True)),
+            {"blue"},
+        )
+
+    def test_equivalent_row_preview_shows_no_change(self):
+        result = self._resource().import_data(
+            self._dataset(), dry_run=True, raise_errors=True
+        )
+        index = self._resource().get_diff_headers().index("categories")
+        diff_html = result.rows[0].diff[index]
+        self.assertNotIn("<del", diff_html)
+        self.assertNotIn("<ins", diff_html)

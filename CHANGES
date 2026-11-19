@@ -2,6 +2,15 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- `TableGroup.copy` now returns `ReferenceResolver` objects listing which link properties (table
+  URLs, foreign key resources) have a local copy. Only references with a local copy are copied and
+  rewritten to the new path; references without a local copy, e.g. explicit external URLs, are
+  reported and left untouched.
+
+
 Version 4.2.0
 -------------
 

@@ -334,13 +334,107 @@ class TestTableGroup:
         t = csvw.TableGroup.from_file(FIXTURES / 'csv.txt-metadata.json')
         l = len(list(t.tabledict['csv.txt']))
         assert not tmp_path.joinpath('csv.txt-metadata.json').exists()
-        t.copy(tmp_path)
+        refs = t.copy(tmp_path)
         assert tmp_path.joinpath('csv.txt-metadata.json').exists()
         assert tmp_path.joinpath('csv.txt').exists()
+        assert len(refs) == 1
+        assert refs[0].name == 'tables/0/url'
+        assert refs[0].url == 'csv.txt'
+        assert refs[0].local
         # Make sure the copied TableGroup reads from the new files:
         tmp_path.joinpath('csv.txt').write_text(
             tmp_path.joinpath('csv.txt').read_text('utf8') + '\nabc,b', 'utf8')
         assert len(list(t.tabledict['csv.txt'])) == l + 1
+
+    def test_copy_reports_references_without_local_copy(self, tmp_path):
+        metadata = json.dumps({
+            "@context": "http://www.w3.org/ns/csvw",
+            "tables": [
+                {"url": "csv.txt"},
+                {"url": "http://example.org/remote.csv"},
+            ],
+        })
+        t = self._make_tablegroup(tmp_path, metadata=metadata)
+        dest = tmp_path / 'copy'
+        dest.mkdir()
+        refs = t.copy(dest, fail_on_missing=False)
+        assert [(r.name, r.local) for r in refs] == [
+            ('tables/0/url', True),
+            ('tables/1/url', False)]
+        remote = refs[1]
+        assert remote.url == 'http://example.org/remote.csv'
+        assert remote.resolved == 'http://example.org/remote.csv'
+        assert dest.joinpath('csv.txt').exists()
+        assert not dest.joinpath('remote.csv').exists()
+        # The explicit external URL is left untouched in the copied metadata:
+        copied = _load_json(dest / 'md')
+        assert copied['tables'][0]['url'] == 'csv.txt'
+        assert copied['tables'][1]['url'] == 'http://example.org/remote.csv'
+        # The copied metadata remains usable, resolving the local table against the new path:
+        t2 = csvw.TableGroup.from_file(dest / 'md')
+        assert t2.tables[0].url.resolve(t2.base) == dest / 'csv.txt'
+        assert t2.tables[1].url.resolve(t2.base) == 'http://example.org/remote.csv'
+
+    def test_copy_missing_local_reference(self, tmp_path):
+        metadata = json.dumps({
+            "@context": "http://www.w3.org/ns/csvw",
+            "tables": [{"url": "missing.csv"}],
+        })
+        t = self._make_tablegroup(tmp_path, metadata=metadata)
+        dest = tmp_path / 'copy'
+        dest.mkdir()
+        with pytest.raises(FileNotFoundError):
+            t.copy(dest)
+        t = self._make_tablegroup(tmp_path, metadata=metadata)
+        refs = t.copy(dest, fail_on_missing=False)
+        assert len(refs) == 1
+        assert refs[0].local is False
+        assert isinstance(refs[0].resolved, pathlib.Path)
+        assert refs[0].resolved.name == 'missing.csv'
+        copied = _load_json(dest / 'md')
+        assert copied['tables'][0]['url'] == 'missing.csv'
+
+    def test_copy_preserves_nested_local_paths(self, tmp_path):
+        (tmp_path / 'data').mkdir()
+        (tmp_path / 'data' / 'nested').mkdir()
+        (tmp_path / 'data' / 'nested' / 'a.csv').write_text('ID\n1\n', encoding='utf8')
+        (tmp_path / 'data' / 'b.csv').write_text('ID\n1\n', encoding='utf8')
+        metadata = json.dumps({
+            "@context": "http://www.w3.org/ns/csvw",
+            "tables": [
+                {"url": "nested/a.csv"},
+                {"url": "b.csv"},
+            ],
+        })
+        (tmp_path / 'data' / 'md.json').write_text(metadata, encoding='utf8')
+        tg = csvw.TableGroup.from_file(tmp_path / 'data' / 'md.json')
+        dest = tmp_path / 'copy'
+        refs = tg.copy(dest)
+        assert all(r.local for r in refs)
+        assert dest.joinpath('nested', 'a.csv').exists()
+        assert dest.joinpath('b.csv').exists()
+        copied = _load_json(dest / 'md.json')
+        assert [t['url'] for t in copied['tables']] == ['nested/a.csv', 'b.csv']
+        tg2 = csvw.TableGroup.from_file(dest / 'md.json')
+        assert tg2.tables[0].url.resolve(tg2.base) == dest / 'nested' / 'a.csv'
+
+    def test_copy_rewrites_foreign_key_resources(self, tmp_path):
+        shutil.copytree(FIXTURES / 'multitable', tmp_path / 'multi')
+        tg = csvw.TableGroup.from_file(tmp_path / 'multi' / 'metadata.json')
+        dest = tmp_path / 'out'
+        dest.mkdir()
+        refs = tg.copy(dest)
+        fk_ref = next(
+            r for r in refs
+            if r.name == 'tables/0/tableSchema/foreignKeys/0/reference/resource')
+        assert fk_ref.local and fk_ref.url == 't2.csv'
+        assert dest.joinpath('t1.csv').exists()
+        assert dest.joinpath('t2.csv').exists()
+        copied = _load_json(dest / 'metadata.json')
+        fk = copied['tables'][0]['tableSchema']['foreignKeys'][0]
+        assert fk['reference']['resource'] == 't2.csv'
+        tg2 = csvw.TableGroup.from_file(dest / 'metadata.json')
+        assert tg2.tabledict['t2.csv'].url.resolve(tg2.base) == dest / 't2.csv'
 
     def test_write_all(self, tmp_path):
         t = self._make_tablegroup(tmp_path)

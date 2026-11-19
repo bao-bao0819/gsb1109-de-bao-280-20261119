@@ -41,7 +41,7 @@ DEFAULT = object()
 
 __all__ = [
     'TableGroup', 'Table', 'Column', 'ForeignKey', 'Link', 'NaturalLanguage', 'Datatype',
-    'is_url', 'CSVW',
+    'is_url', 'CSVW', 'ReferenceResolver',
 ]
 
 is_url = utils.is_url
@@ -1264,6 +1264,34 @@ class ForeignKeyInstance:
 
 
 @dataclasses.dataclass
+class ReferenceResolver:
+    """
+    Information about a link property encountered while copying a TableGroup, indicating whether
+    a local copy of the referenced resource is available.
+
+    :ivar name: JSON pointer-style path of the link property within the metadata document,
+        e.g. ``tables/0/url``.
+    :ivar url: The link as specified in the metadata.
+    :ivar resolved: The link resolved against the TableGroup's base - a `pathlib.Path` for local
+        references or a `str` URL for explicit external references.
+    :ivar local: `True` if the referenced resource exists as a local file.
+    """
+    name: str
+    url: Union[str, pathlib.Path]
+    resolved: Union[pathlib.Path, str]
+    local: bool
+
+    @classmethod
+    def from_link(cls, name: str, link: Link, base) -> 'ReferenceResolver':
+        resolved = link.resolve(base)
+        return cls(
+            name=name,
+            url=link.string,
+            resolved=resolved,
+            local=hasattr(resolved, 'exists') and resolved.exists())
+
+
+@dataclasses.dataclass
 class TableGroup(TableLike):
     """
     A table group description is an object that describes a group of tables.
@@ -1320,19 +1348,63 @@ class TableGroup(TableLike):
             self.tabledict[tname].write(rows, base=fname.parent, strict=strict, _zipped=_zipped)
         self.to_file(fname)
 
-    def copy(self, dest: Union[pathlib.Path, str]):
+    def copy(self, dest: Union[pathlib.Path, str], fail_on_missing: bool = True) \
+            -> list[ReferenceResolver]:
         """
         Write a TableGroup's data and metadata to files relative to `dest`, adapting the `base`
         attribute.
 
-        :param dest:
-        :return:
+        All link properties (table URLs, foreign key resources and external schema references)
+        are inspected. References resolving to an existing local file are copied to `dest` and
+        rewritten to point at the new local path. References without a local copy (in particular
+        explicit external URLs) are left untouched, so the original metadata and its explicit
+        external URLs remain usable separately.
+
+        :param dest: Directory to copy the TableGroup's local files into.
+        :param fail_on_missing: If `True` (the default), a local reference whose file does not
+            exist raises a `FileNotFoundError`. If `False`, such a reference is reported instead.
+        :return: A list of `ReferenceResolver` objects, one per inspected link property, listing
+            which references have a local copy and which do not.
         """
         dest = pathlib.Path(dest)
-        for table in self.tables:
-            shutil.copy(str(table.url.resolve(self.base)), str(table.url.resolve(dest)))
+        dest.mkdir(parents=True, exist_ok=True)
+        references: list[ReferenceResolver] = []
+
+        def handle(link: Optional[Link], name: str) -> None:
+            if link is None:
+                return
+            ref = ReferenceResolver.from_link(name, link, self.base)
+            references.append(ref)
+            if not ref.local:
+                if isinstance(ref.resolved, pathlib.Path) and fail_on_missing:
+                    raise FileNotFoundError(str(ref.resolved))
+                return
+            rel = pathlib.Path(link.string)
+            if rel.is_absolute() or '..' in rel.parts:
+                # Flatten absolute paths or references escaping the metadata directory so the
+                # copied bundle stays self-contained.
+                rel = pathlib.Path(rel.name)
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(str(ref.resolved), str(target))
+            link.string = rel.as_posix()
+
+        for index, table in enumerate(self.tables):
+            handle(table.url, f'tables/{index}/url')
+            schema = table.tableSchema
+            if not isinstance(schema, Schema):
+                continue
+            for fk_index, fk in enumerate(schema.foreignKeys):
+                if fk.reference is not None:
+                    handle(fk.reference.resource,
+                           f'tables/{index}/tableSchema/foreignKeys/{fk_index}/reference/resource')
+                    handle(fk.reference.schemaReference,
+                           f'tables/{index}/tableSchema/foreignKeys/{fk_index}/reference/'
+                           'schemaReference')
+
         self._fname = dest / self._fname.name
         self.to_file(self._fname)
+        return references
 
     @property
     def tabledict(self) -> dict[str, Table]:

@@ -59,6 +59,31 @@ such mechanisms. This part of the spec is implemented in :class:`csvw.CSVW`.
     :members:
 
 
+Copying a TableGroup for offline use
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`csvw.TableGroup.copy` copies a TableGroup's data and metadata into another directory,
+rewriting the local references to the new paths. It returns a list of
+:class:`csvw.ReferenceResolver` objects, one per link property (table URLs and foreign key
+resources), which records whether a local copy of the referenced resource exists:
+
+.. code-block:: python
+
+    >>> tg = TableGroup.from_file('metadata.json')
+    >>> refs = tg.copy('delivery', fail_on_missing=False)
+    >>> [(r.name, r.local) for r in refs]
+    [('tables/0/url', True), ('tables/1/url', False)]
+
+References with a local copy are copied and rewritten to the new path. References without a
+local copy - in particular explicit external URLs such as ``http://example.org/data.csv`` - are
+reported with ``local=False`` and left untouched, so the original metadata and its explicit
+external URLs remain usable separately. By default a local reference whose file is missing
+raises `FileNotFoundError`; pass ``fail_on_missing=False`` to report it instead.
+
+.. autoclass:: csvw.ReferenceResolver
+    :members:
+
+
 Top-level descriptions
 ----------------------
 

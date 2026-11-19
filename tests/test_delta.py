@@ -17,7 +17,8 @@ from deepdiff.delta import (
     BINIARY_MODE_NEEDED_MSG, DELTA_AT_LEAST_ONE_ARG_NEEDED, DeltaError,
     INVALID_ACTION_WHEN_CALLING_GET_ELEM, INVALID_ACTION_WHEN_CALLING_SIMPLE_SET_ELEM,
     INVALID_ACTION_WHEN_CALLING_SIMPLE_DELETE_ELEM, INDEXES_NOT_FOUND_WHEN_IGNORE_ORDER,
-    FAIL_TO_REMOVE_ITEM_IGNORE_ORDER_MSG, UNABLE_TO_GET_PATH_MSG, NOT_VALID_NUMPY_TYPE)
+    FAIL_TO_REMOVE_ITEM_IGNORE_ORDER_MSG, UNABLE_TO_GET_PATH_MSG, NOT_VALID_NUMPY_TYPE,
+    DeltaConflict)
 from deepdiff.serialization import (
     DELTA_IGNORE_ORDER_NEEDS_REPETITION_REPORT, DELTA_ERROR_WHEN_GROUP_BY,
     json_dumps, json_loads,
@@ -3058,3 +3059,212 @@ class TestDeltaCompareFunc:
         assert [item for item in result if "id" not in item] == [], \
             "Phantom entries (dicts missing 'id') found in result"
         assert result == t2
+
+
+class TestDeltaSelectiveApply:
+    """
+    Delta.apply selectively applies only the changes whose baseline still
+    matches the target object and reports the rest as conflicts.
+    """
+
+    def test_apply_values_changed_baseline_match_and_conflict(self):
+        t1 = {'a': 1, 'b': 2, 'c': 3}
+        t2 = {'a': 10, 'b': 20, 'c': 3}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = {'a': 1, 'b': 999, 'c': 3}
+        outcome = delta.apply(current)
+        assert outcome.result == {'a': 10, 'b': 999, 'c': 3}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['b']", action='values_changed', old_value=2,
+            new_value=20, current_value=999, reason='value mismatch')]
+        # The input object is not mutated.
+        assert current == {'a': 1, 'b': 999, 'c': 3}
+
+    def test_apply_no_conflicts(self):
+        t1 = {'a': 1, 'b': [1, 2]}
+        t2 = {'a': 2, 'b': [1, 2, 3], 'c': 'new'}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = copy.deepcopy(t1)
+        outcome = delta.apply(current)
+        assert outcome.result == t2
+        assert outcome.conflicts == []
+
+    def test_apply_result_can_be_unpacked(self):
+        t1 = {'a': 1}
+        t2 = {'a': 2}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        result, conflicts = delta.apply({'a': 1})
+        assert result == {'a': 2}
+        assert conflicts == []
+
+    def test_apply_missing_ancestor_does_not_create_partial_object(self):
+        t1 = {'x': {'y': 1}, 'z': 5}
+        t2 = {'x': {'y': 2}, 'z': 6}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = {'z': 5}
+        outcome = delta.apply(current)
+        # The change under the deleted 'x' branch is skipped entirely:
+        # no partial 'x' object is recreated.
+        assert outcome.result == {'z': 6}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['x']['y']", action='values_changed', old_value=1,
+            new_value=2, reason='missing ancestor')]
+        assert current == {'z': 5}
+
+    def test_apply_missing_ancestor_for_added_item(self):
+        t1 = {'x': {'y': 1}}
+        t2 = {'x': {'y': 1, 'y2': 2}}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = {}
+        outcome = delta.apply(current)
+        assert outcome.result == {}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['x']['y2']", action='dictionary_item_added',
+            new_value=2, reason='missing ancestor')]
+        assert current == {}
+
+    def test_apply_dictionary_item_added_already_exists(self):
+        t1 = {'keep': 1}
+        t2 = {'keep': 1, 'new': 3}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = {'keep': 1, 'new': 'occupied'}
+        outcome = delta.apply(current)
+        assert outcome.result == {'keep': 1, 'new': 'occupied'}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['new']", action='dictionary_item_added',
+            new_value=3, current_value='occupied', reason='already exists')]
+
+    def test_apply_dictionary_item_removed(self):
+        t1 = {'keep': 1, 'gone': 2}
+        t2 = {'keep': 1}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        outcome = delta.apply({'keep': 1, 'gone': 2})
+        assert outcome.result == {'keep': 1}
+        assert outcome.conflicts == []
+        # The baseline drifted: the item no longer has the expected value.
+        outcome = delta.apply({'keep': 1, 'gone': 999})
+        assert outcome.result == {'keep': 1, 'gone': 999}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['gone']", action='dictionary_item_removed',
+            old_value=2, current_value=999, reason='value mismatch')]
+
+    def test_apply_directed_delta_without_old_values(self):
+        # A directed delta does not store old values for values_changed,
+        # so those changes are applied without baseline verification.
+        # Missing ancestors are still reported as conflicts though.
+        t1 = {'x': {'y': 1}, 'z': 1}
+        t2 = {'x': {'y': 2}, 'z': 2}
+        delta = Delta(DeepDiff(t1, t2))
+        current = {'z': 1}
+        outcome = delta.apply(current)
+        assert outcome.result == {'z': 2}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['x']['y']", action='values_changed',
+            new_value=2, reason='missing ancestor')]
+
+    def test_apply_type_changes_verified_by_old_type(self):
+        t1 = {'a': 1}
+        t2 = {'a': '1'}
+        delta = Delta(DeepDiff(t1, t2))
+        outcome = delta.apply({'a': 2})
+        assert outcome.result == {'a': '2'}
+        assert outcome.conflicts == []
+        # The current value is already a string: the baseline type drifted.
+        outcome = delta.apply({'a': 'unchanged'})
+        assert outcome.result == {'a': 'unchanged'}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['a']", action='type_changes',
+            current_value='unchanged', reason='value mismatch')]
+
+    def test_apply_type_changes_with_old_value(self):
+        t1 = {'a': 1}
+        t2 = {'a': '1'}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        outcome = delta.apply({'a': 5})
+        assert outcome.result == {'a': 5}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['a']", action='type_changes', old_value=1,
+            new_value='1', current_value=5, reason='value mismatch')]
+
+    def test_apply_iterable_changes(self):
+        t1 = [1, 2, 3]
+        t2 = [10, 2]
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = [1, 2, 3, 99]
+        outcome = delta.apply(current)
+        assert outcome.result == [10, 2, 99]
+        assert outcome.conflicts == []
+        # The item to be removed no longer matches the baseline.
+        outcome = delta.apply([1, 2, 30])
+        assert outcome.result == [10, 2, 30]
+        assert outcome.conflicts == [DeltaConflict(
+            path='root[2]', action='iterable_item_removed',
+            old_value=3, current_value=30, reason='value mismatch')]
+
+    def test_apply_iterable_item_added_missing_ancestor(self):
+        t1 = {'x': [1]}
+        t2 = {'x': [1, 2]}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = {}
+        outcome = delta.apply(current)
+        assert outcome.result == {}
+        assert outcome.conflicts == [DeltaConflict(
+            path="root['x'][1]", action='iterable_item_added',
+            new_value=2, reason='missing ancestor')]
+
+    def test_apply_set_items(self):
+        t1 = {'s': {1, 2, 3}}
+        t2 = {'s': {2, 3, 4}}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        outcome = delta.apply({'s': {1, 2, 3}})
+        assert outcome.result == {'s': {2, 3, 4}}
+        assert outcome.conflicts == []
+        # The member to remove is already gone and the member to add
+        # already exists: both are reported but the end state is kept.
+        outcome = delta.apply({'s': {2, 3, 4}})
+        assert outcome.result == {'s': {2, 3, 4}}
+        assert len(outcome.conflicts) == 2
+        assert DeltaConflict(path="root['s']", action='set_item_removed',
+                             old_value=1, reason='value mismatch') in outcome.conflicts
+        assert DeltaConflict(path="root['s']", action='set_item_added',
+                             new_value=4, current_value=4, reason='already exists') in outcome.conflicts
+
+    def test_apply_attributes_on_objects(self):
+        class MyObj:
+            pass
+
+        t1 = MyObj()
+        t1.a = 1
+        t2 = MyObj()
+        t2.a = 2
+        t2.b = 3
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = MyObj()
+        current.a = 100
+        outcome = delta.apply(current)
+        assert outcome.result.a == 100
+        assert outcome.result.b == 3
+        assert outcome.conflicts == [DeltaConflict(
+            path='root.a', action='values_changed', old_value=1,
+            new_value=2, current_value=100, reason='value mismatch')]
+        assert not hasattr(current, 'b')
+
+    def test_apply_does_not_mutate_even_when_delta_created_with_mutate(self):
+        t1 = {'a': 1}
+        t2 = {'a': 2}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True, mutate=True)
+        current = {'a': 1}
+        outcome = delta.apply(current)
+        assert outcome.result == {'a': 2}
+        assert current == {'a': 1}
+
+    def test_apply_everything_conflicts_returns_deepcopy(self):
+        t1 = {'a': 1}
+        t2 = {'a': 2}
+        delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        current = {'a': 100, 'nested': {'x': [1]}}
+        outcome = delta.apply(current)
+        assert outcome.result == current
+        assert outcome.result is not current
+        assert outcome.result['nested'] is not current['nested']
+        assert len(outcome.conflicts) == 1

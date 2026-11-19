@@ -1,6 +1,6 @@
 import copy
 import logging
-from typing import List, Dict, IO, Callable, Set, Union, Optional, Any, cast
+from typing import List, Dict, IO, Callable, NamedTuple, Set, Union, Optional, Any, cast
 from functools import partial, cmp_to_key
 from collections.abc import Mapping
 from copy import deepcopy
@@ -46,6 +46,11 @@ INDEXES_NOT_FOUND_WHEN_IGNORE_ORDER = 'Delta added to an incompatible object. Un
 NUMPY_TO_LIST = 'NUMPY_TO_LIST'
 NOT_VALID_NUMPY_TYPE = "{} is not a valid numpy type."
 
+CONFLICT_MISSING_ANCESTOR = 'missing ancestor'
+CONFLICT_MISSING_ITEM = 'missing item'
+CONFLICT_VALUE_MISMATCH = 'value mismatch'
+CONFLICT_ALREADY_EXISTS = 'already exists'
+
 doc = get_doc('delta.rst')
 
 
@@ -61,6 +66,48 @@ class DeltaNumpyOperatorOverrideError(ValueError):
     Delta Numpy Operator Override Error
     """
     pass
+
+
+class DeltaConflict(NamedTuple):
+    """
+    A single change in a delta whose baseline no longer matches the object
+    that the delta is being selectively applied to via Delta.apply().
+
+    path : The string path of the change, e.g. "root['a'][2]".
+
+    action : The delta action of the change, e.g. "values_changed".
+
+    old_value : The baseline value recorded in the delta (the value when the
+        delta was created). It is not_found when the delta does not store it.
+
+    new_value : The value the delta intended to write. It is not_found for
+        removals.
+
+    current_value : The value currently found in the target object. It is
+        not_found when the item (or its ancestor) is missing.
+
+    reason : One of 'missing ancestor', 'missing item', 'value mismatch' or
+        'already exists'.
+    """
+    path: str
+    action: str
+    old_value: Any = not_found
+    new_value: Any = not_found
+    current_value: Any = not_found
+    reason: str = ''
+
+
+class DeltaApplyResult(NamedTuple):
+    """
+    The result of Delta.apply().
+
+    result : The new object with all the non-conflicting changes applied.
+
+    conflicts : The list of DeltaConflict items that were skipped because
+        their baseline no longer matched the target object.
+    """
+    result: Any
+    conflicts: List[DeltaConflict]
 
 
 class Delta:
@@ -214,6 +261,261 @@ class Delta:
         result = self.__add__(other)
         self.diff, self._reversed_diff = self._reversed_diff, self.diff
         return result
+
+    @staticmethod
+    def _resolve_path_for_verify(obj, elements):
+        """
+        Navigate obj by elements without modifying it.
+        Returns (status, value) where status is 'ok', CONFLICT_MISSING_ITEM
+        or CONFLICT_MISSING_ANCESTOR.
+        """
+        last_index = len(elements) - 1
+        for index, (elem, action) in enumerate(elements):
+            check_elem(elem)
+            try:
+                if action == GET:
+                    obj = obj[elem]
+                elif action == GETATTR:
+                    obj = getattr(obj, elem)
+            except (KeyError, IndexError, AttributeError, TypeError):
+                if index < last_index:
+                    return CONFLICT_MISSING_ANCESTOR, not_found
+                return CONFLICT_MISSING_ITEM, not_found
+        return 'ok', obj
+
+    def _partition_for_selective_apply(self, other):
+        """
+        Partition the changes in the delta into the ones whose baseline still
+        matches the current object and the ones that conflict.
+        Returns (applicable_diff, conflicts).
+        """
+        applicable = {}
+        conflicts = []
+        diff = self.diff
+        compare_func_was_used = diff.get('_iterable_compare_func_was_used', False)
+        opcode_list_paths = None
+        if compare_func_was_used and diff.get('_iterable_opcodes'):
+            opcode_list_paths = {tuple(_path_to_elements(i)) for i in diff['_iterable_opcodes']}
+
+        def resolve(path):
+            elements = _path_to_elements(path, root_element=None)
+            return self._resolve_path_for_verify(other, elements)
+
+        def add_applicable(action, path, info):
+            if action not in applicable:
+                applicable[action] = {}
+            applicable[action][path] = info
+
+        for action in ('values_changed', 'type_changes'):
+            for path, info in diff.get(action, {}).items():
+                apply_path = path
+                if compare_func_was_used and info.get('new_path'):
+                    if not (opcode_list_paths and tuple(_path_to_elements(path))[:-1] in opcode_list_paths):
+                        apply_path = info['new_path']
+                expected_old_value = info.get('old_value', not_found)
+                new_value = info.get('new_value', not_found)
+                status, current_value = resolve(apply_path)
+                if status != 'ok':
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, old_value=expected_old_value,
+                        new_value=new_value, reason=status))
+                elif expected_old_value is not not_found and current_value != expected_old_value:
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, old_value=expected_old_value,
+                        new_value=new_value, current_value=current_value,
+                        reason=CONFLICT_VALUE_MISMATCH))
+                elif (expected_old_value is not_found and action == 'type_changes'
+                      and 'old_type' in info and type(current_value) is not info['old_type']):
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, old_value=expected_old_value,
+                        new_value=new_value, current_value=current_value,
+                        reason=CONFLICT_VALUE_MISMATCH))
+                else:
+                    add_applicable(action, path, info)
+
+        for action in ('dictionary_item_removed', 'attribute_removed', 'iterable_item_removed'):
+            for path, old_value in diff.get(action, {}).items():
+                status, current_value = resolve(path)
+                if status == 'ok' and current_value == old_value:
+                    add_applicable(action, path, old_value)
+                elif status == 'ok':
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, old_value=old_value,
+                        current_value=current_value, reason=CONFLICT_VALUE_MISMATCH))
+                else:
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, old_value=old_value, reason=status))
+
+        for action in ('dictionary_item_added', 'attribute_added'):
+            for path, new_value in diff.get(action, {}).items():
+                status, current_value = resolve(path)
+                if status == CONFLICT_MISSING_ITEM:
+                    add_applicable(action, path, new_value)
+                elif status == CONFLICT_MISSING_ANCESTOR:
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, new_value=new_value, reason=status))
+                else:
+                    conflicts.append(DeltaConflict(
+                        path=path, action=action, new_value=new_value,
+                        current_value=current_value, reason=CONFLICT_ALREADY_EXISTS))
+
+        for path, new_value in diff.get('iterable_item_added', {}).items():
+            status, current_value = resolve(path)
+            if status == CONFLICT_MISSING_ANCESTOR:
+                conflicts.append(DeltaConflict(
+                    path=path, action='iterable_item_added', new_value=new_value, reason=status))
+            else:
+                add_applicable('iterable_item_added', path, new_value)
+
+        for path, info in diff.get('iterable_item_moved', {}).items():
+            value = info['value']
+            status, current_value = resolve(path)
+            if status == 'ok' and current_value == value:
+                add_applicable('iterable_item_moved', path, info)
+            elif status == 'ok':
+                conflicts.append(DeltaConflict(
+                    path=path, action='iterable_item_moved', old_value=value,
+                    new_value=value, current_value=current_value,
+                    reason=CONFLICT_VALUE_MISMATCH))
+            else:
+                conflicts.append(DeltaConflict(
+                    path=path, action='iterable_item_moved', old_value=value,
+                    new_value=value, reason=status))
+
+        for action in ('set_item_added', 'set_item_removed'):
+            for path, values in diff.get(action, {}).items():
+                status, current_value = resolve(path)
+                for value in values:
+                    if status != 'ok':
+                        if action == 'set_item_added':
+                            conflicts.append(DeltaConflict(
+                                path=path, action=action, new_value=value, reason=status))
+                        else:
+                            conflicts.append(DeltaConflict(
+                                path=path, action=action, old_value=value, reason=status))
+                    elif action == 'set_item_added':
+                        if value in current_value:
+                            conflicts.append(DeltaConflict(
+                                path=path, action=action, new_value=value,
+                                current_value=value, reason=CONFLICT_ALREADY_EXISTS))
+                        else:
+                            if action not in applicable:
+                                applicable[action] = {}
+                            applicable[action].setdefault(path, set()).add(value)
+                    else:
+                        if value in current_value:
+                            if action not in applicable:
+                                applicable[action] = {}
+                            applicable[action].setdefault(path, set()).add(value)
+                        else:
+                            conflicts.append(DeltaConflict(
+                                path=path, action=action, old_value=value,
+                                reason=CONFLICT_VALUE_MISMATCH))
+
+        for action in ('iterable_items_added_at_indexes', 'iterable_items_removed_at_indexes'):
+            for path, index_to_value in diff.get(action, {}).items():
+                status, container = resolve(path)
+                for index, value in index_to_value.items():
+                    item_path = '{}[{}]'.format(path, index)
+                    if status != 'ok':
+                        conflicts.append(DeltaConflict(
+                            path=item_path, action=action, new_value=value, reason=status))
+                    elif action == 'iterable_items_removed_at_indexes':
+                        try:
+                            current_value = container[index]
+                        except (KeyError, IndexError, TypeError):
+                            conflicts.append(DeltaConflict(
+                                path=item_path, action=action, old_value=value,
+                                reason=CONFLICT_MISSING_ITEM))
+                        else:
+                            if current_value == value:
+                                if action not in applicable:
+                                    applicable[action] = {}
+                                applicable[action].setdefault(path, {})[index] = value
+                            else:
+                                conflicts.append(DeltaConflict(
+                                    path=item_path, action=action, old_value=value,
+                                    current_value=current_value, reason=CONFLICT_VALUE_MISMATCH))
+                    else:
+                        if action not in applicable:
+                            applicable[action] = {}
+                        applicable[action].setdefault(path, {})[index] = value
+
+        for path, opcodes in diff.get('_iterable_opcodes', {}).items():
+            status, container = resolve(path)
+            if status != 'ok':
+                conflicts.append(DeltaConflict(
+                    path=path, action='iterable_opcodes', reason=status))
+                continue
+            mismatch = None
+            for opcode in opcodes:
+                if opcode.old_values is not None:
+                    try:
+                        current_segment = list(container[opcode.t1_from_index:opcode.t1_to_index])
+                    except TypeError:
+                        current_segment = not_found
+                    if current_segment != list(opcode.old_values):
+                        mismatch = (opcode, current_segment)
+                        break
+            if mismatch:
+                opcode, current_segment = mismatch
+                conflicts.append(DeltaConflict(
+                    path=path, action='iterable_opcodes', old_value=opcode.old_values,
+                    new_value=opcode.new_values, current_value=current_segment,
+                    reason=CONFLICT_VALUE_MISMATCH))
+            else:
+                add_applicable('_iterable_opcodes', path, opcodes)
+
+        for meta_key in ('_numpy_paths', '_iterable_compare_func_was_used'):
+            if meta_key in diff:
+                applicable[meta_key] = diff[meta_key]
+        return applicable, conflicts
+
+    def apply(self, other):
+        """
+        Selectively apply the delta to an object whose current state may have
+        drifted from the baseline the delta was created from.
+
+        Only the changes whose baseline still matches the object are applied.
+        Every skipped change is reported as a DeltaConflict that includes the
+        old (baseline) value, the intended new value and the current value.
+
+        Unlike ``delta + other``, this function never partially creates
+        missing objects: when the ancestor of a changed path has been removed,
+        the change is reported as a conflict instead of recreating a partial
+        object. The input object is never mutated, regardless of the mutate
+        parameter the delta was created with.
+
+        Note that in order for the baseline of value and type changes to be
+        verified, the delta needs to store the old values. Create the delta
+        with bidirectional=True or always_include_values=True for the strictest
+        verification. Removals always store the old value and additions are
+        verified to not overwrite existing items.
+
+        Returns a DeltaApplyResult named tuple of (result, conflicts).
+
+        >>> from deepdiff import DeepDiff, Delta
+        >>> t1 = {'a': 1, 'b': 2}
+        >>> t2 = {'a': 10, 'b': 20}
+        >>> delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+        >>> current = {'a': 1, 'b': 999}
+        >>> outcome = delta.apply(current)
+        >>> outcome.result
+        {'a': 10, 'b': 999}
+        >>> outcome.conflicts
+        [DeltaConflict(path="root['b']", action='values_changed', old_value=2, new_value=20, current_value=999, reason='value mismatch')]
+        >>> current
+        {'a': 1, 'b': 999}
+        """
+        applicable, conflicts = self._partition_for_selective_apply(other)
+        has_changes = any(key for key in applicable if not key.startswith('_'))
+        if has_changes:
+            delta = Delta(delta_diff=applicable, log_errors=self.log_errors,
+                          raise_errors=self.raise_errors)
+            result = delta + other
+        else:
+            result = deepcopy(other)
+        return DeltaApplyResult(result=result, conflicts=conflicts)
 
     def _raise_or_log(self, msg, level='error'):
         if self.log_errors:

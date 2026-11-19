@@ -507,8 +507,46 @@ Once we set the force to be True
 Notice that the force attribute does not know the original object at ['x']['y'] was supposed to be a list, so it assumes it was a dictionary.
 
 
-.. _always_include_values_label:
+.. _delta_apply_label:
 
+Delta Apply: Selective Application With Conflict Detection
+----------------------------------------------------------
+
+``delta.apply(obj)`` selectively applies a delta to an object whose current
+state may have drifted from the baseline the delta was created from. Only the
+changes whose baseline still matches the object are applied. Every skipped
+change is reported as a ``DeltaConflict`` that includes the old (baseline)
+value, the intended new value and the current value.
+
+Unlike ``delta + obj``, ``apply`` never partially recreates missing objects:
+when the ancestor of a changed path has been removed, the change is reported
+as a conflict instead of creating a partial object. The input object is never
+mutated, regardless of the ``mutate`` parameter.
+
+>>> from deepdiff import DeepDiff, Delta
+>>> t1 = {'a': 1, 'b': 2}
+>>> t2 = {'a': 10, 'b': 20}
+>>> delta = Delta(DeepDiff(t1, t2), bidirectional=True)
+
+Someone else changed ``b`` since the delta was created:
+
+>>> current = {'a': 1, 'b': 999}
+>>> outcome = delta.apply(current)
+>>> outcome.result
+{'a': 10, 'b': 999}
+>>> outcome.conflicts
+[DeltaConflict(path="root['b']", action='values_changed', old_value=2, new_value=20, current_value=999, reason='value mismatch')]
+>>> current
+{'a': 1, 'b': 999}
+
+.. note::
+    In order for the baseline of value and type changes to be verified, the
+    delta needs to store the old values. Create the delta with
+    ``bidirectional=True`` or ``always_include_values=True`` for the strictest
+    verification. Removals always store the old value, and additions are
+    verified to not overwrite existing items.
+
+.. _always_include_values_label:
 Always Include Values
 ---------------------
 

@@ -1,5 +1,8 @@
 # DeepDiff Change log
 
+- Unreleased
+    - Added `Delta.apply(obj)` for selective delta application: only the changes whose baseline still matches the target object are applied, and the skipped ones are returned as `DeltaConflict` items listing the old (baseline) value, the intended new value and the current value. Missing ancestors are reported as conflicts instead of partially recreating deleted objects, and the input object is never mutated.
+
 - v9-2-0
     - Added `iterable_match_keys` to match list items by key per path, e.g. `{"root['orders']": "order_id", "root['orders'][*]['lines']": ("sku", "warehouse")}`. Inserted, removed and reordered records are reported per record at real list indexes, and `Delta` round-trips (#664)
     - Support for Python 3.15

@@ -1388,3 +1388,139 @@ class SimpleArrayWidgetTest(TestCase):
         self.widget = widgets.SimpleArrayWidget(coerce_to_string=False)
         self.assertFalse(self.widget.coerce_to_string)
         self.assertIsNone(self.widget.render(None))
+
+
+class CompositeForeignKeyWidgetTest(TestCase):
+    """
+    Tests for composite lookups, e.g. a supplier specific city code where the
+    same code (``01``) identifies a different city for each supplier.
+    """
+
+    def setUp(self):
+        self.supplier_a = Author.objects.create(name="Supplier A")
+        self.supplier_b = Author.objects.create(name="Supplier B")
+        self.city_a = Book.objects.create(name="01", author=self.supplier_a)
+        self.city_b = Book.objects.create(name="01", author=self.supplier_b)
+        self.widget = widgets.ForeignKeyWidget(
+            Book,
+            field="name",
+            lookup_fields={"name": "code", "author": "supplier"},
+        )
+
+    def test_clean_uses_row_supplier(self):
+        self.assertEqual(
+            self.city_a,
+            self.widget.clean("01", row={"code": "01", "supplier": "Supplier A"}),
+        )
+        self.assertEqual(
+            self.city_b,
+            self.widget.clean("01", row={"code": "01", "supplier": "Supplier B"}),
+        )
+
+    def test_clean_alternating_codes(self):
+        rows = [
+            ({"code": "01", "supplier": "Supplier A"}, self.city_a),
+            ({"code": "01", "supplier": "Supplier B"}, self.city_b),
+            ({"code": "01", "supplier": "Supplier A"}, self.city_a),
+            ({"code": "01", "supplier": "Supplier B"}, self.city_b),
+        ]
+        for row, expected in rows:
+            self.assertEqual(expected, self.widget.clean("01", row=row))
+
+    def test_render_returns_natural_key(self):
+        self.assertEqual(
+            json.dumps(self.city_a.natural_key()), self.widget.render(self.city_a)
+        )
+        self.assertEqual(
+            json.dumps(self.city_b.natural_key()), self.widget.render(self.city_b)
+        )
+
+    def test_render_then_clean_round_trip(self):
+        rendered = self.widget.render(self.city_b)
+        # the rendered value identifies the city, even if the row names the
+        # other supplier
+        self.assertEqual(
+            self.city_b,
+            self.widget.clean(rendered, row={"code": "01", "supplier": "Supplier A"}),
+        )
+
+    def test_lookup_fields_shorthand_includes_field(self):
+        city = Book.objects.create(name="02", author=self.supplier_a)
+        widget = widgets.ForeignKeyWidget(Book, field="name", lookup_fields=["author"])
+        self.assertEqual(city, widget.clean("02", row={"author": "Supplier A"}))
+
+    def test_field_tuple_declaration(self):
+        widget = widgets.ForeignKeyWidget(Book, field=("author", "name"))
+        self.assertEqual(
+            self.city_b,
+            widget.clean("01", row={"author": "Supplier B"}),
+        )
+
+    def test_unknown_combination_preserves_code(self):
+        with self.assertRaises(Book.DoesNotExist) as e:
+            self.widget.clean("01", row={"code": "01", "supplier": "Unknown"})
+        self.assertIn("'01'", str(e.exception))
+        self.assertIn("'Unknown'", str(e.exception))
+
+    def test_missing_supplier_column(self):
+        with self.assertRaises(KeyError):
+            self.widget.clean("01", row={"code": "01"})
+
+    def test_cached_widget_alternating_codes(self):
+        widget = widgets.CachedForeignKeyWidget(
+            Book,
+            field="name",
+            lookup_fields={"name": "code", "author": "supplier"},
+        )
+        rows = [
+            ({"code": "01", "supplier": "Supplier A"}, self.city_a),
+            ({"code": "01", "supplier": "Supplier B"}, self.city_b),
+            ({"code": "01", "supplier": "Supplier A"}, self.city_a),
+            ({"code": "01", "supplier": "Supplier B"}, self.city_b),
+        ]
+        for row, expected in rows:
+            self.assertEqual(expected, widget.clean("01", row=row))
+
+
+class CompositeForeignKeyLookupKwargsTest(TestCase):
+    def test_subclass_lookup_kwargs_renders_natural_key(self):
+        supplier = Author.objects.create(name="Supplier")
+        book = Book.objects.create(name="01", author=supplier)
+
+        class SupplierCodeWidget(widgets.ForeignKeyWidget):
+            def get_lookup_kwargs(self, value, row, **kwargs):
+                return {"name": value, "author": row["supplier"]}
+
+        widget = SupplierCodeWidget(Book, field="name")
+        self.assertEqual(json.dumps(book.natural_key()), widget.render(book))
+
+
+class CompositeForeignKeyAliasTest(TestCase):
+    def setUp(self):
+        self.supplier = Author.objects.create(name="Supplier")
+        self.city = Book.objects.create(name="01", author=self.supplier)
+
+    def test_composite_widget_infers_field(self):
+        widget = widgets.CompositeForeignKeyWidget(
+            Book, lookup_fields=["author", "name"]
+        )
+        self.assertEqual("name", widget.field)
+        self.assertEqual(
+            self.city, widget.clean("01", row={"author": "Supplier"})
+        )
+
+    def test_composite_widget_accepts_fields_alias(self):
+        widget = widgets.CompositeForeignKeyWidget(
+            Book, fields=["author", "name"]
+        )
+        self.assertEqual(
+            self.city, widget.clean("01", row={"author": "Supplier"})
+        )
+
+    def test_cached_composite_widget(self):
+        widget = widgets.CachedCompositeForeignKeyWidget(
+            Book, lookup_fields=["author", "name"]
+        )
+        self.assertEqual(
+            self.city, widget.clean("01", row={"author": "Supplier"})
+        )

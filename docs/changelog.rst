@@ -17,6 +17,7 @@ Enhancements
 ############
 
 - Added :meth:`~import_export.widgets.Widget.is_equal` hook so that widgets control how :meth:`~import_export.resources.Resource.skip_row` compares imported values against persisted values. The date / time widgets and ``ManyToManyWidget`` override it (`2174 <https://github.com/django-import-export/django-import-export/pull/2174>`_)
+- Added composite lookups to :class:`~import_export.widgets.ForeignKeyWidget` and :class:`~import_export.widgets.CachedForeignKeyWidget` via ``lookup_fields``, so a value which is only unique within another row value (for example a supplier specific city code) can be imported, and exported as the related object's natural key
 - Added :meth:`~import_export.widgets.ManyToManyWidget.get_queryset` to customize the related objects available during import (`2172 <https://github.com/django-import-export/django-import-export/pull/2172>`_)
 - Replace ``DEFAULT_FORMATS`` and ``BINARY_FORMATS`` constants with ``get_default_formats()`` and ``get_binary_formats()`` functions to avoid expensive library imports at Django startup (`2149 <https://github.com/django-import-export/django-import-export/issues/2149>`_)
 - Allow ``Resource`` subclasses to be subscripted, e.g. ``ModelResource[MyModel]`` (`2069 <https://github.com/django-import-export/django-import-export/issues/2069>`_)

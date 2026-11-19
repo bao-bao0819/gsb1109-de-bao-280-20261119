@@ -50,5 +50,11 @@ Widgets
 .. autoclass:: import_export.widgets.CachedForeignKeyWidget
    :members:
 
+.. autoclass:: import_export.widgets.CompositeForeignKeyWidget
+   :members:
+
+.. autoclass:: import_export.widgets.CachedCompositeForeignKeyWidget
+   :members:
+
 .. autoclass:: import_export.widgets.ManyToManyWidget
    :members:

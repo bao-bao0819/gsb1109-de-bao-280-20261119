@@ -713,6 +713,71 @@ for all Models that support it.
 
 Read more at `Django Serialization <https://docs.djangoproject.com/en/stable/topics/serialization/>`_.
 
+Composite lookup fields
+-----------------------
+
+Sometimes a value is only unique within another row value.  A typical example is
+a supplier specific city code, where ``01`` identifies a different city for each
+supplier::
+
+    supplier,code
+    ACME,01
+    GLOBEX,01
+
+Use the ``lookup_fields`` argument to identify the related object using more than
+one field.  The mapping maps a lookup path on the related model to the import
+column which supplies its value::
+
+    class CityResource(resources.ModelResource):
+        city = Field(
+            attribute="city",
+            column_name="code",
+            widget=ForeignKeyWidget(
+                City,
+                field="code",
+                lookup_fields={"supplier": "supplier", "code": "code"},
+            ),
+        )
+
+        class Meta:
+            model = Delivery
+
+The lookup path which matches ``field`` is taken from the field's own cell, and
+the remaining components are read from the import row.  In the example above the
+city is looked up by supplier and code, so two rows with code ``01`` resolve to
+different cities.  If ``field`` is not listed in ``lookup_fields`` it is added
+automatically, so ``lookup_fields=["supplier"]`` is equivalent to looking up by
+supplier and the field's cell value.
+
+When only the lookup components are supplied, the component which represents the
+cell value is inferred (``code``, then ``name``, then ``id``), so the same widget
+can be declared more concisely:
+
+::
+
+    from import_export.widgets import CompositeForeignKeyWidget
+
+    city = CompositeForeignKeyWidget(City, lookup_fields=["supplier", "code"])
+
+``CachedCompositeForeignKeyWidget`` is the equivalent cached variant.
+
+When exporting a field which uses a composite lookup, the related object's
+Django natural key (a JSON list) is rendered, which preserves the supplier's own
+key and can be imported back into the same lookup.  The target model therefore
+needs ``natural_key()`` and ``get_by_natural_key()`` functions, as described
+above.  Values produced by :meth:`~import_export.widgets.ForeignKeyWidget.render`
+are accepted on import before the row-based lookup is attempted.
+
+If no object matches the combination, the row is reported as an error.  The
+error message includes the incoming code and the lookup values so that the
+original row can be reviewed.  Pass ``collect_failed_rows=True`` to
+:meth:`~import_export.resources.Resource.import_data` to obtain the untouched
+rows (including the original code) in ``result.failed_dataset``.
+
+:class:`~import_export.widgets.CachedForeignKeyWidget` supports composite
+lookups as well.  Each combination is cached independently, so rows which
+alternate between suppliers and reuse the same code are resolved correctly.
+
 Create or update model instances
 ================================
 

@@ -2,7 +2,7 @@ import json
 import logging
 import numbers
 import sys
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
@@ -10,7 +10,7 @@ import django
 from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import F
+from django.db.models import F, Model
 from django.utils import timezone
 from django.utils.dateparse import parse_duration
 from django.utils.encoding import force_str, smart_str
@@ -643,6 +643,74 @@ class JSONWidget(Widget):
         return json.dumps(value, sort_keys=kwargs.get("sort_json_keys", False))
 
 
+class _LookupField:
+    """
+    Internal description of one component of a composite foreign key lookup.
+
+    ``model_field`` is a field (or ``__`` path) on the related model.
+    ``row_key`` is the column in the import row which supplies the value.
+    """
+
+    __slots__ = ("model_field", "row_key")
+
+    def __init__(self, model_field, row_key=None):
+        self.model_field = model_field
+        self.row_key = row_key
+
+    def __repr__(self):
+        return (
+            f"<_LookupField model_field={self.model_field!r} "
+            f"row_key={self.row_key!r}>"
+        )
+
+
+def _resolve_attr(value, path):
+    for attr in path.split("__"):
+        value = getattr(value, attr, None)
+        if value is None:
+            return None
+    return value
+
+
+def _relation_model_for_path(model, path):
+    """
+    Return the related model when ``path`` ends at a relation on ``model``,
+    otherwise ``None``.
+    """
+    current = model
+    field = None
+    parts = path.split("__")
+    for index, part in enumerate(parts):
+        try:
+            field = current._meta.get_field(part)
+        except Exception:
+            return None
+        if field.is_relation:
+            current = field.related_model
+        elif index < len(parts) - 1:
+            return None
+    if field is not None and field.is_relation:
+        return field.related_model
+    return None
+
+
+def _supports_natural_key(model):
+    return hasattr(model, "natural_key") and hasattr(
+        model.objects, "get_by_natural_key"
+    )
+
+
+def _natural_key_value(value):
+    """
+    Return a JSON friendly natural key.  A single element key is unwrapped so
+    that a component stays scalar in a rendered composite value.
+    """
+    natural_key = value.natural_key()
+    if len(natural_key) == 1:
+        return natural_key[0]
+    return list(natural_key)
+
+
 class RelatedModelWidgetMixin:
     """
     Mixin for widgets which reference a related model.
@@ -711,6 +779,33 @@ class ForeignKeyWidget(RelatedModelWidgetMixin, Widget):
         object.
     :param use_natural_foreign_keys: Use natural key functions to identify
         related object, default to False
+    :param lookup_fields: An optional declaration which identifies the related
+        object using more than one field.  This is needed when a single field
+        value is only unique within a parent, for example a supplier specific
+        city code.  The value can be a mapping of related model lookup paths to
+        import column names::
+
+            ForeignKeyWidget(
+                City,
+                field="code",
+                lookup_fields={"supplier": "supplier", "code": "code"},
+            )
+
+        or a sequence of lookup paths (in which case the column name defaults
+        to the related field name).  A sequence item may also be a
+        ``(lookup_path, column_name)`` pair when the column name differs::
+
+            ForeignKeyWidget(
+                City,
+                field="code",
+                lookup_fields=[("supplier__name", "supplier"), "code"],
+            )
+
+        The lookup path which matches ``field`` is populated from the widget's
+        own cell value; every other value is read from the import row.  If
+        ``field`` is not present in ``lookup_fields`` it is added, so
+        ``lookup_fields=["supplier"]`` is shorthand for looking up by the
+        supplier and the widget's field value.
     """
 
     def __init__(
@@ -719,9 +814,22 @@ class ForeignKeyWidget(RelatedModelWidgetMixin, Widget):
         field="pk",
         use_natural_foreign_keys=False,
         key_is_id=False,
+        lookup_fields=None,
+        fields=None,
+        field_name=None,
         **kwargs,
     ):
         self.model = model
+        if lookup_fields is None:
+            lookup_fields = fields if fields is not None else field_name
+        if isinstance(field, (list, tuple)):
+            # A sequence of lookup paths is shorthand for a composite lookup;
+            # the last component is supplied by this field's own cell.
+            field, lookup_fields = field[-1], lookup_fields or list(field)
+        self.lookup_fields = lookup_fields
+        self._lookup_field_specs = self._normalise_lookup_fields(lookup_fields)
+        if field == "pk" and self._lookup_field_specs:
+            field = self._infer_composite_field()
         self.field = field
         self.key_is_id = key_is_id
         self.use_natural_foreign_keys = use_natural_foreign_keys
@@ -730,6 +838,198 @@ class ForeignKeyWidget(RelatedModelWidgetMixin, Widget):
                 _("use_natural_foreign_keys and key_is_id cannot both be True")
             )
         super().__init__(**kwargs)
+
+    def _infer_composite_field(self):
+        """
+        Choose the component supplied by the widget's own cell when ``field``
+        is left at its ``pk`` default.  A ``code`` component is the common
+        case; otherwise the last declared component is used.
+        """
+        paths = [spec.model_field for spec in self._lookup_field_specs]
+        if "pk" in paths:
+            return "pk"
+        for candidate in ("code", "name", "id"):
+            if candidate in paths:
+                return candidate
+        return paths[-1]
+
+    @staticmethod
+    def _normalise_lookup_fields(lookup_fields):
+        if not lookup_fields:
+            return ()
+        if isinstance(lookup_fields, str):
+            return (_LookupField(lookup_fields),)
+        if isinstance(lookup_fields, dict):
+            items = lookup_fields.items()
+        else:
+            items = lookup_fields
+        specs = []
+        for item in items:
+            if isinstance(item, str):
+                specs.append(_LookupField(item))
+                continue
+            try:
+                path, column = item
+            except (TypeError, ValueError):
+                raise WidgetError(
+                    _(
+                        "lookup_fields items must be a lookup path or a "
+                        "(lookup path, column name) pair"
+                    )
+                )
+            specs.append(_LookupField(path, column))
+        return tuple(specs)
+
+    def _is_value_component(self, spec):
+        return spec.model_field == self.field
+
+    def _get_component_value(self, spec, value, row, parsed=None):
+        parsed_value = self._parsed_component(spec, parsed)
+        if parsed_value is not None:
+            return self._resolve_component(spec, parsed_value)
+        if self._is_value_component(spec):
+            return value
+        if row is None:
+            raise KeyError(
+                "Column '%s' is required to look up %s but no row was supplied."
+                % (spec.row_key or spec.model_field, self.model.__name__)
+            )
+        keys = []
+        if spec.row_key:
+            keys.append(spec.row_key)
+        keys.extend(
+            [
+                spec.model_field,
+                spec.model_field.split("__")[-1],
+                spec.model_field.split("__")[0],
+            ]
+        )
+        for key in keys:
+            if key in row:
+                return self._resolve_component(spec, row[key])
+        raise KeyError(
+            "Column '%s' not found in dataset. Available columns are: %s"
+            % (keys[0], list(row))
+        )
+
+    def _resolve_component(self, spec, component):
+        """
+        Resolve a component which addresses a relation.
+
+        Export renders relations as their natural key, so re-importing an
+        exported value needs to turn that natural key back into a model
+        instance.  A primary key is also accepted, so a value which is not a
+        natural key is tried as a pk before the lookup is reported as missing.
+        Non-relation components are returned unchanged.
+        """
+        related_model = _relation_model_for_path(self.model, spec.model_field)
+        if related_model is None or isinstance(component, Model):
+            return component
+        if not _supports_natural_key(related_model):
+            return component
+        if isinstance(component, (list, tuple)):
+            natural_key = component
+        else:
+            natural_key = (component,)
+        try:
+            return related_model.objects.get_by_natural_key(*natural_key)
+        except related_model.DoesNotExist:
+            pass
+        try:
+            return related_model._default_manager.get(pk=component)
+        except (related_model.DoesNotExist, TypeError, ValueError):
+            raise related_model.DoesNotExist(
+                "%s matching query does not exist for %s value %r."
+                % (related_model.__name__, spec.model_field, component)
+            )
+
+    def _split_composite_value(self, value):
+        """
+        Split a value rendered by a composite lookup back into its components.
+
+        Both the list form produced by :meth:`render` and a mapping of lookup
+        paths to component values are accepted.  ``None`` is returned for
+        values which are not a complete rendered representation.
+        """
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        if not stripped or stripped[0] not in "[{":
+            return None
+        try:
+            components = json.loads(stripped)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(components, (list, dict)):
+            return None
+        return components
+
+    def _parsed_component(self, spec, parsed):
+        if parsed is None:
+            return None
+        if isinstance(parsed, dict):
+            for key in (spec.model_field, spec.model_field.split("__")[-1]):
+                if key in parsed:
+                    return parsed[key]
+            return None
+        index = self._get_lookup_field_specs().index(spec)
+        if index < len(parsed):
+            return parsed[index]
+        return None
+
+    def _get_lookup_field_specs(self):
+        if not self._lookup_field_specs:
+            return ()
+        if any(self._is_value_component(s) for s in self._lookup_field_specs):
+            return self._lookup_field_specs
+        return self._lookup_field_specs + (_LookupField(self.field),)
+
+    def _lookup_keys(self):
+        """
+        Return the lookup paths used to identify the related object, without
+        querying the database.
+        """
+        specs = self._get_lookup_field_specs()
+        if specs:
+            return [spec.model_field for spec in specs]
+        return [self.field]
+
+    def _has_custom_lookup_kwargs(self):
+        """Whether ``get_lookup_kwargs`` has been overridden by a subclass."""
+        implementation = type(self).get_lookup_kwargs
+        return implementation not in (
+            ForeignKeyWidget.get_lookup_kwargs,
+            CachedForeignKeyWidget.get_lookup_kwargs,
+        )
+
+    def _has_composite_lookup(self):
+        return bool(self._lookup_field_specs) or self._has_custom_lookup_kwargs()
+
+    def _render_natural_key(self, value):
+        if _supports_natural_key(self.model) and hasattr(value, "natural_key"):
+            return json.dumps(value.natural_key())
+        return None
+
+    def _render_components(self, value):
+        """
+        Render each declared lookup component as a JSON list.
+
+        A component addressing a relation is rendered as that object's
+        natural key (or its primary key if it has no natural key), so the
+        original supplier key is carried in the output.
+        """
+        components = []
+        for spec in self._get_lookup_field_specs():
+            component = _resolve_attr(value, spec.model_field)
+            if component is None:
+                return None
+            if isinstance(component, Model):
+                if hasattr(component, "natural_key"):
+                    component = _natural_key_value(component)
+                else:
+                    component = component.pk
+            components.append(component)
+        return json.dumps(components, default=str)
 
     def get_queryset(self, value, row, *args, **kwargs):
         """
@@ -771,15 +1071,46 @@ class ForeignKeyWidget(RelatedModelWidgetMixin, Widget):
         """
         val = super().clean(value)
         if val:
+            if self._has_composite_lookup():
+                obj = self.get_instance_by_composite_key(value, row, **kwargs)
+                return obj.pk if self.key_is_id else obj
             if self.use_natural_foreign_keys:
                 return self.get_instance_by_natural_key(value)
-            else:
-                obj = self.get_instance_by_lookup_fields(value, row, **kwargs)
-                if self.key_is_id:
-                    return obj.pk
-                return obj
-        else:
-            return None
+            obj = self.get_instance_by_lookup_fields(value, row, **kwargs)
+            if self.key_is_id:
+                return obj.pk
+            return obj
+        return None
+
+    def get_instance_by_composite_key(self, value, row, **kwargs):
+        """
+        Return the related object for a composite lookup.
+
+        A value previously rendered by :meth:`render` is the related object's
+        natural key, so try that first.  Otherwise the value is the field's own
+        component (for example the supplier specific city code), and the
+        remaining components are read from ``row`` by
+        :meth:`get_lookup_kwargs`.
+        """
+        parsed = self._split_composite_value(value)
+        if isinstance(parsed, list) and _supports_natural_key(self.model):
+            try:
+                return self.get_instance_by_natural_key(value)
+            except (ObjectDoesNotExist, TypeError, ValueError):
+                pass
+        try:
+            return self.get_instance_by_lookup_fields(value, row, **kwargs)
+        except ObjectDoesNotExist as e:
+            raise self.model.DoesNotExist(
+                "%s matching query does not exist for lookup fields %s "
+                "with value %r and row %r."
+                % (
+                    self.model._meta.object_name,
+                    self._lookup_keys(),
+                    value,
+                    dict(row) if row is not None else None,
+                )
+            ) from e
 
     def get_instance_by_natural_key(self, value):
         # natural keys will always be a tuple, which ends up as a json list.
@@ -799,7 +1130,20 @@ class ForeignKeyWidget(RelatedModelWidgetMixin, Widget):
         :param row: The dataset's current row.
         :param \\**kwargs:
             Optional kwargs.
+
+        If ``lookup_fields`` is declared, every declared component is
+        included, with the component matching ``field`` taken from ``value``
+        and the remaining components taken from ``row``.
         """
+        specs = self._get_lookup_field_specs()
+        if specs:
+            parsed = self._split_composite_value(value)
+            return {
+                spec.model_field: self._get_component_value(
+                    spec, value, row, parsed
+                )
+                for spec in specs
+            }
         return {self.field: value}
 
     def render(self, value, **kwargs):
@@ -814,6 +1158,16 @@ class ForeignKeyWidget(RelatedModelWidgetMixin, Widget):
 
         if value is None:
             return ""
+
+        if self._has_composite_lookup():
+            # A single component cannot represent a composite lookup.  Prefer
+            # the related object's natural key, which carries the supplier's
+            # own key and can be imported back into the same lookup.
+            natural_key = self._render_natural_key(value)
+            if natural_key is not None:
+                return natural_key
+            if self._lookup_field_specs:
+                return self._render_components(value)
 
         attrs = self.field.split("__")
         for attr in attrs:
@@ -847,31 +1201,43 @@ class _CachedQuerySetWrapper:
     def __init__(self, queryset):
         self.queryset = queryset
         self.model = queryset.model
+        self._instances = None
+        self._indexes = {}
 
-    def _get_instances(self, queryset, key_cls):
-        """
-        Converts a queryset into a dictionary mapping lookup fields values
-        to lists of instances. The values of the returned dict are lists
-        to handle potential multiple instances with the same lookup fields values.
-        """
-        if hasattr(self, "_instances"):
-            return self._instances
-
-        self._instances = defaultdict(list)
-        for instance in queryset:
-            key = key_cls(
-                **{field: str(getattr(instance, field)) for field in key_cls._fields}
-            )
-            self._instances[key].append(instance)
-
+    def _get_instances(self):
+        if self._instances is None:
+            self._instances = list(self.queryset)
         return self._instances
 
-    def get(self, **lookup_fields):
-        Key = namedtuple("Key", list(lookup_fields.keys()))
+    @staticmethod
+    def _key_value(value):
+        if value is None:
+            return None
+        if isinstance(value, Model):
+            return value.pk
+        return str(value)
 
-        instances = self._get_instances(self.queryset, Key)
-        key = Key(**{k: str(v) for k, v in lookup_fields.items()})
-        result = instances.get(key, [])
+    def _get_index(self, field_names):
+        key = tuple(field_names)
+        index = self._indexes.get(key)
+        if index is None:
+            index = defaultdict(list)
+            for instance in self._get_instances():
+                values = tuple(
+                    self._key_value(_resolve_attr(instance, field))
+                    for field in field_names
+                )
+                index[values].append(instance)
+            self._indexes[key] = index
+        return index
+
+    def get(self, **lookup_fields):
+        field_names = tuple(lookup_fields.keys())
+        index = self._get_index(field_names)
+        key = tuple(
+            self._key_value(lookup_fields[field]) for field in field_names
+        )
+        result = index.get(key, [])
 
         if len(result) == 1:
             return result[0]
@@ -952,15 +1318,39 @@ class CachedForeignKeyWidget(ForeignKeyWidget):
 
     def get_queryset(self, value, row, *args, **kwargs):
         queryset = super().get_queryset(value, row, *args, **kwargs)
-        if self._contains_relations():
-            queryset = queryset.annotate(
-                django_import_export_cached_lookup=F(self.field)
-            )
+        for path in self._cached_lookup_paths():
+            if "__" in path:
+                queryset = queryset.annotate(
+                    **{self._cached_lookup_alias(path): F(path)}
+                )
         return queryset
 
+    @staticmethod
+    def _cached_lookup_alias(path):
+        return "django_import_export_cached_lookup_%s" % path.replace("__", "_")
+
+    def _cached_lookup_key(self, path):
+        if "__" in path:
+            return self._cached_lookup_alias(path)
+        return path
+
+    def _cached_lookup_paths(self):
+        specs = self._get_lookup_field_specs()
+        if specs:
+            return [spec.model_field for spec in specs]
+        return [self.field]
+
     def get_lookup_kwargs(self, value, row, **kwargs):
+        specs = self._get_lookup_field_specs()
+        if specs:
+            return {
+                self._cached_lookup_key(spec.model_field): self._get_component_value(
+                    spec, value, row
+                )
+                for spec in specs
+            }
         if self._contains_relations():
-            return {"django_import_export_cached_lookup": value}
+            return {self._cached_lookup_key(self.field): value}
         return super().get_lookup_kwargs(value, row, **kwargs)
 
     def get_instance_by_lookup_fields(self, value, row, **kwargs):
@@ -970,6 +1360,28 @@ class CachedForeignKeyWidget(ForeignKeyWidget):
 
         lookup_kwargs = self.get_lookup_kwargs(value, row, **kwargs)
         return self._cached_qs.get(**lookup_kwargs)
+
+
+class CompositeForeignKeyWidget(ForeignKeyWidget):
+    """
+    A :class:`~import_export.widgets.ForeignKeyWidget` which identifies the
+    related object using more than one field.
+
+    This is a convenience alias for ``ForeignKeyWidget`` with
+    ``lookup_fields`` declared.  The related object is looked up by every
+    declared component, so a code which is only unique within a parent (for
+    example a supplier specific city code) resolves to the correct row.
+    """
+
+
+class CachedCompositeForeignKeyWidget(CachedForeignKeyWidget):
+    """
+    A :class:`~import_export.widgets.CachedForeignKeyWidget` which identifies
+    the related object using more than one field.
+
+    This is a convenience alias for ``CachedForeignKeyWidget`` with
+    ``lookup_fields`` declared.
+    """
 
 
 class ManyToManyWidget(RelatedModelWidgetMixin, Widget):

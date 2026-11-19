@@ -28,13 +28,17 @@ from beangulp import extract
 from beangulp import identify
 from beangulp import utils
 from beangulp.importer import Importer, ImporterProtocol, Adapter
+from beangulp.identify import Identification, IdentificationError, SelectionRule
 
 
 __all__ = [
     "Adapter",
+    "Identification",
+    "IdentificationError",
     "Importer",
     "ImporterProtocol",
     "Ingest",
+    "SelectionRule",
     "archive",
     "cache",
     "exceptions",
@@ -100,7 +104,9 @@ def _extract(
     extracted: List[extract.ExtractedEntry] = []
     for filename in _walk(src, log):
         with errors:
-            importer = identify.identify(ctx.importers, filename)
+            importer = identify.identify(
+                ctx.importers, filename, rules=ctx.selection_rules
+            )
             if not importer:
                 log("")  # Newline.
                 continue
@@ -198,7 +204,9 @@ def _archive(
 
     for filename in _walk(src, log):
         with errors:
-            importer = identify.identify(ctx.importers, filename)
+            importer = identify.identify(
+                ctx.importers, filename, rules=ctx.selection_rules
+            )
             if not importer:
                 log("")  # Newline.
                 continue
@@ -256,7 +264,9 @@ def _identify(ctx: "Ingest", src: str, failfast: bool, verbose: bool):
 
     for filename in _walk(src, log):
         with errors:
-            importer = identify.identify(ctx.importers, filename)
+            importer = identify.identify(
+                ctx.importers, filename, rules=ctx.selection_rules
+            )
             if not importer:
                 log("")  # Newline.
                 continue
@@ -299,9 +309,14 @@ def _importer(importer):
 
 
 class Ingest:
-    def __init__(self, importers: list, hooks=None):
+    def __init__(
+        self, importers: list, hooks=None, rules=None, selection=None, selectors=None
+    ):
         self.importers = [_importer(i) for i in importers]
         self.hooks = list(hooks) if hooks is not None else []
+        # Selection rules used to resolve importer identification
+        # conflicts for specific document sources.
+        self.selection_rules = identify.combine_rules(rules, selection, selectors)
 
         while extract.find_duplicate_entries in self.hooks:
             self.hooks.remove(extract.find_duplicate_entries)

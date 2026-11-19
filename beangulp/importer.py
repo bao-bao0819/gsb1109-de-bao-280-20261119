@@ -52,6 +52,37 @@ class Importer(abc.ABC):
         """
         raise NotImplementedError
 
+    def explain_identification(self, filepath: str) -> Optional[str]:
+        """Explain why this importer matches the given file.
+
+        Importers can override this method to provide an auditable
+        explanation that is included in identification conflict reports.
+        The default implementation does not provide an explanation.
+
+        Args:
+          filepath: Filesystem path to the document to be matched.
+
+        Returns:
+          A human readable explanation, or None.
+
+        """
+        return None
+
+    def identify_source(self, filepath: str) -> Optional[str]:
+        """Return the source (bank, institution, ...) of the given file.
+
+        The returned source is used to match importer selection rules to
+        specific document sources. The default implementation returns None.
+
+        Args:
+          filepath: Filesystem path to the document to be matched.
+
+        Returns:
+          A source identifier, or None.
+
+        """
+        return None
+
     @abc.abstractmethod
     def account(self, filepath: str) -> data.Account:
         """Return the account associated with the given file.
@@ -238,3 +269,21 @@ class Adapter(Importer):
         if len(p) > 1:
             return self.importer.extract(cache.get_file(filepath), existing)
         return self.importer.extract(cache.get_file(filepath))
+
+    def explain_identification(self, filepath):
+        method = getattr(self.importer, "explain_identification", None)
+        if not callable(method):
+            return None
+        parameters = inspect.signature(method).parameters
+        if not parameters:
+            return method()
+        return method(cache.get_file(filepath))
+
+    def identify_source(self, filepath):
+        method = getattr(self.importer, "identify_source", None)
+        if not callable(method):
+            return None
+        parameters = inspect.signature(method).parameters
+        if not parameters:
+            return method()
+        return method(cache.get_file(filepath))

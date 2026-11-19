@@ -9,7 +9,12 @@ from warnings import warn
 import tablib
 from diff_match_patch import diff_match_patch
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    FieldError,
+    ImproperlyConfigured,
+    ValidationError,
+)
 from django.core.management.color import no_style
 from django.core.paginator import Paginator
 from django.db import connections, router
@@ -1110,6 +1115,212 @@ class Resource(metaclass=DeclarativeMetaclass):
                     export_fields.append(field)
         return export_fields
 
+    def get_export_field_dependencies(self, field):
+        """
+        Returns the model attribute paths read when exporting ``field``.
+
+        This combines any dependencies declared on the
+        :class:`~import_export.fields.Field`, and any dependencies declared for
+        the field in
+        :attr:`~import_export.options.ResourceOptions.export_field_dependencies`.
+        The field's own ``attribute`` is resolved separately by
+        :meth:`get_export_dependencies`.
+
+        Override this method to declare dependencies for a resource
+        dynamically.
+        """
+        dependencies = list(field.dependencies)
+        for dependency in self._get_meta_field_dependencies(field):
+            if dependency not in dependencies:
+                dependencies.append(dependency)
+        return dependencies
+
+    def _get_meta_field_dependencies(self, field):
+        meta_dependencies = None
+        for option in ("export_field_dependencies", "export_dependencies"):
+            meta_dependencies = getattr(self._meta, option, None)
+            if not meta_dependencies:
+                meta_dependencies = getattr(self, option, None)
+            if meta_dependencies:
+                break
+        if not isinstance(meta_dependencies, dict):
+            return ()
+        try:
+            field_name = self.get_field_name(field)
+        except AttributeError:
+            return ()
+        dependencies = meta_dependencies.get(field_name)
+        if dependencies is None:
+            dependencies = meta_dependencies.get(field.column_name)
+        if dependencies is None:
+            return ()
+        if isinstance(dependencies, str):
+            return (dependencies,)
+        return tuple(dependencies)
+
+    def is_export_queryset_narrowing_enabled(self):
+        """
+        Returns ``True`` if the resource declares dependencies for any of its
+        export fields.
+
+        Resources which do not declare dependencies keep loading complete rows
+        for every export.
+        """
+        return any(
+            self.get_export_field_dependencies(field) for field in self.fields.values()
+        )
+
+    def get_export_dependencies(self, export_fields=None):
+        """
+        Returns the model attribute paths which are read when exporting
+        ``export_fields``.
+
+        Each field contributes its own ``attribute`` (including any relation
+        traversal, such as ``author__name``) plus any dependencies declared on
+        the field or in
+        :attr:`~import_export.options.ResourceOptions.export_field_dependencies`.
+        A dependency may be the name of another resource field, in which case
+        that field and its own dependencies are included.
+
+        The primary key is always included so that each row can be identified.
+
+        Returns ``None`` if any of the fields has neither an ``attribute`` nor
+        declared dependencies, because in that case the field's data source
+        cannot be determined and the queryset must not be narrowed.
+        """
+        if export_fields is None:
+            export_fields = self.get_export_fields()
+        dependencies = []
+        seen_fields = set()
+        pending = list(export_fields)
+        while pending:
+            field = pending.pop()
+            if id(field) in seen_fields:
+                continue
+            seen_fields.add(id(field))
+            if field.attribute and field.attribute not in dependencies:
+                dependencies.append(field.attribute)
+            field_dependencies = self.get_export_field_dependencies(field)
+            if not field.attribute and not field_dependencies:
+                # the field reads from an unknown source (for example a
+                # dehydrate method) and no dependencies were declared
+                return None
+            for dependency in field_dependencies:
+                dependency_field = self.fields.get(dependency)
+                if dependency_field is None:
+                    dependency_field = self._select_field_no_warn(dependency)
+                if dependency_field is not None:
+                    pending.append(dependency_field)
+                elif dependency not in dependencies:
+                    dependencies.append(dependency)
+        model = self._meta.model
+        if model is None:
+            return None
+        dependencies.append(model._meta.pk.name)
+        return dependencies
+
+    def _select_field_no_warn(self, target_field_name):
+        for field in self.fields.values():
+            if target_field_name == field.column_name:
+                return field
+        return None
+
+    def _resolve_only_path(self, path):
+        """
+        Returns the part of ``path`` which can be used with ``QuerySet.only()``,
+        or ``None`` if the path does not resolve to a concrete model field.
+
+        Reverse relations, many-to-many fields and properties cannot be
+        deferred, and a path which traverses an annotation cannot be resolved
+        before the query is executed.  These are skipped so that a declared
+        dependency never makes an export fail.
+        """
+        model = self._meta.model
+        attrs = path.split("__")
+        resolved = []
+        for index, attr in enumerate(attrs):
+            try:
+                model_field = model._meta.get_field(attr)
+            except FieldDoesNotExist:
+                return None
+            if model_field.many_to_many or not model_field.concrete:
+                return None
+            resolved.append(attr)
+            if index < len(attrs) - 1:
+                model = get_related_model(model_field)
+                if model is None:
+                    return None
+        return "__".join(resolved)
+
+    @staticmethod
+    def _get_related_prefixes(only_paths):
+        prefixes = []
+        for path in only_paths:
+            attrs = path.split("__")
+            for index in range(1, len(attrs)):
+                prefix = "__".join(attrs[:index])
+                if prefix not in prefixes:
+                    prefixes.append(prefix)
+        return prefixes
+
+    def get_export_queryset(self, queryset, export_fields):
+        """
+        Narrows ``queryset`` to the model attributes required to export
+        ``export_fields``.
+
+        The queryset is only narrowed if at least one of the export fields
+        declares dependencies.  Resources without any dependency declarations
+        keep loading complete rows.
+        """
+        if not self.is_export_queryset_narrowing_enabled():
+            return queryset
+        if not isinstance(queryset, QuerySet):
+            return queryset
+        if queryset.query.values_select or queryset.query.annotation_select_mask:
+            # only() cannot be combined with values() / values_list() or with
+            # annotations which are later masked, so leave the queryset as-is
+            return queryset
+        dependencies = self.get_export_dependencies(export_fields)
+        if dependencies is None:
+            return queryset
+        only_paths = []
+        for dependency in dependencies:
+            path = self._resolve_only_path(dependency)
+            if path is not None and path not in only_paths:
+                only_paths.append(path)
+        existing_select_related = queryset.query.select_related
+        if existing_select_related is True:
+            return queryset
+        if existing_select_related:
+            only_roots = {path.split("__")[0] for path in only_paths}
+            only_roots.update(
+                {root[: -len("_id")] for root in only_roots if root.endswith("_id")}
+            )
+            for relation in existing_select_related:
+                if relation in only_roots:
+                    continue
+                path = self._resolve_only_path(relation)
+                if path is None:
+                    # a relation which the caller already asked to join cannot
+                    # be deferred, so leave the queryset as-is
+                    return queryset
+                only_paths.append(path)
+        deferred_fields, deferred_is_inclusive = queryset.query.deferred_loading
+        if deferred_fields and deferred_is_inclusive:
+            # the caller already deferred specific columns; only() would
+            # replace that selection, so leave the queryset as-is
+            return queryset
+        select_related = self._get_related_prefixes(only_paths)
+        try:
+            if select_related:
+                queryset = queryset.select_related(*select_related)
+            return queryset.only(*only_paths)
+        except (FieldError, ValueError) as e:
+            # a path which cannot be resolved must not break the export; fall
+            # back to loading the complete rows
+            logger.debug(e, exc_info=True)
+            return queryset
+
     def export_resource(self, instance, selected_fields=None, **kwargs):
         export_fields = self.get_export_fields(selected_fields)
         return [self.export_field(field, instance, **kwargs) for field in export_fields]
@@ -1179,6 +1390,12 @@ class Resource(metaclass=DeclarativeMetaclass):
         export_fields = kwargs.get("export_fields", None)
         headers = self.get_export_headers(selected_fields=export_fields)
         dataset = tablib.Dataset(headers=headers)
+
+        export_objects = self.get_export_fields(selected_fields=export_fields)
+        if export_fields:
+            # narrow the queryset only when a subset of columns was selected;
+            # a full export needs every field anyway
+            queryset = self.get_export_queryset(queryset, export_objects)
 
         for obj in self.iter_queryset(queryset):
             r = self.export_resource(obj, selected_fields=export_fields, **kwargs)

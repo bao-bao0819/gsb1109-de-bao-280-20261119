@@ -31,6 +31,13 @@ This is what happens when the method is invoked:
 #. The :meth:`~import_export.resources.Resource.filter_export` hook is called.
    You can override this method to modify the queryset for export.
 
+#. When a subset of export fields has been selected and the resource has declared
+   :ref:`export field dependencies<export_field_dependencies>`,
+   :meth:`~import_export.resources.Resource.get_export_queryset` is called to narrow
+   the queryset with ``only()``, so that model columns which are not required by the
+   selected fields are not loaded.  Resources without dependency declarations are
+   not affected.
+
 #. For each instance in the ``QuerySet``,
    :meth:`~import_export.resources.Resource.export_resource` is called (with the
    instance passed as a parameter).

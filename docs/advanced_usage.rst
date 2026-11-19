@@ -1052,6 +1052,53 @@ If this method name or callable is supplied, then it will be called as the 'dehy
             model = Book
 
 
+.. _export_field_dependencies:
+
+Declaring export field dependencies
+-----------------------------------
+Fields without an ``attribute`` (for example fields which are populated by a ``dehydrate`` method) may read values
+from other model attributes.  By default, export loads complete model rows, so a large column can be read even when it
+is not part of the export.
+
+You can declare the attributes a field actually reads with the ``dependencies`` argument.  When a subset of export
+fields is selected, only those attributes (together with the attributes of the selected fields) are loaded from the
+database::
+
+    class ProductResource(resources.ModelResource):
+        local_price = Field(
+            dehydrate_method="dehydrate_local_price",
+            dependencies=("price", "exchange_rate__rate"),
+        )
+
+        class Meta:
+            model = Product
+
+        def dehydrate_local_price(self, product):
+            return product.price * product.exchange_rate.rate
+
+With this declaration, exporting only ``product_code`` and ``local_price`` will not load the ``description`` column.
+
+The same dependencies can be declared in ``Meta`` for fields which are declared elsewhere (or dynamically)::
+
+    class ProductResource(resources.ModelResource):
+        class Meta:
+            model = Product
+            export_field_dependencies = {
+                "local_price": ("price", "exchange_rate__rate"),
+            }
+
+A dependency can also be the name of another resource field, in which case that field's own attribute and
+dependencies are included.
+
+Dependencies are resolved to concrete model columns; related attributes (``author__name``) are joined with
+``select_related()``.  Many-to-many fields and reverse relations cannot be deferred and are ignored for the purposes
+of narrowing.
+
+Declaring dependencies is optional.  Resources which do not declare any dependencies keep loading complete rows.
+If a selected field has no ``attribute`` and no dependencies are declared for it, the export also falls back to
+loading complete rows, so computed values are always available.
+
+
 Filtering querysets during export
 =================================
 

@@ -168,6 +168,13 @@ class FieldTest(TestCase):
         val = self.field.get_value(self.obj)
         self.assertEqual("some val", val)
 
+    def test_dependencies_default_to_empty_tuple(self):
+        self.assertEqual((), self.field.dependencies)
+
+    def test_dependencies_accept_a_single_string(self):
+        field = fields.Field(attribute="name", dependencies="author__name")
+        self.assertEqual(("author__name",), field.dependencies)
+
     def test_get_value_with_no_attribute(self):
         self.field.attribute = None
         self.assertIsNone(self.field.get_value(self.obj))

@@ -44,6 +44,26 @@ class ResourceOptions:
     Controls export order for columns.
     """
 
+    export_field_dependencies = None
+    """
+    Declares the model attributes read by export fields whose value is derived
+    from attributes other than their own ``attribute``.
+
+    This is a mapping of resource field names (or column names) to an iterable
+    of model attribute paths, for example::
+
+        class Meta:
+            model = Product
+            export_field_dependencies = {
+                "local_price": ("price", "exchange_rate__rate"),
+            }
+
+    When a subset of export fields is selected, only the declared dependencies
+    (together with the attributes of the selected fields) are loaded from the
+    database.  Resources which do not declare any dependencies keep loading
+    complete rows.
+    """
+
     widgets = None
     """
     This dictionary defines widget kwargs for fields.

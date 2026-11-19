@@ -178,3 +178,161 @@ class ExportFunctionalityTest(TestCase):
         self.assertEqual(dataset.dict[0]["Author Name"], "Ian Fleming")
         self.assertEqual(dataset.dict[0]["Author Birthdate"], "")
         self.assertEqual(dataset.dict[0]["Custom Attribute"], "")
+
+
+class ExportFieldDependenciesTest(TestCase):
+    """
+    Only the model attributes required by the selected export fields (plus any
+    declared dependencies of computed fields) are loaded from the database.
+    """
+
+    class ProductResource(ModelResource):
+        local_price = Field(
+            dehydrate_method="dehydrate_local_price",
+            dependencies=("price", "author__name"),
+        )
+
+        class Meta:
+            model = Book
+            fields = (
+                "id",
+                "name",
+                "price",
+                "author__name",
+                "author_email",
+                "local_price",
+            )
+
+        def dehydrate_local_price(self, book):
+            rate = book.author.name if book.author else "1"
+            return f"{book.price}:{rate}"
+
+        def iter_queryset(self, queryset):
+            self.export_queryset = queryset
+            yield from super().iter_queryset(queryset)
+
+    def setUp(self):
+        author = Author.objects.create(name="2.5")
+        self.book = Book.objects.create(
+            name="SKU-1", price="10.00", author=author, author_email="a@example.com"
+        )
+
+    def test_selected_fields_load_only_required_attributes(self):
+        resource = self.ProductResource()
+        dataset = resource.export(export_fields=["id", "local_price"])
+
+        self.assertEqual([str(self.book.pk), "10.00:2.5"], list(dataset[0]))
+        deferred = resource.export_queryset.first().get_deferred_fields()
+        self.assertNotIn("price", deferred)
+        self.assertNotIn("author_id", deferred)
+        self.assertIn("name", deferred)
+        self.assertIn("author_email", deferred)
+
+    def test_selected_fields_do_not_load_unrelated_columns(self):
+        resource = self.ProductResource()
+        resource.export(export_fields=["id", "local_price"])
+        selected = str(resource.export_queryset.query)
+        self.assertIn('"core_book"."price"', selected)
+        self.assertNotIn("author_email", selected)
+        self.assertNotIn('"core_book"."name"', selected)
+        self.assertIn('"core_author"."name"', selected)
+        self.assertNotIn('"core_author"."birthday"', selected)
+
+    def test_meta_level_dependency_declaration(self):
+        class MetaDependencyResource(ModelResource):
+            local_price = Field(dehydrate_method="dehydrate_local_price")
+
+            class Meta:
+                model = Book
+                fields = (
+                    "id",
+                    "name",
+                    "price",
+                    "author__name",
+                    "author_email",
+                    "local_price",
+                )
+                export_field_dependencies = {
+                    "local_price": ("price", "author__name"),
+                }
+
+            def dehydrate_local_price(self, book):
+                rate = book.author.name if book.author else "1"
+                return f"{book.price}:{rate}"
+
+            def iter_queryset(self, queryset):
+                self.export_queryset = queryset
+                yield from super().iter_queryset(queryset)
+
+        resource = MetaDependencyResource()
+        dataset = resource.export(export_fields=["id", "local_price"])
+        self.assertEqual([str(self.book.pk), "10.00:2.5"], list(dataset[0]))
+        selected = str(resource.export_queryset.query)
+        self.assertNotIn("author_email", selected)
+
+    def test_dependency_referencing_resource_field(self):
+        class ResourceFieldDependencyResource(ModelResource):
+            author_name = Field(attribute="author__name")
+            local_price = Field(
+                dehydrate_method="dehydrate_local_price",
+                dependencies=("price", "author_name"),
+            )
+
+            class Meta:
+                model = Book
+                fields = (
+                    "id",
+                    "price",
+                    "author_name",
+                    "author_email",
+                    "local_price",
+                )
+
+            def dehydrate_local_price(self, book):
+                return f"{book.price}:{book.author.name}"
+
+            def iter_queryset(self, queryset):
+                self.export_queryset = queryset
+                yield from super().iter_queryset(queryset)
+
+        resource = ResourceFieldDependencyResource()
+        dataset = resource.export(export_fields=["id", "local_price"])
+        self.assertEqual([str(self.book.pk), "10.00:2.5"], list(dataset[0]))
+        selected = str(resource.export_queryset.query)
+        self.assertIn('"core_author"."name"', selected)
+        self.assertNotIn("author_email", selected)
+
+    def test_resource_without_dependencies_loads_full_rows(self):
+        class CapturingBookResource(ModelResource):
+            class Meta:
+                model = Book
+
+            def iter_queryset(self, queryset):
+                self.export_queryset = queryset
+                yield from super().iter_queryset(queryset)
+
+        resource = CapturingBookResource()
+        resource.export(export_fields=["id", "name"])
+        first = resource.export_queryset.first()
+        self.assertEqual(set(), first.get_deferred_fields())
+
+    def test_computed_field_without_declaration_loads_full_rows(self):
+        class UndeclaredDependencyResource(ModelResource):
+            computed = Field()
+
+            class Meta:
+                model = Book
+                fields = ("id", "computed")
+
+            def dehydrate_computed(self, book):
+                return book.name
+
+            def iter_queryset(self, queryset):
+                self.export_queryset = queryset
+                yield from super().iter_queryset(queryset)
+
+        resource = UndeclaredDependencyResource()
+        dataset = resource.export(export_fields=["id", "computed"])
+        self.assertEqual([str(self.book.pk), "SKU-1"], list(dataset[0]))
+        first = resource.export_queryset.first()
+        self.assertEqual(set(), first.get_deferred_fields())

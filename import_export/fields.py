@@ -38,6 +38,16 @@ class Field:
     :param m2m_add: changes save of this field to add the values, if they do not exist,
         to a ManyToMany field instead of setting all values.  Only useful if field is
         a ManyToMany field.
+
+    :param dependencies: An optional iterable of model attribute paths, or resource
+        field names, which this field reads during export.  This is required for
+        computed fields (for example a field with a ``dehydrate`` method) whose
+        value is derived from attributes other than its own ``attribute``.
+
+        Dependencies are used to narrow the queryset when only a subset of export
+        fields has been selected, so that unrelated (possibly large) model columns
+        are not loaded from the database.  Resources which do not declare any
+        dependencies keep the previous behaviour of loading complete rows.
     """
 
     empty_values = [None, ""]
@@ -52,6 +62,10 @@ class Field:
         saves_null_values=True,
         dehydrate_method=None,
         m2m_add=False,
+        dependencies=None,
+        depends_on=None,
+        export_dependencies=None,
+        export_field_dependencies=None,
     ):
         self.attribute = attribute
         self.default = default
@@ -63,6 +77,18 @@ class Field:
         self.saves_null_values = saves_null_values
         self.dehydrate_method = dehydrate_method
         self.m2m_add = m2m_add
+        declared_dependencies = (
+            dependencies
+            if dependencies is not None
+            else depends_on
+            if depends_on is not None
+            else export_dependencies
+            if export_dependencies is not None
+            else export_field_dependencies
+        )
+        if isinstance(declared_dependencies, str):
+            declared_dependencies = (declared_dependencies,)
+        self.dependencies = tuple(declared_dependencies or ())
 
     def __repr__(self):
         """

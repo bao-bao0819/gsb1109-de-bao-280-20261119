@@ -2,6 +2,7 @@ import abc
 import csv
 import datetime
 import decimal
+import logging
 from enum import Enum
 import re
 
@@ -10,6 +11,8 @@ from itertools import islice, tee
 from beancount.core import data
 
 import beangulp
+
+log = logging.getLogger(__name__)
 
 EMPTY = frozenset()
 
@@ -188,13 +191,41 @@ class Amount(Column):
         return parsed
 
 
+class Sign(Enum):
+    """How to interpret the sign of the amounts in the source columns.
+
+    Some sources always emit unsigned magnitudes, while others (for
+    example refund rows) may emit amounts that already carry a sign
+    contradicting the side of the ledger they are placed on.
+    """
+
+    IGNORE = 1
+    """Ignore the sign of the source values. The sign of the parsed
+    amount is determined solely by which of the credit or debit column
+    is populated: credit amounts are positive and debit amounts are
+    negated."""
+
+    PRESERVE = 2
+    """Preserve the sign of the source values. The sign carried by the
+    parsed value is applied on top of the sign determined by the credit
+    or debit column it appears in."""
+
+
 class CreditOrDebit(Column):
     """Specialized Column for positive and negative amounts on separate columns.
 
     Parse and return the amount present in the credit or debit
     fields. The amount in the debit field is negated before being
-    returned. Only one of the two fields may be populated. The parsing
-    is done as per the Amount column type.
+    returned. Normally only one of the two fields is populated. The
+    parsing is done as per the Amount column type.
+
+    Sources that emit signed amounts, for example refund rows carrying
+    a negative amount in the debit column, can be handled selecting the
+    appropriate sign handling policy with the sign argument.
+
+    Rows having both the credit and debit fields populated are
+    ambiguous. They are not rejected, but recorded in the warnings list
+    and skipped, so that they can be reviewed manually.
 
     Args:
       credit: Column name or index for amount.
@@ -202,25 +233,37 @@ class CreditOrDebit(Column):
       subs: Dictionary mapping regular expression patterns to
         replacement strings. Substitutions are performed with
         re.sub() in the order they are specified.
+      sign: A member of the Sign enum selecting how the sign of the
+        source values is interpreted. Defaults to Sign.IGNORE.
       default: Value to return if both fields are empty, if specified.
 
     """
 
-    def __init__(self, credit, debit, subs=None, default=NA):
+    def __init__(self, credit, debit, subs=None, sign=Sign.IGNORE, default=NA):
         super().__init__(credit, debit, default=default)
         self.subs = subs if subs is not None else {}
+        self.sign = sign
+        self.warnings = []
 
     def parse(self, credit, debit):
+        credit = credit.strip()
+        debit = debit.strip()
         if credit and debit:
-            raise ValueError(
-                "The credit and debit fields cannot be populated at the same time"
+            self.warnings.append(
+                "Row has both the credit and debit fields populated: "
+                f"credit={credit!r}, debit={debit!r}"
             )
+            return None
         if not credit and not debit:
+            if self.default is not NA:
+                return self.default
             raise ValueError("Neither credit or debit fields are populated")
         value = credit if credit else debit
         for pattern, replacement in self.subs.items():
             value = re.sub(pattern, replacement, value)
         parsed = decimal.Decimal(value)
+        if self.sign is Sign.IGNORE:
+            parsed = abs(parsed)
         return parsed if credit else -parsed
 
 
@@ -375,6 +418,14 @@ class Importer(beangulp.Importer, CSVReader):
         balances = defaultdict(list)
         default_account = self.account(filepath)
 
+        # Column descriptors are class-level singletons shared across
+        # importer instances and extract() invocations. Discard the
+        # warnings possibly recorded by a previous run.
+        for column in self.columns.values():
+            warnings = getattr(column, "warnings", None)
+            if warnings is not None:
+                warnings.clear()
+
         # Compute the line number of the first data line.
         offset = int(self.header) + bool(self.names) + 1
 
@@ -397,7 +448,17 @@ class Importer(beangulp.Importer, CSVReader):
                 payee = getattr(row, "payee", None)
                 account = getattr(row, "account", default_account)
                 currency = getattr(row, "currency", self.currency)
-                units = data.Amount(row.amount, currency)
+                amount = row.amount
+                if amount is None and isinstance(
+                    self.columns.get("amount"), CreditOrDebit
+                ):
+                    # CreditOrDebit rows that cannot be associated with
+                    # a single amount, for example rows having both the
+                    # credit and debit fields populated, are skipped
+                    # here. The column parser records them in its
+                    # warnings list for review.
+                    continue
+                units = data.Amount(amount, currency)
 
                 # Create a transaction.
                 txn = data.Transaction(
@@ -440,6 +501,13 @@ class Importer(beangulp.Importer, CSVReader):
                 balances[currency].append(
                     data.Balance(meta, date, account, units, None, None)
                 )
+
+        # Report rows recorded for review by the column parsers, for
+        # example rows having both the credit and debit fields
+        # populated.
+        for column in self.columns.values():
+            for warning in getattr(column, "warnings", []):
+                log.warning("%s: %s", filepath, warning)
 
         if not entries:
             return []

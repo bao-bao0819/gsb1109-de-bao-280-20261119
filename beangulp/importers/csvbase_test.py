@@ -17,6 +17,7 @@ from beangulp.importers.csvbase import (
     Order,
     Importer,
     CreditOrDebit,
+    Sign,
 )
 
 
@@ -242,14 +243,6 @@ class TestCreditOrDebitColumn(unittest.TestCase):
         value = func(("", ""))
         self.assertIsNone(value)
 
-    def test_both_columns(self):
-        column = CreditOrDebit(0, 1)
-        func = column.getter(None)
-        with self.assertRaisesRegex(
-            ValueError, "The credit and debit fields cannot be populated at the same time"
-        ):
-            func(("1.0", "2.0"))
-
     def test_neither_columns(self):
         column = CreditOrDebit(0, 1)
         func = column.getter(None)
@@ -257,6 +250,52 @@ class TestCreditOrDebitColumn(unittest.TestCase):
             ValueError, "Neither credit or debit fields are populated"
         ):
             func(("", ""))
+
+    def test_signed_credit_sign_ignored(self):
+        # With the default policy the source sign is ignored and the
+        # column side alone determines the sign of the result.
+        column = CreditOrDebit(0, 1)
+        func = column.getter(None)
+        self.assertEqual(func(("-1.0", "")), decimal.Decimal("1.0"))
+
+    def test_signed_debit_sign_ignored(self):
+        column = CreditOrDebit(0, 1)
+        func = column.getter(None)
+        self.assertEqual(func(("", "-1.0")), -decimal.Decimal("1.0"))
+
+    def test_signed_credit_sign_preserved(self):
+        column = CreditOrDebit(0, 1, sign=Sign.PRESERVE)
+        func = column.getter(None)
+        self.assertEqual(func(("-1.0", "")), -decimal.Decimal("1.0"))
+
+    def test_signed_debit_sign_preserved(self):
+        # A negative refund amount in the debit column becomes positive.
+        column = CreditOrDebit(0, 1, sign=Sign.PRESERVE)
+        func = column.getter(None)
+        self.assertEqual(func(("", "-1.0")), decimal.Decimal("1.0"))
+
+    def test_unsigned_amounts_unchanged_by_sign_policy(self):
+        for sign in Sign:
+            column = CreditOrDebit(0, 1, sign=sign)
+            func = column.getter(None)
+            self.assertEqual(func(("1.0", "")), decimal.Decimal("1.0"))
+            self.assertEqual(func(("", "1.0")), -decimal.Decimal("1.0"))
+
+    def test_both_columns_recorded(self):
+        # Rows with both fields populated are ambiguous: they are
+        # recorded for review and resolve to no amount.
+        column = CreditOrDebit(0, 1)
+        func = column.getter(None)
+        self.assertIsNone(func(("1.0", "2.0")))
+        self.assertEqual(len(column.warnings), 1)
+        self.assertIn("1.0", column.warnings[0])
+        self.assertIn("2.0", column.warnings[0])
+
+    def test_both_columns_recorded_sign_preserved(self):
+        column = CreditOrDebit(0, 1, sign=Sign.PRESERVE)
+        func = column.getter(None)
+        self.assertIsNone(func(("-1.0", "2.0")))
+        self.assertEqual(len(column.warnings), 1)
 
 
 class TestCSVMeta(unittest.TestCase):
@@ -794,6 +833,137 @@ class TestImporter(cmptest.TestCase):
         with self.assertRaisesRegex(RuntimeError, msg) as ctx:
             importer.extract(filename, [])
         self.assertIsInstance(ctx.exception.__cause__, decimal.InvalidOperation)
+
+    # Sources where expenses and refunds share the debit column have
+    # the refund rows carrying a signed amount. USD amounts have two
+    # decimal digits, KWD amounts three, so that precision preservation
+    # is checked.
+
+    def _signed_importer(self, sign):
+        class CSVImporter(Base):
+            date = Date(0)
+            narration = Column(1)
+            amount = CreditOrDebit(2, 3, sign=sign)
+            currency = Column(4)
+            names = False
+
+        return CSVImporter("Assets:CSV", "USD")
+
+    @docfile
+    def test_extract_signed_refunds_preserved(self, filename):
+        """\
+2021-05-17, Expense USD, , 12.34, USD
+2021-05-17, Refund USD, , -12.34, USD
+2021-05-18, Expense KWD, , 12.345, KWD
+2021-05-18, Refund KWD, , -12.345, KWD
+2021-05-19, Income USD, 50.00, , USD
+2021-05-19, Ambiguous, 1.00, 2.00, USD
+"""
+        importer = self._signed_importer(Sign.PRESERVE)
+        with self.assertLogs("beangulp.importers.csvbase", level="WARNING"):
+            entries = importer.extract(filename, [])
+
+        self.assertEqualEntries(
+            entries,
+            """
+        2021-05-17 * "Expense USD"
+          Assets:CSV  -12.34 USD
+        2021-05-17 * "Refund USD"
+          Assets:CSV  12.34 USD
+        2021-05-18 * "Expense KWD"
+          Assets:CSV  -12.345 KWD
+        2021-05-18 * "Refund KWD"
+          Assets:CSV  12.345 KWD
+        2021-05-19 * "Income USD"
+          Assets:CSV  50.00 USD
+        """,
+        )
+
+        # The original fixed-point values and their precision are
+        # preserved verbatim on the postings.
+        numbers = [entry.postings[0].units.number for entry in entries]
+        self.assertEqual(
+            numbers,
+            [
+                decimal.Decimal("-12.34"),
+                decimal.Decimal("12.34"),
+                decimal.Decimal("-12.345"),
+                decimal.Decimal("12.345"),
+                decimal.Decimal("50.00"),
+            ],
+        )
+        self.assertEqual(
+            [entry.postings[0].units.currency for entry in entries],
+            ["USD", "USD", "KWD", "KWD", "USD"],
+        )
+
+        # The row with both fields populated is not imported but is
+        # recorded for review.
+        self.assertEqual(len(importer.columns["amount"].warnings), 1)
+
+    @docfile
+    def test_extract_signed_refunds_ignored(self, filename):
+        """\
+2021-05-17, Expense USD, , 12.34, USD
+2021-05-17, Refund USD, , -12.34, USD
+2021-05-18, Expense KWD, , 12.345, KWD
+2021-05-18, Refund KWD, , -12.345, KWD
+2021-05-19, Income USD, 50.00, , USD
+2021-05-19, Ambiguous, 1.00, 2.00, USD
+"""
+        importer = self._signed_importer(Sign.IGNORE)
+        with self.assertLogs("beangulp.importers.csvbase", level="WARNING"):
+            entries = importer.extract(filename, [])
+
+        self.assertEqualEntries(
+            entries,
+            """
+        2021-05-17 * "Expense USD"
+          Assets:CSV  -12.34 USD
+        2021-05-17 * "Refund USD"
+          Assets:CSV  -12.34 USD
+        2021-05-18 * "Expense KWD"
+          Assets:CSV  -12.345 KWD
+        2021-05-18 * "Refund KWD"
+          Assets:CSV  -12.345 KWD
+        2021-05-19 * "Income USD"
+          Assets:CSV  50.00 USD
+        """,
+        )
+
+    @docfile
+    def test_extract_both_credit_and_debit_recorded(self, filename):
+        """\
+2021-05-17, Fine, , 12.34, USD
+2021-05-18, Ambiguous, 1.00, 2.00, USD
+2021-05-19, Also fine, 50.00, , USD
+"""
+        importer = self._signed_importer(Sign.PRESERVE)
+        with self.assertLogs("beangulp.importers.csvbase", level="WARNING") as cm:
+            entries = importer.extract(filename, [])
+
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].narration, "Fine")
+        self.assertEqual(entries[1].narration, "Also fine")
+
+        warnings = importer.columns["amount"].warnings
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1.00", warnings[0])
+        self.assertIn("2.00", warnings[0])
+        self.assertTrue(any("1.00" in line and "2.00" in line for line in cm.output))
+
+    @docfile
+    def test_warnings_reset_between_extracts(self, filename):
+        """\
+2021-05-17, Fine, , 12.34, USD
+2021-05-18, Ambiguous, 1.00, 2.00, USD
+"""
+        importer = self._signed_importer(Sign.PRESERVE)
+        for _ in range(2):
+            with self.assertLogs("beangulp.importers.csvbase", level="WARNING"):
+                entries = importer.extract(filename, [])
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(len(importer.columns["amount"].warnings), 1)
 
 
 class TestChomp(unittest.TestCase):

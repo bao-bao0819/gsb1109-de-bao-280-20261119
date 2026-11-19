@@ -1,3 +1,4 @@
+import csv
 import urllib.parse
 
 import pytest
@@ -323,6 +324,61 @@ async def test_table_tsv_with_labels_and_stream(ds_client):
     # Excel's quoting: values with double quotes in are quoted, quotes doubled
     assert lines[1].split("\t")[8] == '"[""tag1"", ""tag2""]"'
     assert len([line for line in lines if line]) == 16
+
+
+async def test_streaming_csv_reuses_label_lookups_across_pages_and_columns():
+    ds = Datasette(memory=True, settings={"max_returned_rows": 2})
+    await ds.invoke_startup()
+    db = ds.add_memory_database("labelsdb")
+    await db.execute_write_script(
+        """
+        create table t1 (id integer primary key, name text);
+        insert into t1 (id, name) values (7, 'T1-seven');
+        insert into t1 (id, name) values (8, 'T1-eight');
+        insert into t1 (id, name) values (9, 'T1-nine');
+        create table t2 (id integer primary key, name text);
+        insert into t2 (id, name) values (7, 'T2-seven');
+        create table maintable (
+            id integer primary key,
+            fk_a integer references t1(id),
+            fk_a2 integer references t1(id),
+            fk_b integer references t2(id)
+        );
+        insert into maintable (id, fk_a, fk_a2, fk_b) values (1, 7, 7, 7);
+        insert into maintable (id, fk_a, fk_a2, fk_b) values (2, 8, 7, 7);
+        insert into maintable (id, fk_a, fk_a2, fk_b) values (3, 9, 8, 7);
+        insert into maintable (id, fk_a, fk_a2, fk_b) values (4, 7, 9, null);
+        insert into maintable (id, fk_a, fk_a2, fk_b) values (5, 8, null, null);
+        """
+    )
+    label_queries = []
+    original_execute = ds.execute
+
+    async def tracking_execute(db_name, sql, params=None, **kwargs):
+        if " from t1" in sql.lower() or " from t2" in sql.lower():
+            label_queries.append((sql, list(params or [])))
+        return await original_execute(db_name, sql, params=params, **kwargs)
+
+    ds.execute = tracking_execute
+    response = await ds.client.get("/labelsdb/maintable.csv?_labels=1&_stream=1")
+    assert response.status_code == 200
+    lines = [line for line in response.text.split("\r\n") if line]
+    rows = list(csv.reader(lines))
+    header = rows[0]
+    first = dict(zip(header, rows[1]))
+    # Both fk_a and fk_b contain 7, but reference different tables
+    assert first["fk_a_label"] == "T1-seven"
+    assert first["fk_a2_label"] == "T1-seven"
+    assert first["fk_b_label"] == "T2-seven"
+    # Every referenced (table, value) pair is queried at most once, even though
+    # the export spans three pages and two columns point at t1
+    seen_pairs = set()
+    for sql, params in label_queries:
+        table = "t1" if " from t1" in sql.lower() else "t2"
+        for param in params:
+            assert (table, param) not in seen_pairs
+            seen_pairs.add((table, param))
+    assert seen_pairs == {("t1", 7), ("t1", 8), ("t1", 9), ("t2", 7)}
 
 
 async def test_custom_sql_tsv_quotes_like_excel(ds_client):

@@ -18,6 +18,7 @@ from datasette.app import Database, Datasette, ResourcesSQL
 from datasette.database import DatasetteClosedError
 from datasette.resources import DatabaseResource
 from datasette.utils import PrefixedUrlString
+from datasette.utils.asgi import Request
 
 
 @pytest.fixture
@@ -462,3 +463,94 @@ async def test_datasette_render_template_dataclass_values_not_deep_copied():
     await ds.invoke_startup()
     rendered = await ds.render_template("error.html", context)
     assert "shallow-copied-value" in rendered
+
+
+async def _fk_label_datasette():
+    ds = Datasette(memory=True)
+    await ds.invoke_startup()
+    db = ds.add_memory_database("fkdb")
+    await db.execute_write_script(
+        """
+        create table targets_a (id integer primary key, name text);
+        insert into targets_a (id, name) values (7, 'A-seven');
+        insert into targets_a (id, name) values (8, 'A-eight');
+        create table targets_b (id integer primary key, name text);
+        insert into targets_b (id, name) values (7, 'B-seven');
+        create table source (
+            id integer primary key,
+            ref_a integer references targets_a(id),
+            ref_a_again integer references targets_a(id),
+            ref_b integer references targets_b(id)
+        );
+        """
+    )
+    return ds
+
+
+def _track_label_queries(ds):
+    # Returns a list that records every label lookup SQL run via ds.execute
+    label_sql = []
+    original_execute = ds.execute
+
+    async def tracking_execute(db_name, sql, params=None, **kwargs):
+        if " from targets_" in sql.lower():
+            label_sql.append((sql, params))
+        return await original_execute(db_name, sql, params=params, **kwargs)
+
+    ds.execute = tracking_execute
+    return label_sql
+
+
+async def test_expand_foreign_keys_batches_distinct_target_values():
+    ds = await _fk_label_datasette()
+    label_sql = _track_label_queries(ds)
+    request = Request.fake("/")
+    # Value 7 repeats within one column, and 8 appears once
+    first = await ds.expand_foreign_keys(
+        None, "fkdb", "source", "ref_a", [7, 7, 8], request=request
+    )
+    # A second source column references the same table and asks for 7 again
+    second = await ds.expand_foreign_keys(
+        None, "fkdb", "source", "ref_a_again", [7], request=request
+    )
+    # One batched query for distinct values 7 and 8; cached 7 needs no second query
+    assert len(label_sql) == 1
+    assert label_sql[0][1] == [7, 8]
+    assert first == {
+        ("ref_a", 7): "A-seven",
+        ("ref_a", 8): "A-eight",
+    }
+    assert second == {("ref_a_again", 7): "A-seven"}
+
+
+async def test_expand_foreign_keys_same_value_different_target_tables():
+    ds = await _fk_label_datasette()
+    label_sql = _track_label_queries(ds)
+    request = Request.fake("/")
+    # Both columns contain the number 7, but they reference different tables
+    labels_a = await ds.expand_foreign_keys(
+        None, "fkdb", "source", "ref_a", [7], request=request
+    )
+    labels_b = await ds.expand_foreign_keys(
+        None, "fkdb", "source", "ref_b", [7], request=request
+    )
+    assert labels_a == {("ref_a", 7): "A-seven"}
+    assert labels_b == {("ref_b", 7): "B-seven"}
+    assert len(label_sql) == 2
+    assert any("from targets_a" in sql for sql, _ in label_sql)
+    assert any("from targets_b" in sql for sql, _ in label_sql)
+
+
+async def test_expand_foreign_keys_without_request_does_not_cache():
+    ds = await _fk_label_datasette()
+    label_sql = _track_label_queries(ds)
+    first = await ds.expand_foreign_keys(
+        None, "fkdb", "source", "ref_a", [7]
+    )
+    second = await ds.expand_foreign_keys(
+        None, "fkdb", "source", "ref_a_again", [7]
+    )
+    # Without a request there is nowhere to store the cache, so both lookups run
+    assert len(label_sql) == 2
+    assert first == {("ref_a", 7): "A-seven"}
+    assert second == {("ref_a_again", 7): "A-seven"}

@@ -2343,9 +2343,24 @@ ORDER BY allowed.parent, allowed.child
             log_sql_errors=log_sql_errors,
         )
 
-    async def expand_foreign_keys(self, actor, database, table, column, values):
-        """Returns dict mapping (column, value) -> label"""
-        labeled_fks = {}
+    async def expand_foreign_keys(
+        self, actor, database, table, column, values, *, request=None
+    ):
+        """Returns dict mapping (column, value) -> label
+
+        Labels are cached for the lifetime of a request, keyed by the actual
+        referenced row (database, table, column, value) rather than the source
+        column. Two source columns pointing at the same target table reuse the
+        same lookup, so the number of label queries grows with the number of
+        distinct target values instead of the number of source cells. Pass the
+        ``request`` to share this cache across columns and streamed pages.
+        """
+        if request is not None:
+            label_cache = request.scope.setdefault(
+                "_datasette_fk_label_cache", {}
+            )
+        else:
+            label_cache = None
         db = self.databases[database]
         foreign_keys = await db.foreign_keys_for_table(table)
         # Find the foreign_key for this column
@@ -2388,27 +2403,55 @@ ORDER BY allowed.parent, allowed.child
         )
         if not visible:
             return {}
-        label_column = await db.label_column_for_table(other_table)
-        if not label_column:
-            return {(fk["column"], value): str(value) for value in values}
-        labeled_fks = {}
-        sql = """
-            select {other_column}, {label_column}
-            from {other_table}
-            where {other_column} in ({placeholders})
-        """.format(
-            other_column=escape_sqlite(other_column),
-            label_column=escape_sqlite(label_column),
-            other_table=escape_sqlite(other_table),
-            placeholders=", ".join(["?"] * len(set(values))),
+        # Only target values that this column has not resolved yet need work.
+        # The cache is keyed on the actual referenced row, so distinct source
+        # columns that reference the same table and value share one entry.
+        # Nulls are never expanded into labels, so skip them entirely.
+        unique_values = list(
+            dict.fromkeys(value for value in values if value is not None)
         )
-        try:
-            results = await self.execute(database, sql, list(set(values)))
-        except QueryInterrupted:
-            pass
-        else:
-            for id, value in results:
-                labeled_fks[(fk["column"], id)] = value
+        cached_labels = {}
+        missing_values = []
+        for value in unique_values:
+            if label_cache is None:
+                missing_values.append(value)
+                continue
+            cache_key = (database, other_table, other_column, value)
+            if cache_key in label_cache:
+                cached_labels[value] = label_cache[cache_key]
+            else:
+                missing_values.append(value)
+        resolved = {}
+        if missing_values:
+            label_column = await db.label_column_for_table(other_table)
+            if not label_column:
+                # No label column: the value itself is the label.
+                resolved = {value: str(value) for value in missing_values}
+            else:
+                sql = """
+                    select {other_column}, {label_column}
+                    from {other_table}
+                    where {other_column} in ({placeholders})
+                """.format(
+                    other_column=escape_sqlite(other_column),
+                    label_column=escape_sqlite(label_column),
+                    other_table=escape_sqlite(other_table),
+                    placeholders=", ".join(["?"] * len(missing_values)),
+                )
+                try:
+                    results = await self.execute(database, sql, missing_values)
+                except QueryInterrupted:
+                    pass
+                else:
+                    for id, value in results:
+                        resolved[id] = value
+        if label_cache is not None:
+            for value, label in resolved.items():
+                label_cache[(database, other_table, other_column, value)] = label
+        labeled_fks = {
+            (fk["column"], value): label
+            for value, label in {**cached_labels, **resolved}.items()
+        }
         return labeled_fks
 
     def absolute_url(self, request, path):

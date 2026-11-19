@@ -438,7 +438,12 @@ class RowView(BaseView):
                 column_index = reordered_columns.index(column)
                 values = [row[column_index] for row in expanded_rows]
                 expanded_labels = await self.ds.expand_foreign_keys(
-                    request.actor, database, table, column, values
+                    request.actor,
+                    database,
+                    table,
+                    column,
+                    values,
+                    request=request,
                 )
                 if expanded_labels:
                     new_rows = []

@@ -290,7 +290,12 @@ class ColumnFacet(Facet):
                     # Attempt to expand foreign keys into labels
                     values = [row["value"] for row in facet_rows]
                     expanded = await self.ds.expand_foreign_keys(
-                        self.request.actor, self.database, self.table, column, values
+                        self.request.actor,
+                        self.database,
+                        self.table,
+                        column,
+                        values,
+                        request=self.request,
                     )
                 else:
                     expanded = {}

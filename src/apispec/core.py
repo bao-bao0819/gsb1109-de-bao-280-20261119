@@ -551,6 +551,14 @@ class APISpec:
         if not path:
             raise APISpecError("Path template is not specified.")
 
+        # The same parameter objects may be shared by several operations (the
+        # caller or a path helper may reuse one list for more than one
+        # operation). Give each operation its own copy so resolving or
+        # updating one operation cannot alter the parameters of another one.
+        for operation in operations.values():
+            if isinstance(operation, dict) and "parameters" in operation:
+                operation["parameters"] = deepcopy(operation["parameters"])
+
         # Execute operation helpers
         for plugin in self.plugins:
             try:

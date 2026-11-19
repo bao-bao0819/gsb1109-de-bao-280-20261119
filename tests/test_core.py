@@ -786,6 +786,64 @@ class TestPath(RefsSchemaTestMixin):
         )
         assert get_paths(spec)[path]["put"]["parameters"][0]["required"] is True
 
+    def test_shared_parameter_not_modified_by_other_operation(self, spec):
+        """A parameter object shared by two operations is resolved for both.
+
+        Resolving the parameters of one operation must not mutate the shared
+        object used by the other operation.
+        """
+        path = "/items"
+        region = {"name": "region", "in": "query", "schema": {"type": "string"}}
+        spec.path(
+            path=path,
+            operations={
+                "get": {"parameters": [region]},
+                "post": {"parameters": [region]},
+            },
+        )
+        assert get_paths(spec)[path]["get"]["parameters"] == [region]
+        assert get_paths(spec)[path]["post"]["parameters"] == [region]
+
+    def test_update_one_operation_keeps_other_parameters(self, spec):
+        """Updating an operation keeps other operations' parameters untouched."""
+        path = "/items"
+        get_region = {
+            "name": "region",
+            "in": "query",
+            "schema": {"type": "string", "default": "us"},
+        }
+        post_region = {
+            "name": "region",
+            "in": "query",
+            "schema": {"type": "string", "default": "eu"},
+        }
+        region_header = {
+            "name": "region",
+            "in": "header",
+            "schema": {"type": "string"},
+        }
+        spec.path(
+            path=path,
+            operations={
+                "get": {"parameters": [get_region, region_header]},
+                "post": {"parameters": [post_region, region_header]},
+            },
+        )
+
+        updated_region = {
+            "name": "region",
+            "in": "query",
+            "schema": {"type": "string", "default": "de"},
+        }
+        spec.path(
+            path=path,
+            operations={"get": {"parameters": [updated_region], "summary": "updated"}},
+        )
+
+        paths = get_paths(spec)[path]
+        assert paths["get"]["parameters"] == [updated_region]
+        assert paths["post"]["parameters"] == [post_region, region_header]
+
     def test_path_with_no_path_raises_error(self, spec):
         message = "Path template is not specified"
         with pytest.raises(APISpecError, match=message):

@@ -222,6 +222,24 @@ class MarshmallowPlugin(BasePlugin):
         self.resolver.resolve_schema(header)
         return header
 
+    def path_helper(
+        self,
+        path: str | None = None,
+        operations: dict | None = None,
+        parameters: list | None = None,
+        **kwargs: typing.Any,
+    ) -> None:
+        """Resolve marshmallow Schemas in path-level parameters.
+
+        Path-level parameters are shared by the operations of the path, but
+        each operation may override one of them with its own definition. The
+        shared list is resolved in place. Operation parameters are resolved
+        separately by :meth:`operation_helper`.
+        """
+        assert self.resolver  # needed for mypy
+        if parameters is not None:
+            parameters[:] = self.resolver.resolve_parameters(parameters)
+
     def operation_helper(
         self,
         path: str | None = None,

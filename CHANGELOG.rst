@@ -1,6 +1,18 @@
 Changelog
 ---------
 
+Unreleased
+**********
+
+Bug fixes:
+
+- Resolve parameters shared by several operations without mutating the
+  shared parameter objects, so updating one operation no longer alters the
+  parameters of another one.
+- ``MarshmallowPlugin``: expand marshmallow Schemas in path-level
+  parameters. Parameters with the same name but different ``in`` values
+  (e.g. a query parameter and a header) are kept as distinct parameters.
+
 6.10.1 (2026-11-03)
 *******************
 

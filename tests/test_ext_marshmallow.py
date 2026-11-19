@@ -1228,6 +1228,70 @@ class TestOperationHelper:
             schema = resp["content"]["application/json"]["schema"]
         assert schema == build_ref(spec, "schema", "SomeSpecificPetSchema")
 
+    def test_shared_schema_parameter_resolved_for_each_operation(self, spec_fixture):
+        """A parameter dict shared by two operations is resolved for both.
+
+        Resolution must not consume the ``schema``/``in`` keys of the shared
+        dict, otherwise the second operation fails or loses its parameter.
+        """
+        spec = spec_fixture.spec
+        shared = {"in": "query", "schema": PetSchema}
+        spec.path(
+            "/pet",
+            operations={
+                "get": {"parameters": [shared]},
+                "post": {"parameters": [shared]},
+            },
+        )
+        paths = get_paths(spec)["/pet"]
+        expected = spec_fixture.openapi.schema2parameters(
+            schema=PetSchema, location="query"
+        )
+        assert paths["get"]["parameters"] == expected
+        assert paths["post"]["parameters"] == expected
+        assert shared == {"in": "query", "schema": PetSchema}
+
+    def test_path_level_schema_parameter_resolved(self, spec_fixture):
+        """Marshmallow schemas are expanded in path-level parameters."""
+        spec = spec_fixture.spec
+        spec.path(
+            "/pet",
+            parameters=[{"in": "query", "schema": PetSchema}],
+            operations={"get": {"responses": {"200": {"description": "ok"}}}},
+        )
+        parameters = get_paths(spec)["/pet"]["parameters"]
+        assert parameters == spec_fixture.openapi.schema2parameters(
+            schema=PetSchema, location="query"
+        )
+
+    def test_shared_region_query_and_header_preserved(self, spec_fixture):
+        """Same-named parameters in different locations are both kept.
+
+        A shared ``region`` query parameter and a ``region`` header parameter
+        have distinct OpenAPI identities, so both must appear.
+        """
+        spec = spec_fixture.spec
+        shared = {
+            "in": "query",
+            "name": "region",
+            "schema": {"type": "string", "default": "us"},
+        }
+        region_header = {
+            "name": "region",
+            "in": "header",
+            "schema": {"type": "string"},
+        }
+        spec.path(
+            "/table",
+            operations={
+                "get": {"parameters": [shared, region_header]},
+                "post": {"parameters": [shared, region_header]},
+            },
+        )
+        paths = get_paths(spec)["/table"]
+        assert paths["get"]["parameters"] == [shared, region_header]
+        assert paths["post"]["parameters"] == [shared, region_header]
+
 
 class TestCircularReference:
     def test_circular_referencing_schemas(self, spec):

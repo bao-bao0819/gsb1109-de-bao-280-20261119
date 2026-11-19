@@ -153,6 +153,10 @@ class SchemaResolver:
                 and not isinstance(parameter.get("schema", {}), dict)
                 and "in" in parameter
             ):
+                # Work on a copy so a parameter dict shared by several
+                # operations is not mutated (and can still be resolved for
+                # each of them).
+                parameter = parameter.copy()
                 schema_instance = resolve_schema_instance(parameter.pop("schema"))
                 resolved += self.converter.schema2parameters(
                     schema_instance, location=parameter.pop("in"), **parameter

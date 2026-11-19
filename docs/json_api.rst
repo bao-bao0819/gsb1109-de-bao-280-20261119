@@ -1192,6 +1192,15 @@ The following extras are available for row JSON responses.
           }
         ]
 
+``row_version``
+    Opaque version token for this row, derived from a hash of its current values. Pass it as ``if_version`` to the row update API to apply the update only if the row has not changed since it was read. (See :ref:`RowUpdateView` for how to use this token for compare-and-swap updates.)
+
+    ``GET /fixtures/simple_primary_key/1.json?_extra=row_version``
+
+    .. code-block:: json
+
+        "89c00b0c81fe1fe034ca190f020cab807cbe1474d746cd935be0e8158ad61d46"
+
 Query JSON responses
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -2128,6 +2137,64 @@ The returned JSON will look like this:
 Any errors will use the :ref:`standard error format <json_api_errors>`, with a ``400`` status code for a bad input or a ``403`` status code for an authentication or permission error.
 
 Pass ``"alter: true`` to automatically add any missing columns to the table. This requires the :ref:`actions_alter_table` permission.
+
+.. _RowUpdateView_if_version:
+
+Optimistic concurrency with ``if_version``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If two clients may edit the same row at the same time, you can guard against lost updates with a compare-and-swap update. First read the row's version token using the ``row_version`` extra:
+
+::
+
+    GET /<database>/<table>/<row-pks>.json?_extra=row_version
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "row": {
+            "id": 1,
+            "title": "Old title"
+        },
+        "row_version": "9c1b0a8f..."
+    }
+
+Then pass that token back as ``if_version`` when updating:
+
+.. code-block:: json
+
+    {
+        "update": {
+            "title": "New title"
+        },
+        "if_version": "9c1b0a8f..."
+    }
+
+The update is only applied if the row still matches that version - the check and the update happen together inside the write transaction. A successful response includes the new version token:
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "version": "f7e2d1c0..."
+    }
+
+If the row has been modified since you read it, the update is rejected with a ``409`` status code and the current version token, so you can re-read the row and decide whether to retry:
+
+.. code-block:: json
+
+    {
+        "ok": false,
+        "error": "Row has been modified since if_version was read",
+        "errors": [
+            "Row has been modified since if_version was read"
+        ],
+        "status": 409,
+        "current_version": "f7e2d1c0..."
+    }
+
+The version token is an opaque hash of the row's current values - any change to the row produces a different token.
 
 .. _RowDeleteView:
 

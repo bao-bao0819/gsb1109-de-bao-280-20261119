@@ -22,9 +22,11 @@ from datasette.utils import (
     await_me_maybe,
     call_with_supported_arguments,
     decode_write_json_row,
+    error_body,
     escape_sqlite,
     make_slot_function,
     path_from_row_pks,
+    row_version,
     sqlite3,
     tilde_decode,
     to_css_class,
@@ -694,6 +696,13 @@ class RowError(Exception):
         self.error = error
 
 
+class RowVersionConflict(Exception):
+    "Raised inside the write transaction when if_version does not match."
+
+    def __init__(self, current_version):
+        self.current_version = current_version
+
+
 ROW_FLASH_LABEL_MAX_LENGTH = 80
 
 
@@ -829,9 +838,13 @@ class RowUpdateView(BaseView):
         if "update" not in data or not isinstance(data["update"], dict):
             return Response.error(["JSON must contain an update dictionary"])
 
-        invalid_keys = set(data.keys()) - {"update", "return", "alter"}
+        invalid_keys = set(data.keys()) - {"update", "return", "alter", "if_version"}
         if invalid_keys:
             return Response.error(["Invalid keys: {}".format(", ".join(invalid_keys))])
+
+        if_version = data.get("if_version")
+        if if_version is not None and not isinstance(if_version, str):
+            return Response.error(["if_version must be a string"], 400)
 
         update = data["update"]
         try:
@@ -858,17 +871,47 @@ class RowUpdateView(BaseView):
 
         def update_row(conn):
             check_structured_write_table(conn, resolved.table)
+            if if_version is not None:
+                # Compare-and-swap: only apply the update if the row still
+                # matches the version the caller read. Runs inside the
+                # serialized write transaction, so the check and the update
+                # are atomic with respect to other writes.
+                cursor = conn.execute(resolved.sql, resolved.params)
+                current_row = cursor.fetchone()
+                if current_row is not None:
+                    current_version = row_version(
+                        [d[0] for d in cursor.description], current_row
+                    )
+                    if current_version != if_version:
+                        raise RowVersionConflict(current_version)
             sqlite_utils.Database(conn)[resolved.table].update(
                 resolved.pk_values, update, alter=alter
             )
+            if if_version is None:
+                return None
+            # Re-read to compute the new version token - None if the
+            # update changed the primary key and the row moved
+            cursor = conn.execute(resolved.sql, resolved.params)
+            new_row = cursor.fetchone()
+            if new_row is None:
+                return None
+            return row_version([d[0] for d in cursor.description], new_row)
 
         try:
-            await resolved.db.execute_write_fn(update_row, request=request)
+            new_version = await resolved.db.execute_write_fn(
+                update_row, request=request
+            )
+        except RowVersionConflict as e:
+            body = error_body("Row has been modified since if_version was read", 409)
+            body["current_version"] = e.current_version
+            return Response.json(body, status=409)
         except Exception as e:  # noqa: BLE001
             # TODO: narrow to expected write errors so Datasette bugs surface as 500s
             return Response.error([str(e)], 400)
 
         result = {"ok": True}
+        if if_version is not None and new_version is not None:
+            result["version"] = new_version
         returned_row = None
         # Only read back and disclose the stored row if the actor is also
         # allowed to view this table - update-row alone must not be usable

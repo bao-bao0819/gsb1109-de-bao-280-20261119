@@ -436,6 +436,21 @@ def decode_write_json_rows(rows):
     return [decode_write_json_row(row) for row in rows]
 
 
+def row_version(columns, row):
+    """
+    Opaque version token for a row, derived from a hash of its column
+    names and current values. Used for optimistic concurrency control:
+    read the version, then pass it as if_version to the row update API
+    so the update only applies if the row has not changed since.
+    """
+    payload = json.dumps(
+        [[column, value] for column, value in zip(columns, row)],
+        cls=CustomJSONEncoder,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @contextmanager
 def sqlite_timelimit(conn, ms):
     deadline = time.perf_counter() + (ms / 1000)

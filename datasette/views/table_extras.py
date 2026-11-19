@@ -11,6 +11,7 @@ from datasette.resources import DatabaseResource, TableResource
 from datasette.utils import (
     await_me_maybe,
     call_with_supported_arguments,
+    row_version,
     to_css_class,
 )
 
@@ -1204,6 +1205,21 @@ class ExpandedColumnsExtra(Extra):
         return list(context.expanded_columns)
 
 
+class RowVersionExtra(Extra):
+    description = "Opaque version token for this row, derived from a hash of its current values. Pass it as ``if_version`` to the row update API to apply the update only if the row has not changed since it was read."
+    docs_note = (
+        "See :ref:`RowUpdateView` for how to use this token for "
+        "compare-and-swap updates."
+    )
+    example = ExtraExample("/fixtures/simple_primary_key/1.json?_extra=row_version")
+    scopes: ClassVar[set[ExtraScope]] = {ExtraScope.ROW}
+
+    async def resolve(self, context):
+        if not context.rows:
+            return None
+        return row_version(context.columns, context.rows[0])
+
+
 class ForeignKeyTablesExtra(Extra):
     description = "List of tables that link to this row using foreign keys. Each item includes the foreign key fields plus ``count`` for matching rows and ``link`` for the filtered table URL."
     example = ExtraExample(
@@ -1356,6 +1372,7 @@ TABLE_EXTRA_CLASSES = [
     ExpandableColumnsExtra,
     ExpandedColumnsExtra,
     ForeignKeyTablesExtra,
+    RowVersionExtra,
     FormHiddenArgsExtra,
 ]
 

@@ -1116,6 +1116,104 @@ async def test_update_row_alter(ds_write):
     assert response.json() == {"ok": True}
 
 
+async def _row_version(ds_write, pk):
+    response = await ds_write.client.get(f"/data/docs/{pk}.json?_extra=row_version")
+    assert response.status_code == 200
+    return response.json()["row_version"]
+
+
+async def test_row_version_extra(ds_write):
+    pk = await _insert_row(ds_write)
+    version = await _row_version(ds_write, pk)
+    assert isinstance(version, str)
+    assert len(version) == 64
+    # Stable while the row is unchanged
+    assert await _row_version(ds_write, pk) == version
+    # Changes when the row changes
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        f"/data/docs/{pk}/-/update",
+        json={"update": {"title": "Changed"}},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200
+    assert await _row_version(ds_write, pk) != version
+
+
+async def test_update_row_if_version(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    path = f"/data/docs/{pk}/-/update"
+    version = await _row_version(ds_write, pk)
+
+    # Update with the correct version succeeds and returns the new version
+    response = await ds_write.client.post(
+        path,
+        json={"update": {"title": "New title"}, "if_version": version},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200
+    new_version = response.json()["version"]
+    assert new_version != version
+    assert await _row_version(ds_write, pk) == new_version
+
+    # A second update from the same (now stale) version is rejected
+    response = await ds_write.client.post(
+        path,
+        json={"update": {"title": "Other title"}, "if_version": version},
+        headers=_headers(token),
+    )
+    assert response.status_code == 409
+    assert response.json() == {
+        "ok": False,
+        "error": "Row has been modified since if_version was read",
+        "errors": ["Row has been modified since if_version was read"],
+        "status": 409,
+        "current_version": new_version,
+    }
+    # The rejected update did not modify the row
+    row = (await ds_write.client.get(f"/data/docs/{pk}.json")).json()["row"]
+    assert row["title"] == "New title"
+
+    # Retrying with the returned current version succeeds
+    response = await ds_write.client.post(
+        path,
+        json={
+            "update": {"title": "Other title"},
+            "if_version": response.json()["current_version"],
+        },
+        headers=_headers(token),
+    )
+    assert response.status_code == 200
+    row = (await ds_write.client.get(f"/data/docs/{pk}.json")).json()["row"]
+    assert row["title"] == "Other title"
+
+
+async def test_update_row_if_version_never_seen(ds_write):
+    # A token that does not match the current row is rejected
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    response = await ds_write.client.post(
+        f"/data/docs/{pk}/-/update",
+        json={"update": {"title": "New title"}, "if_version": "not-a-version"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 409
+    assert response.json()["current_version"] == await _row_version(ds_write, pk)
+
+
+async def test_update_row_if_version_must_be_string(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    response = await ds_write.client.post(
+        f"/data/docs/{pk}/-/update",
+        json={"update": {"title": "New title"}, "if_version": 123},
+        headers=_headers(token),
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == ["if_version must be a string"]
+
+
 async def test_alter_table_operations(ds_write):
     token = write_token(ds_write, permissions=["at"])
     db = ds_write.get_database("data")

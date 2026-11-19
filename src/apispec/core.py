@@ -32,6 +32,274 @@ MIN_INCLUSIVE_OPENAPI_VERSION = Version("2.0")
 MAX_EXCLUSIVE_OPENAPI_VERSION = Version("4.0")
 
 
+_NON_OPTION_KEYS = {
+    "components",
+    "definitions",
+    "examples",
+    "headers",
+    "info",
+    "links",
+    "openapi",
+    "parameters",
+    "paths",
+    "responses",
+    "securityDefinitions",
+    "securitySchemes",
+    "swagger",
+    "tags",
+}
+
+
+def _escape_json_pointer(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def _unescape_json_pointer(value: str) -> str:
+    return value.replace("~1", "/").replace("~0", "~")
+
+
+def _rewrite_ref(
+    reference: str, renames: dict[str, dict[str, str]], openapi_major_version: int
+) -> str:
+    """Rewrite a local component reference using a rename mapping."""
+    if not reference.startswith("#/"):
+        return reference
+
+    segments = reference[2:].split("/")
+    if openapi_major_version >= 3:
+        if len(segments) <= 2 or segments[0] != "components":
+            return reference
+        prefix_length = 2
+    else:
+        if len(segments) <= 1:
+            return reference
+        prefix_length = 1
+
+    subsections = COMPONENT_SUBSECTIONS[openapi_major_version]
+    obj_type = None
+    for component_type, subsection in subsections.items():
+        section_index = 1 if openapi_major_version >= 3 else 0
+        if segments[section_index] == subsection:
+            obj_type = component_type
+            break
+    if obj_type is None:
+        return reference
+
+    name = _unescape_json_pointer(segments[prefix_length])
+    new_name = renames.get(obj_type, {}).get(name)
+    if new_name is None:
+        return reference
+    segments[prefix_length] = _escape_json_pointer(new_name)
+    return "#/" + "/".join(segments)
+
+
+def _rewrite_refs(
+    obj: typing.Any, renames: dict[str, dict[str, str]], openapi_major_version: int
+) -> None:
+    """Recursively rewrite all ``$ref`` values in a component or path object."""
+    if isinstance(obj, dict):
+        reference = obj.get("$ref")
+        if isinstance(reference, str):
+            obj["$ref"] = _rewrite_ref(reference, renames, openapi_major_version)
+        # Security requirements refer to security schemes by name.
+        security = obj.get("security")
+        security_renames = renames.get("security_scheme", {})
+        if isinstance(security, list) and security_renames:
+            for requirement in security:
+                if isinstance(requirement, dict):
+                    renamed = {
+                        security_renames.get(name, name): scopes
+                        for name, scopes in requirement.items()
+                    }
+                    requirement.clear()
+                    requirement.update(renamed)
+        for value in obj.values():
+            _rewrite_refs(value, renames, openapi_major_version)
+    elif isinstance(obj, list):
+        for value in obj:
+            _rewrite_refs(value, renames, openapi_major_version)
+
+
+def _namespaced_name(name: str, namespace: typing.Any, separator: str) -> str:
+    """Build the namespaced name of a component."""
+    if namespace in (None, ""):
+        return name
+    if callable(namespace):
+        return namespace(name)
+    if isinstance(namespace, dict):
+        return namespace.get(name, name)
+    if not isinstance(namespace, str):
+        raise APISpecError("A namespace must be a string, a mapping or a callable.")
+    if "{name}" in namespace:
+        return namespace.replace("{name}", name)
+    if "{}" in namespace:
+        return namespace.replace("{}", name)
+    if namespace.endswith(separator):
+        return f"{namespace}{name}"
+    return f"{namespace}{separator}{name}"
+
+
+def _component_container(
+    data: dict, obj_type: str, openapi_major_version: int
+) -> dict | None:
+    """Return the component mapping for a component type in a spec dict."""
+    section = COMPONENT_SUBSECTIONS[openapi_major_version].get(obj_type)
+    if section is None:
+        return None
+    if openapi_major_version >= 3:
+        return (data.get("components") or {}).get(section)
+    return data.get(section)
+
+
+def _component_renames(
+    spec: APISpec,
+    namespace: typing.Any,
+    separator: str,
+    openapi_major_version: int,
+    data: dict | None = None,
+) -> dict[str, dict[str, str]]:
+    """Map each component type's names to their namespaced names."""
+    renames: dict[str, dict[str, str]] = {}
+    for obj_type in COMPONENT_SUBSECTIONS[openapi_major_version]:
+        names = set(spec.components._subsections.get(obj_type, {}))
+        names.update(spec.components._subsections_lazy.get(obj_type, {}))
+        # Components passed through options are rendered in ``data`` but are
+        # not stored in ``spec.components``.
+        if data is not None:
+            container = _component_container(data, obj_type, openapi_major_version)
+            if container:
+                names.update(container)
+        renames[obj_type] = {
+            name: _namespaced_name(name, namespace, separator) for name in names
+        }
+    return renames
+
+
+def _rename_component_keys(
+    data: dict,
+    renames: dict[str, dict[str, str]],
+    openapi_major_version: int,
+) -> None:
+    """Rename component keys in a spec dict, using their namespaced names."""
+    for obj_type, mapping in renames.items():
+        container = _component_container(data, obj_type, openapi_major_version)
+        if not container:
+            continue
+        renamed = {}
+        for name, component in container.items():
+            new_name = mapping.get(name, name)
+            if new_name in renamed:
+                raise DuplicateComponentNameError(
+                    f'Another {obj_type.replace("_", " ")} with name "{new_name}" '
+                    "is already registered."
+                )
+            renamed[new_name] = component
+        container.clear()
+        container.update(renamed)
+
+
+def _merge_dicts(target: dict, source: dict) -> None:
+    """Recursively merge ``source`` into ``target``.
+
+    Dictionaries are merged and parameters lists are concatenated. Other
+    conflicting values from ``source`` take precedence.
+    """
+    for key, value in source.items():
+        if key not in target:
+            target[key] = value
+        elif isinstance(target[key], dict) and isinstance(value, dict):
+            _merge_dicts(target[key], value)
+        elif (
+            key == "parameters"
+            and isinstance(target[key], list)
+            and isinstance(value, list)
+        ):
+            for parameter in value:
+                if parameter not in target[key]:
+                    target[key].append(parameter)
+        elif target[key] != value:
+            target[key] = value
+
+
+def _merge_missing(target: dict, source: dict) -> None:
+    """Fill missing values in ``target`` from ``source``, keeping existing ones."""
+    for key, value in source.items():
+        if key not in target:
+            target[key] = value
+        elif isinstance(target[key], dict) and isinstance(value, dict):
+            _merge_missing(target[key], value)
+
+
+def _merge_tags(target: list[dict], tags: list[dict]) -> None:
+    known_names = {
+        tag.get("name") for tag in target if isinstance(tag, dict) and "name" in tag
+    }
+    for tag in tags:
+        name = tag.get("name") if isinstance(tag, dict) else None
+        if name is not None and name in known_names:
+            continue
+        target.append(tag)
+        if name is not None:
+            known_names.add(name)
+
+
+def _merge_component_data(
+    components: Components, data: dict, openapi_major_version: int
+) -> None:
+    for obj_type in COMPONENT_SUBSECTIONS[openapi_major_version]:
+        container = _component_container(data, obj_type, openapi_major_version)
+        if not container:
+            continue
+        target = components._subsections[obj_type]
+        for name, component in container.items():
+            if name in target and target[name] != component:
+                raise DuplicateComponentNameError(
+                    f'Another {obj_type.replace("_", " ")} with name "{name}" '
+                    "is already registered."
+                )
+            target[name] = component
+
+
+def _flatten_merge_specs(
+    base: typing.Any, specs: Sequence[typing.Any]
+) -> list[APISpec]:
+    """Flatten merge arguments, accepting a base spec or a sequence of specs."""
+    values = list(specs)
+    if isinstance(base, APISpec):
+        values.insert(0, base)
+    elif isinstance(base, (list, tuple)):
+        values = [*base, *values]
+    else:
+        raise APISpecError("Can only merge APISpec instances.")
+
+    flattened: list[APISpec] = []
+    for value in values:
+        if isinstance(value, APISpec):
+            flattened.append(value)
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(item, APISpec) for item in value
+        ):
+            flattened.extend(value)
+        else:
+            raise APISpecError("Can only merge APISpec instances.")
+    return flattened
+
+
+def _merge_namespace_index(key: typing.Any, specs: Sequence[APISpec]) -> int:
+    """Resolve a namespace mapping key to a spec index."""
+    if isinstance(key, int):
+        if not -len(specs) <= key < len(specs):
+            raise APISpecError(f"namespaces index {key} is out of range.")
+        return key % len(specs)
+    if isinstance(key, str):
+        matches = [index for index, spec in enumerate(specs) if spec.title == key]
+        if len(matches) == 1:
+            return matches[0]
+    elif key in specs:
+        return specs.index(key)
+    raise APISpecError("namespaces keys must be specs, spec indices or titles.")
+
+
 class Components:
     """Stores OpenAPI components
 
@@ -503,6 +771,157 @@ class APISpec:
         from .yaml_utils import dict_to_yaml
 
         return dict_to_yaml(self.to_dict(), yaml_dump_kwargs)
+
+    def merge(
+        self,
+        *specs: APISpec | Sequence[APISpec],
+        namespace: str | dict | typing.Callable[[str], str] | None = None,
+        namespaces: Sequence[str | dict | typing.Callable[[str], str] | None]
+        | dict = (),
+        prefix: str | dict | typing.Callable[[str], str] | None = None,
+        title: str | None = None,
+        version: str | None = None,
+        openapi_version: str | None = None,
+        separator: str = ".",
+    ) -> APISpec:
+        """Merge specs into a new spec, optionally namespacing components.
+
+        The first spec is the base spec::
+
+            APISpec.merge(orders, inventory, namespace="inventory")
+            orders.merge(inventory, namespace="inventory")
+
+        ``namespace`` applies to the specs following the first one. A namespace
+        is a prefix (``"inventory"`` renames ``"Item"`` to ``"inventory.Item"``),
+        a template containing ``{name}`` or ``{}``, or a callable/mapping used
+        to compute the new names. ``namespaces`` can be used to pass one
+        namespace per spec instead.
+
+        Component names and all local component references are rewritten
+        together, including references nested in schemas and operations, so
+        each merged entry keeps pointing to its own components. ``$ref``
+        strings are updated without being resolved.
+
+        The merged spec is new and the input specs are left untouched: they
+        still render exactly as before the merge.
+
+        Components with the same final name must have equal definitions. Paths
+        and options are merged recursively, and list-valued ``parameters`` are
+        concatenated.
+
+        :param specs: specs to merge with this one
+        :param namespace: namespace for the specs following this one
+        :param namespaces: optional namespace per spec, in order. A mapping may
+            be keyed by spec, spec index or spec title.
+        :param prefix: alias for ``namespace``
+        :param title: title of the merged spec (defaults to this spec's)
+        :param version: version of the merged spec (defaults to this spec's)
+        :param openapi_version: OpenAPI version of the merged spec (defaults to
+            this spec's)
+        :param separator: separator between a prefix namespace and a name
+        """
+        all_specs = _flatten_merge_specs(self, specs)
+        if not all_specs:
+            raise APISpecError("At least one spec is required to merge.")
+        openapi_major_version = all_specs[0].openapi_version.major
+        for spec in all_specs:
+            if not isinstance(spec, APISpec):
+                raise APISpecError("Can only merge APISpec instances.")
+            if spec.openapi_version.major != openapi_major_version:
+                raise APISpecError(
+                    "Cannot merge specs with different OpenAPI versions."
+                )
+
+        if namespace is None:
+            namespace = prefix
+        if (
+            isinstance(namespace, dict)
+            and namespace
+            and any(isinstance(key, APISpec) for key in namespace)
+        ):
+            namespaces = namespace
+            namespace = None
+
+        if isinstance(namespace, (list, tuple)):
+            namespaces = namespace
+            namespace = None
+
+        if isinstance(namespaces, dict):
+            spec_namespaces = [None] * len(all_specs)
+            for key, value in namespaces.items():
+                index = _merge_namespace_index(key, all_specs)
+                spec_namespaces[index] = value
+        elif namespaces:
+            if len(namespaces) == len(all_specs):
+                spec_namespaces = list(namespaces)
+            elif len(namespaces) == len(all_specs) - 1:
+                spec_namespaces = [None, *namespaces]
+            else:
+                raise APISpecError(
+                    "namespaces must contain one entry per spec, or one entry per "
+                    "spec after the first one."
+                )
+        else:
+            spec_namespaces = [None, *([namespace] * (len(all_specs) - 1))]
+
+        first = all_specs[0]
+        merged_version = (
+            Version(openapi_version) if openapi_version else first.openapi_version
+        )
+        if merged_version.major != openapi_major_version:
+            raise APISpecError("Cannot change the OpenAPI major version when merging.")
+        # The merged spec is built from rendered data, so it does not need the
+        # plugins of the input specs. Not forwarding them also prevents the
+        # merged spec from rebinding plugin instances owned by the inputs.
+        merged = (self.__class__ if isinstance(self, APISpec) else APISpec)(
+            title=title if title is not None else first.title,
+            version=version if version is not None else first.version,
+            openapi_version=str(merged_version),
+        )
+
+        merged_options: dict[str, typing.Any] = {}
+        for spec, spec_namespace in zip(all_specs, spec_namespaces, strict=True):
+            spec_data = deepcopy(spec.to_dict())
+            renames = _component_renames(
+                spec, spec_namespace, separator, openapi_major_version, spec_data
+            )
+            _rewrite_refs(spec_data, renames, openapi_major_version)
+            _rename_component_keys(spec_data, renames, openapi_major_version)
+            _merge_component_data(merged.components, spec_data, openapi_major_version)
+            _merge_dicts(merged._paths, spec_data.get("paths", {}))
+            _merge_tags(merged._tags, spec_data.get("tags", []))
+
+            if openapi_major_version >= 3:
+                # Keep component sections apispec does not manage (e.g.
+                # "requestBodies") and namespaced sections already renamed.
+                managed_sections = set(
+                    COMPONENT_SUBSECTIONS[openapi_major_version].values()
+                )
+                extra_sections = {
+                    key: value
+                    for key, value in (spec_data.get("components") or {}).items()
+                    if key not in managed_sections
+                }
+                if extra_sections:
+                    merged_options.setdefault("components", {})
+                    _merge_missing(merged_options["components"], extra_sections)
+
+            spec_options = {
+                key: value
+                for key, value in spec_data.items()
+                if key not in _NON_OPTION_KEYS
+            }
+            info = {
+                key: value
+                for key, value in (spec_data.get("info") or {}).items()
+                if key not in ("title", "version")
+            }
+            if info:
+                spec_options["info"] = info
+            _merge_missing(merged_options, spec_options)
+
+        merged.options = merged_options
+        return merged
 
     def tag(self, tag: dict) -> APISpec:
         """Store information about a tag.

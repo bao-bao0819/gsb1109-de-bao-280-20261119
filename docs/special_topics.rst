@@ -149,6 +149,67 @@ to document `Security Scheme Objects <https://github.com/OAI/OpenAPI-Specificati
     # { 'api_key': {'in': 'header', 'name': 'X-API-Key', 'type': 'apiKey'},
     #   'jwt': {'bearerFormat': 'JWT', 'scheme': 'bearer', 'type': 'http'}}
 
+Merging Specifications
+----------------------
+
+Use `spec.merge <apispec.APISpec.merge>` to merge several specs into a new
+one. When two specs define a component with the same name but different
+contents, give one of them a namespace. Component names and every local
+component reference are rewritten together, so each entry keeps resolving to
+its own components.
+
+.. code-block:: python
+
+    orders = APISpec(title="Orders", version="1.0.0", openapi_version="3.0.0")
+    orders.components.schema("Item", {"properties": {"quantity": {"type": "integer"}}})
+    orders.path(
+        "/orders",
+        operations={
+            "get": {
+                "responses": {
+                    "200": {
+                        "description": "An order",
+                        "content": {
+                            "application/json": {"schema": "Item"}
+                        },
+                    }
+                }
+            }
+        },
+    )
+
+    inventory = APISpec(title="Inventory", version="1.0.0", openapi_version="3.0.0")
+    inventory.components.schema("Item", {"properties": {"stock": {"type": "integer"}}})
+    inventory.path(
+        "/inventory",
+        operations={
+            "get": {
+                "responses": {
+                    "200": {
+                        "description": "A stock level",
+                        "content": {
+                            "application/json": {"schema": "Item"}
+                        },
+                    }
+                }
+            }
+        },
+    )
+
+    merged = orders.merge(inventory, namespace="inventory")
+
+The merged spec contains ``Item`` and ``inventory.Item``. The response of
+``/inventory`` references ``#/components/schemas/inventory.Item`` while the
+response of ``/orders`` still references ``#/components/schemas/Item``.
+
+A namespace may be a prefix (``"inventory"`` gives ``"inventory.Item"``), a
+template such as ``"inventory__{name}"``, a mapping or a callable. To give a
+namespace to every spec, pass ``namespaces=[...]`` with one entry per spec, or
+an entry per spec after the first one.
+
+Merging does not modify the input specs: ``orders`` and ``inventory`` render
+exactly as they did before the merge.
+
 Referencing Top-level Components
 --------------------------------
 

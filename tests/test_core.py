@@ -22,6 +22,7 @@ from .utils import (
     get_responses,
     get_schemas,
     get_security_schemes,
+    validate_spec,
 )
 
 description = "This is a sample Petstore server.  You can find out more "
@@ -1301,3 +1302,353 @@ class TestPluginsOrder:
             "plugin_1_operations",
             "plugin_2_operations",
         ]
+
+
+class TestMerge:
+    @staticmethod
+    def _orders_spec(openapi_version="3.0.0"):
+        spec = APISpec(title="Orders", version="1.0.0", openapi_version=openapi_version)
+        spec.components.schema(
+            "Item",
+            {
+                "type": "object",
+                "properties": {
+                    "quantity": {"type": "integer"},
+                    "product": "Product",
+                },
+            },
+        )
+        spec.components.schema(
+            "Product",
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "related": "Item"},
+            },
+        )
+        spec.components.schema("Order", {"properties": {"item": "Item"}})
+        if openapi_version == "2.0":
+            response = {"schema": "Order"}
+            parameter = {"name": "order_id", "in": "path", "type": "string"}
+        else:
+            response = {
+                "description": "Order",
+                "content": {"application/json": {"schema": "Order"}},
+            }
+            parameter = {
+                "name": "order_id",
+                "in": "path",
+                "schema": {"type": "string"},
+            }
+        spec.path(
+            "/orders/{order_id}",
+            operations={
+                "get": {
+                    "parameters": [parameter],
+                    "responses": {"200": response},
+                }
+            },
+        )
+        return spec
+
+    @staticmethod
+    def _inventory_spec(openapi_version="3.0.0"):
+        spec = APISpec(
+            title="Inventory", version="1.0.0", openapi_version=openapi_version
+        )
+        spec.components.schema(
+            "Item",
+            {
+                "type": "object",
+                "properties": {
+                    "stock": {"type": "string"},
+                    "location": "Location",
+                },
+            },
+        )
+        spec.components.schema(
+            "Location",
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "item": "Item"},
+            },
+        )
+        spec.components.schema("StockLevel", {"properties": {"item": "Item"}})
+        spec.components.response("NotFound", {"description": "Item not found"})
+        spec.components.parameter("ItemId", "path", {"schema": "Item"})
+        if openapi_version == "2.0":
+            response = {"schema": "StockLevel"}
+            parameter = {"name": "item_id", "in": "path", "type": "string"}
+        else:
+            response = {
+                "description": "Stock level",
+                "content": {"application/json": {"schema": "StockLevel"}},
+            }
+            parameter = {
+                "name": "item_id",
+                "in": "path",
+                "schema": {"type": "string"},
+            }
+        spec.path(
+            "/inventory/{item_id}",
+            operations={
+                "get": {
+                    "parameters": [
+                        parameter,
+                        {"name": "item", "in": "query", "schema": "Item"},
+                    ],
+                    "responses": {"200": response, "404": "NotFound"},
+                }
+            },
+        )
+        return spec
+
+    @staticmethod
+    def _response_schema(spec_data, openapi_version, path, code="200"):
+        response = spec_data["paths"][path]["get"]["responses"][code]
+        if openapi_version == "2.0":
+            return response["schema"]
+        return response["content"]["application/json"]["schema"]
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_merge_namespaced_entries_resolve_to_their_own_item(self, openapi_version):
+        orders = self._orders_spec(openapi_version)
+        inventory = self._inventory_spec(openapi_version)
+
+        merged = APISpec.merge(orders, inventory, namespace="inventory")
+        merged_data = merged.to_dict()
+        schemas = get_schemas(merged)
+
+        assert "Item" in schemas
+        assert "inventory.Item" in schemas
+        assert schemas["Item"]["properties"]["quantity"] == {"type": "integer"}
+        assert schemas["inventory.Item"]["properties"]["stock"] == {"type": "string"}
+
+        # Nested references follow each entry's own Item.
+        assert schemas["Product"]["properties"]["related"] == build_ref(
+            merged, "schema", "Item"
+        )
+        assert schemas["inventory.Location"]["properties"]["item"] == build_ref(
+            merged, "schema", "inventory.Item"
+        )
+        assert schemas["inventory.StockLevel"]["properties"]["item"] == build_ref(
+            merged, "schema", "inventory.Item"
+        )
+        assert self._response_schema(
+            merged_data, openapi_version, "/orders/{order_id}"
+        ) == build_ref(merged, "schema", "Order")
+        assert self._response_schema(
+            merged_data, openapi_version, "/inventory/{item_id}"
+        ) == build_ref(merged, "schema", "inventory.StockLevel")
+        assert merged_data["paths"]["/inventory/{item_id}"]["get"]["responses"][
+            "404"
+        ] == build_ref(merged, "response", "inventory.NotFound")
+
+        parameters = get_paths(merged)["/inventory/{item_id}"]["get"]["parameters"]
+        item_parameter = next(p for p in parameters if p["name"] == "item")
+        assert item_parameter["schema"] == build_ref(merged, "schema", "inventory.Item")
+        assert get_parameters(merged)["inventory.ItemId"]["schema"] == build_ref(
+            merged, "schema", "inventory.Item"
+        )
+
+    @pytest.mark.parametrize("openapi_version", ("2.0", "3.0.0"))
+    def test_input_specs_are_unchanged(self, openapi_version):
+        orders = self._orders_spec(openapi_version)
+        inventory = self._inventory_spec(openapi_version)
+        orders_before = copy.deepcopy(orders.to_dict())
+        inventory_before = copy.deepcopy(inventory.to_dict())
+
+        APISpec.merge(orders, inventory, namespace="inventory")
+
+        assert orders.to_dict() == orders_before
+        assert inventory.to_dict() == inventory_before
+        assert get_schemas(orders)["Item"]["properties"] == {
+            "quantity": {"type": "integer"},
+            "product": build_ref(orders, "schema", "Product"),
+        }
+        assert get_schemas(inventory)["Item"]["properties"] == {
+            "stock": {"type": "string"},
+            "location": build_ref(inventory, "schema", "Location"),
+        }
+
+    def test_merge_from_instance_is_chainable(self):
+        orders = self._orders_spec()
+        inventory = self._inventory_spec()
+
+        merged = orders.merge(inventory, namespace="inventory")
+
+        assert isinstance(merged, APISpec)
+        assert "inventory.Item" in get_schemas(merged)
+
+    def test_merged_entries_follow_their_own_references(self):
+        orders = APISpec(title="Orders", version="1.0.0", openapi_version="3.0.0")
+        orders.components.schema(
+            "Item", {"properties": {"quantity": {"type": "integer"}}}
+        )
+        orders.components.schema("Product", {"properties": {"item": "Item"}})
+        orders.components.schema("Order", {"properties": {"product": "Product"}})
+        orders.path(
+            "/orders",
+            operations={
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "Order",
+                            "content": {"application/json": {"schema": "Order"}},
+                        }
+                    }
+                }
+            },
+        )
+        inventory = APISpec(title="Inventory", version="1.0.0", openapi_version="3.0.0")
+        inventory.components.schema(
+            "Item", {"properties": {"stock": {"type": "string"}}}
+        )
+        inventory.components.schema("Location", {"properties": {"item": "Item"}})
+        inventory.components.schema(
+            "StockLevel", {"properties": {"location": "Location"}}
+        )
+        inventory.path(
+            "/stock",
+            operations={
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "Stock",
+                            "content": {"application/json": {"schema": "StockLevel"}},
+                        }
+                    }
+                }
+            },
+        )
+
+        merged = APISpec.merge(orders, inventory, namespace="inventory")
+        schemas = get_schemas(merged)
+
+        def item_schema(path, outer_property):
+            entry = merged.to_dict()["paths"][path]["get"]["responses"]["200"][
+                "content"
+            ]["application/json"]["schema"]
+            entry_name = entry["$ref"].rsplit("/", 1)[1]
+            outer_name = schemas[entry_name]["properties"][outer_property]["$ref"]
+            outer_name = outer_name.rsplit("/", 1)[1]
+            item_ref = schemas[outer_name]["properties"]["item"]["$ref"]
+            return schemas[item_ref.rsplit("/", 1)[1]]
+
+        assert item_schema("/orders", "product") == {
+            "properties": {"quantity": {"type": "integer"}}
+        }
+        assert item_schema("/stock", "location") == {
+            "properties": {"stock": {"type": "string"}}
+        }
+
+    def test_merge_without_namespace_collision_raises(self):
+        orders = self._orders_spec()
+        inventory = self._inventory_spec()
+
+        with pytest.raises(
+            DuplicateComponentNameError, match='name "Item" is already registered'
+        ):
+            APISpec.merge(orders, inventory)
+
+    def test_merge_with_equal_components_allowed(self):
+        merged = APISpec.merge(self._orders_spec(), self._orders_spec())
+
+        assert "Item" in get_schemas(merged)
+
+    def test_merge_namespaces_one_per_spec(self):
+        merged = APISpec.merge(
+            self._orders_spec(),
+            self._inventory_spec(),
+            namespaces=["order", "stock"],
+        )
+
+        schemas = get_schemas(merged)
+        assert "order.Item" in schemas
+        assert "stock.Item" in schemas
+        assert schemas["order.Product"]["properties"]["related"] == build_ref(
+            merged, "schema", "order.Item"
+        )
+        assert schemas["stock.Location"]["properties"]["item"] == build_ref(
+            merged, "schema", "stock.Item"
+        )
+
+    def test_merge_namespace_template(self):
+        merged = APISpec.merge(
+            self._orders_spec(), self._inventory_spec(), namespace="Inventory__{name}"
+        )
+
+        assert "Inventory__Item" in get_schemas(merged)
+
+    def test_merge_accepts_specs_sequence(self):
+        orders = self._orders_spec()
+        inventory = self._inventory_spec()
+
+        merged = APISpec.merge([orders, inventory], namespaces=[None, "inventory"])
+
+        assert "inventory.Item" in get_schemas(merged)
+
+    def test_merge_namespaces_mapping_by_spec(self):
+        orders = self._orders_spec()
+        inventory = self._inventory_spec()
+
+        merged = orders.merge(inventory, namespaces={inventory: "inventory"})
+
+        assert "inventory.Item" in get_schemas(merged)
+
+    def test_merge_namespaces_mapping_by_title(self):
+        orders = self._orders_spec()
+        inventory = self._inventory_spec()
+
+        merged = APISpec.merge(orders, inventory, namespaces={"Inventory": "inventory"})
+
+        assert "inventory.Item" in get_schemas(merged)
+
+    def test_merge_namespace_none_keeps_names(self):
+        orders = self._orders_spec()
+        merged = APISpec.merge(orders, namespaces=[None])
+
+        assert "Item" in get_schemas(merged)
+
+    def test_merge_custom_separator(self):
+        merged = APISpec.merge(
+            self._orders_spec(),
+            self._inventory_spec(),
+            namespace="inventory",
+            separator="/",
+        )
+
+        assert "inventory/Item" in get_schemas(merged)
+
+    def test_merge_with_different_openapi_versions_raises(self):
+        with pytest.raises(APISpecError, match="different OpenAPI versions"):
+            APISpec.merge(self._orders_spec("3.0.0"), self._inventory_spec("2.0"))
+
+    def test_merge_metadata(self):
+        merged = APISpec.merge(
+            self._orders_spec(),
+            self._inventory_spec(),
+            namespace="inventory",
+            title="Merged API",
+            version="2.0",
+        )
+
+        assert merged.to_dict()["info"] == {
+            "title": "Merged API",
+            "version": "2.0",
+        }
+        assert set(get_paths(merged)) == {"/orders/{order_id}", "/inventory/{item_id}"}
+
+    def test_merge_single_spec_returns_copy(self):
+        orders = self._orders_spec()
+
+        merged = APISpec.merge(orders)
+
+        assert merged is not orders
+        assert merged.to_dict() == orders.to_dict()
+
+    def test_merged_spec_is_valid(self):
+        merged = APISpec.merge(
+            self._orders_spec(), self._inventory_spec(), namespace="inventory"
+        )
+
+        validate_spec(merged)

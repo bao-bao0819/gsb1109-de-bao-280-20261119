@@ -13,7 +13,11 @@ from datasette.database import QueryInterrupted
 from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, QueryResource
-from datasette.stored_queries import StoredQuery, stored_query_to_dict
+from datasette.stored_queries import (
+    StoredQuery,
+    column_contract_violation,
+    stored_query_to_dict,
+)
 from datasette.utils import (
     InvalidSql,
     add_cors_headers,
@@ -879,6 +883,25 @@ class QueryView(View):
             except DatasetteError:
                 raise
 
+        # Stored queries can declare a column contract: the stable set of
+        # columns, in order, that subscribers rely on. If the delivered
+        # columns drift from that contract (renamed, dropped, added or
+        # reordered) report the difference instead of returning what looks
+        # like a successful result.
+        column_contract = None
+        if (
+            stored_query is not None
+            and stored_query.columns is not None
+            and query_error is None
+            and results is not None
+        ):
+            column_contract = column_contract_violation(stored_query.columns, columns)
+            if column_contract is not None:
+                query_error = column_contract["message"]
+                results = None
+                rows = []
+                columns = []
+
         async def query_metadata():
             if stored_query:
                 metadata = stored_query_to_dict(stored_query)
@@ -891,6 +914,8 @@ class QueryView(View):
             if not sql:
                 raise DatasetteError("?sql= is required", status=400)
             data = {"ok": True, "rows": rows, "columns": columns}
+            if column_contract is not None:
+                data["column_contract"] = column_contract
             extras = extra_names_from_request(request)
             table_extra_registry.validate_requested(extras, ExtraScope.QUERY)
             # Plus any extras declared by the output renderer for this format

@@ -503,3 +503,291 @@ async def test_stored_write_query_disabled_for_immutable_database(
     )
     assert response.status_code == 403
     assert "Database is immutable" in response.text
+
+
+@pytest.mark.parametrize(
+    "declared,actual,expected",
+    (
+        (["a", "b"], ["a", "b"], None),
+        (
+            ["a", "b"],
+            ["a"],
+            {
+                "missing": ["b"],
+                "unexpected": [],
+                "out_of_order": False,
+            },
+        ),
+        (
+            ["a"],
+            ["a", "b"],
+            {
+                "missing": [],
+                "unexpected": ["b"],
+                "out_of_order": False,
+            },
+        ),
+        (
+            ["a", "b"],
+            ["b", "a"],
+            {
+                "missing": [],
+                "unexpected": [],
+                "out_of_order": True,
+            },
+        ),
+        (
+            ["a", "b"],
+            ["a", "renamed"],
+            {
+                "missing": ["b"],
+                "unexpected": ["renamed"],
+                "out_of_order": False,
+            },
+        ),
+    ),
+)
+def test_column_contract_violation(declared, actual, expected):
+    from datasette.stored_queries import column_contract_violation
+
+    violation = column_contract_violation(declared, actual)
+    if expected is None:
+        assert violation is None
+    else:
+        assert violation["declared"] == declared
+        assert violation["actual"] == actual
+        assert violation["missing"] == expected["missing"]
+        assert violation["unexpected"] == expected["unexpected"]
+        assert violation["out_of_order"] == expected["out_of_order"]
+        assert violation["message"].startswith(
+            "Query result does not match its declared columns"
+        )
+
+
+@pytest_asyncio.fixture
+async def column_contract_ds():
+    from datasette.app import Datasette
+
+    ds = Datasette(memory=True, default_deny=True)
+    ds.root_enabled = True
+    db = ds.add_memory_database("column_contract", name="data")
+    await db.execute_write(
+        "create table dogs (id integer primary key, name text, age integer)"
+    )
+    await db.execute_write("insert into dogs (name, age) values ('Cleo', 5)")
+    await ds.invoke_startup()
+    await ds.add_query(
+        "data",
+        "list_dogs",
+        "select id, name from dogs order by id",
+        columns=["id", "name"],
+    )
+    yield ds
+    ds.close()
+
+
+async def test_stored_query_column_contract_holds(column_contract_ds):
+    response = await column_contract_ds.client.get(
+        "/data/list_dogs.json", actor={"id": "root"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["rows"] == [{"id": 1, "name": "Cleo"}]
+    assert "column_contract" not in data
+
+
+async def test_stored_query_column_contract_allows_sql_and_param_changes(
+    column_contract_ds,
+):
+    # The SQL and its bound parameters can be adjusted freely, as long as
+    # the delivered columns still match the declared contract
+    await column_contract_ds.update_query(
+        "data",
+        "list_dogs",
+        sql="select id, name from dogs where name like :pattern order by id",
+        parameters=["pattern"],
+    )
+    response = await column_contract_ds.client.get(
+        "/data/list_dogs.json?pattern=Cleo", actor={"id": "root"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["rows"] == [{"id": 1, "name": "Cleo"}]
+
+
+async def test_stored_query_column_contract_renamed_column(column_contract_ds):
+    await column_contract_ds.update_query(
+        "data", "list_dogs", sql="select id, name as title from dogs order by id"
+    )
+    response = await column_contract_ds.client.get(
+        "/data/list_dogs.json", actor={"id": "root"}
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert data["ok"] is False
+    assert data["rows"] == []
+    assert "missing columns: name" in data["error"]
+    assert "unexpected columns: title" in data["error"]
+    assert data["column_contract"] == {
+        "message": data["error"],
+        "declared": ["id", "name"],
+        "actual": ["id", "title"],
+        "missing": ["name"],
+        "unexpected": ["title"],
+        "out_of_order": False,
+    }
+
+
+async def test_stored_query_column_contract_missing_column(column_contract_ds):
+    await column_contract_ds.update_query(
+        "data", "list_dogs", sql="select id from dogs"
+    )
+    response = await column_contract_ds.client.get(
+        "/data/list_dogs.json", actor={"id": "root"}
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert data["ok"] is False
+    assert data["column_contract"]["missing"] == ["name"]
+    assert data["column_contract"]["unexpected"] == []
+
+
+async def test_stored_query_column_contract_out_of_order(column_contract_ds):
+    await column_contract_ds.update_query(
+        "data", "list_dogs", sql="select name, id from dogs"
+    )
+    response = await column_contract_ds.client.get(
+        "/data/list_dogs.json", actor={"id": "root"}
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert data["ok"] is False
+    assert data["column_contract"]["out_of_order"] is True
+    assert "columns out of order" in data["error"]
+
+
+async def test_stored_query_column_contract_html_shows_error(column_contract_ds):
+    await column_contract_ds.update_query(
+        "data", "list_dogs", sql="select id from dogs"
+    )
+    response = await column_contract_ds.client.get(
+        "/data/list_dogs", actor={"id": "root"}
+    )
+    assert response.status_code == 200
+    assert "Query result does not match its declared columns" in response.text
+    assert "missing columns: name" in response.text
+
+
+async def test_stored_query_columns_from_config():
+    ds = await make_ds(
+        extra_databases={
+            "data": "create table dogs (id integer primary key, name text)"
+        },
+        config={
+            "databases": {
+                "data": {
+                    "queries": {
+                        "all_dogs": {
+                            "sql": "select id, name from dogs",
+                            "columns": ["id", "name"],
+                        }
+                    }
+                }
+            }
+        },
+    )
+    query = await ds.get_query("data", "all_dogs")
+    assert query.columns == ["id", "name"]
+    definition = (
+        await ds.client.get("/data/all_dogs/-/definition")
+    ).json()
+    assert definition["query"]["columns"] == ["id", "name"]
+    response = await ds.client.get("/data/all_dogs.json")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+async def test_query_store_api_with_columns():
+    from datasette.app import Datasette
+
+    ds = Datasette(memory=True, default_deny=True)
+    ds.root_enabled = True
+    db = ds.add_memory_database("query_store_columns", name="data")
+    await db.execute_write("create table dogs (id integer primary key, name text)")
+    await ds.invoke_startup()
+
+    response = await ds.client.post(
+        "/data/-/queries/store",
+        actor={"id": "root"},
+        json={
+            "query": {
+                "name": "by_name",
+                "sql": "select id, name from dogs where name = :name",
+                "columns": ["id", "name"],
+            }
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["query"]["columns"] == ["id", "name"]
+    query = await ds.get_query("data", "by_name")
+    assert query.columns == ["id", "name"]
+    ds.close()
+
+
+@pytest.mark.parametrize("columns", ("id, name", ["id", 3], {"column": "id"}))
+async def test_query_store_api_rejects_invalid_columns(columns):
+    from datasette.app import Datasette
+
+    ds = Datasette(memory=True, default_deny=True)
+    ds.root_enabled = True
+    db = ds.add_memory_database("query_store_bad_columns", name="data")
+    await db.execute_write("create table dogs (id integer primary key, name text)")
+    await ds.invoke_startup()
+
+    response = await ds.client.post(
+        "/data/-/queries/store",
+        actor={"id": "root"},
+        json={
+            "query": {
+                "name": "by_name",
+                "sql": "select id, name from dogs where name = :name",
+                "columns": columns,
+            }
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == ["columns must be a list of strings"]
+    ds.close()
+
+
+async def test_query_update_api_columns():
+    from datasette.app import Datasette
+
+    ds = Datasette(memory=True, default_deny=True)
+    ds.root_enabled = True
+    db = ds.add_memory_database("query_update_columns", name="data")
+    await db.execute_write("create table dogs (id integer primary key, name text)")
+    await ds.invoke_startup()
+    await ds.add_query("data", "list_dogs", "select id, name from dogs", source="user")
+
+    response = await ds.client.post(
+        "/data/list_dogs/-/update",
+        actor={"id": "root"},
+        json={"update": {"columns": ["id", "name"]}, "return": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["query"]["columns"] == ["id", "name"]
+
+    # Setting columns to null clears the contract
+    response = await ds.client.post(
+        "/data/list_dogs/-/update",
+        actor={"id": "root"},
+        json={"update": {"columns": None}, "return": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["query"]["columns"] is None
+    query = await ds.get_query("data", "list_dogs")
+    assert query.columns is None
+    ds.close()

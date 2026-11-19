@@ -47,7 +47,7 @@ class QueryListContext(Context):
     )
     queries: list[StoredQuery] = field(
         metadata={
-            "help": "The stored queries on this page that the actor can see. Each has ``database``, ``name``, ``sql``, ``title``, ``description``, ``description_html``, ``parameters``, ``is_write``, ``is_private``, ``is_trusted``, ``source`` and ``owner_id`` attributes"
+            "help": "The stored queries on this page that the actor can see. Each has ``database``, ``name``, ``sql``, ``title``, ``description``, ``description_html``, ``columns``, ``parameters``, ``is_write``, ``is_private``, ``is_trusted``, ``source`` and ``owner_id`` attributes"
         }
     )
     next: str | None = field(

@@ -13,6 +13,7 @@ UNCHANGED = object()
 QUERY_OPTION_FIELDS = (
     "hide_sql",
     "fragment",
+    "columns",
     "on_success_message",
     "on_success_message_sql",
     "on_success_redirect",
@@ -43,6 +44,7 @@ class StoredQuery:
     on_error_message: str | None
     on_error_redirect: str | None
     private: bool | None = None
+    columns: list[str] | None = None
 
 
 @dataclass
@@ -74,6 +76,7 @@ def stored_query_to_dict(query: StoredQuery) -> dict[str, Any]:
         "on_success_redirect": query.on_success_redirect,
         "on_error_message": query.on_error_message,
         "on_error_redirect": query.on_error_redirect,
+        "columns": list(query.columns) if query.columns is not None else None,
     }
     if query.private is not None:
         data["private"] = query.private
@@ -85,6 +88,43 @@ def stored_query_page_to_dict(page: StoredQueryPage) -> dict[str, Any]:
         "queries": [stored_query_to_dict(query) for query in page.queries],
         "next": page.next,
         "limit": page.limit,
+    }
+
+
+def column_contract_violation(
+    declared: Iterable[str], actual: Iterable[str]
+) -> dict[str, Any] | None:
+    """Compare a stored query's declared column contract with the columns
+    the query actually delivered.
+
+    Returns None if the names and order match exactly, otherwise a
+    JSON-serializable dictionary describing the difference: columns that
+    are missing (renamed or dropped), columns that are unexpected, and
+    whether the same columns were delivered in a different order.
+    """
+    declared_columns = list(declared)
+    actual_columns = list(actual)
+    if declared_columns == actual_columns:
+        return None
+    missing = [column for column in declared_columns if column not in actual_columns]
+    unexpected = [column for column in actual_columns if column not in declared_columns]
+    out_of_order = not missing and not unexpected
+    parts = []
+    if missing:
+        parts.append("missing columns: {}".format(", ".join(missing)))
+    if unexpected:
+        parts.append("unexpected columns: {}".format(", ".join(unexpected)))
+    if out_of_order:
+        parts.append("columns out of order")
+    return {
+        "message": "Query result does not match its declared columns ({})".format(
+            "; ".join(parts)
+        ),
+        "declared": declared_columns,
+        "actual": actual_columns,
+        "missing": missing,
+        "unexpected": unexpected,
+        "out_of_order": out_of_order,
     }
 
 
@@ -106,6 +146,7 @@ async def save_queries_from_config(datasette: Any) -> None:
                 description_html=query_config.get("description_html"),
                 hide_sql=bool(query_config.get("hide_sql")),
                 fragment=query_config.get("fragment"),
+                columns=query_config.get("columns"),
                 parameters=query_config.get("params"),
                 is_write=bool(query_config.get("write")),
                 is_trusted=bool(query_config.get("is_trusted", True)),
@@ -134,6 +175,9 @@ def query_row_to_stored_query(
         description_html=row["description_html"],
         hide_sql=bool(options.get("hide_sql")),
         fragment=options.get("fragment"),
+        columns=(
+            list(options["columns"]) if options.get("columns") is not None else None
+        ),
         parameters=parameters,
         is_write=bool(row["is_write"]),
         is_private=bool(row["is_private"]),
@@ -172,6 +216,7 @@ async def add_query(
     description_html: str | None = None,
     hide_sql: bool = False,
     fragment: str | None = None,
+    columns: Iterable[str] | None = None,
     parameters: Iterable[str] | None = None,
     is_write: bool = False,
     is_private: bool = False,
@@ -190,6 +235,7 @@ async def add_query(
         {
             "hide_sql": hide_sql,
             "fragment": fragment,
+            "columns": list(columns) if columns is not None else None,
             "on_success_message": on_success_message,
             "on_success_message_sql": on_success_message_sql,
             "on_success_redirect": on_success_redirect,
@@ -250,6 +296,7 @@ async def update_query(
     description_html=UNCHANGED,
     hide_sql=UNCHANGED,
     fragment=UNCHANGED,
+    columns=UNCHANGED,
     parameters=UNCHANGED,
     is_write=UNCHANGED,
     is_private=UNCHANGED,
@@ -277,6 +324,7 @@ async def update_query(
     option_fields = {
         "hide_sql": hide_sql,
         "fragment": fragment,
+        "columns": columns,
         "on_success_message": on_success_message,
         "on_success_message_sql": on_success_message_sql,
         "on_success_redirect": on_success_redirect,
@@ -315,6 +363,8 @@ async def update_query(
                     options.pop(field, None)
             elif value is None:
                 options.pop(field, None)
+            elif field == "columns":
+                options[field] = list(value)
             else:
                 options[field] = value
         updates.append("options = ?")

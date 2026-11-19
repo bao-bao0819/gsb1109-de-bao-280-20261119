@@ -1094,6 +1094,7 @@ Adds a stored query.
         description_html=None,
         hide_sql=False,
         fragment=None,
+        columns=None,
         parameters=None,
         is_write=False,
         is_private=False,
@@ -1124,6 +1125,8 @@ Adds a stored query.
     Set to ``True`` to hide the SQL by default on the query page.
 ``fragment`` - string, optional
     A URL fragment to append to query links, for example ``"chart"``.
+``columns`` - list of strings, optional
+    A :ref:`column contract <queries_column_contract>` for the query: the column names, in order, that the query is expected to deliver. If execution later delivers different columns, the query page reports the difference as an error.
 ``parameters`` - list of strings, optional
     Explicit parameter names for the query form. If omitted, Datasette derives parameters from the SQL.
 ``is_write`` - boolean, optional

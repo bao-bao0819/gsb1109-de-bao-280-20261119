@@ -400,6 +400,44 @@ This example demonstrates both ``fragment`` and ``hide_sql``:
 
 `See here <https://latest.datasette.io/fixtures#queries>`__ for a demo of this in action.
 
+.. _queries_column_contract:
+
+columns
++++++++
+
+Consumers that subscribe to a stored query often rely on it always delivering the same columns, in the same order. Use the ``"columns"`` key to declare that contract when registering a query:
+
+.. code-block:: yaml
+
+    databases:
+      fixtures:
+        queries:
+          neighborhood_search:
+            sql: select neighborhood, city, state from neighborhoods
+            columns:
+              - neighborhood
+              - city
+              - state
+
+The SQL and its bound parameters can still be adjusted later, as long as the delivered columns stay consistent with the declared list. If a change causes the executed query to deliver different columns - for example a column is renamed, dropped, added or reordered - the query page reports the difference as an error instead of returning what looks like a successful (possibly empty) result. The JSON representation includes a ``column_contract`` key describing the difference:
+
+.. code-block:: json
+
+    {
+      "ok": false,
+      "error": "Query result does not match its declared columns (missing columns: state)",
+      "column_contract": {
+        "message": "Query result does not match its declared columns (missing columns: state)",
+        "declared": ["neighborhood", "city", "state"],
+        "actual": ["neighborhood", "city"],
+        "missing": ["state"],
+        "unexpected": [],
+        "out_of_order": false
+      }
+    }
+
+The contract can also be set through the stored query JSON API by passing ``"columns"`` to ``/<database>/-/queries/store`` or ``/<database>/<query>/-/update``, and through the ``columns=`` argument to the :ref:`datasette.add_query() <datasette_stored_queries>` and ``datasette.update_query()`` methods. Pass ``null`` to remove a previously declared contract.
+
 .. _queries_writable:
 
 Writable queries

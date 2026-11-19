@@ -451,9 +451,12 @@ class Importer(beangulp.Importer, CSVReader):
         else:
             order = self.order
 
-        # Reverse the list if the file is in descending order.
+        # Sort the entries by date if the file is in descending
+        # order. The sort is stable, thus the relative order of
+        # entries with the same date is the one in which they appear
+        # in the input file.
         if order is Order.DESCENDING:
-            entries.reverse()
+            entries.sort(key=lambda entry: entry.date)
 
         # Append balances.
         for currency, balances in balances.items():

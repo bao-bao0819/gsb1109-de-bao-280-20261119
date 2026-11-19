@@ -179,6 +179,43 @@ Importing again the same file results in entries marked as duplicates:
   ;   Assets:Tests  2 TESTS
 
 
+Ordering
+--------
+
+Entries extracted from each document are serialized in sections
+identified by the source document filename. The relative order of
+entries extracted from the same document is preserved and the order
+in which documents are discovered does not affect the output:
+
+  >>> one = path.join(downloads, 'one.beans')
+  >>> two = path.join(downloads, 'two.beans')
+  >>> r = run('extract', one, two, '-o', output)
+  >>> r.exit_code
+  0
+  >>> with open(output, 'r') as f:
+  ...     first = f.read()
+  >>> r = run('extract', two, one, '-o', output)
+  >>> r.exit_code
+  0
+  >>> with open(output, 'r') as f:
+  ...     second = f.read()
+  >>> first == second
+  True
+  >>> print(first)
+  ;; -*- mode: beancount -*-
+  <BLANKLINE>
+  **** .../downloads/one.beans
+  <BLANKLINE>
+  2023-01-01 * "Test"
+    Assets:Tests  2 TESTS
+  <BLANKLINE>
+  **** .../downloads/two.beans
+  <BLANKLINE>
+  ; .../downloads/one.beans:2
+  ; 2023-01-01 * "Test"
+  ;   Assets:Tests  2 TESTS
+
+
 Cleanup
 -------
 

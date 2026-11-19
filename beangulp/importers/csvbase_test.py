@@ -591,11 +591,39 @@ class TestImporter(cmptest.TestCase):
         self.assertEqualEntries(
             entries,
             """
+        2021-05-18 * "Test B"
+          Assets:CSV  2.00 EUR
         2021-05-18 * "Test C"
+          Assets:CSV  1.00 EUR
+        2021-05-19 balance Assets:CSV  4.00 EUR
+        """,
+        )
+
+    @docfile
+    def test_extract_descending_same_date(self, filename):
+        """\
+        2021-05-19, Test C, 3.00
+        2021-05-18, Test A, 1.00
+        2021-05-18, Test B, 2.00
+        """
+
+        class CSVImporter(Base):
+            date = Date(0)
+            narration = Column(1)
+            amount = Amount(2)
+            names = False
+
+        importer = CSVImporter("Assets:CSV", "EUR")
+        entries = importer.extract(filename, [])
+        self.assertEqualEntries(
+            entries,
+            """
+        2021-05-18 * "Test A"
           Assets:CSV  1.00 EUR
         2021-05-18 * "Test B"
           Assets:CSV  2.00 EUR
-        2021-05-19 balance Assets:CSV  4.00 EUR
+        2021-05-19 * "Test C"
+          Assets:CSV  3.00 EUR
         """,
         )
 

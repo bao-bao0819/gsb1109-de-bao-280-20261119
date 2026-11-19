@@ -404,9 +404,12 @@ class _CSVImporterBase:
         last_date = date_utils.parse_date(get(last_row, Col.DATE), self.dateutil_kwds)
         is_ascending = first_date < last_date
 
-        # Reverse the list if the file is in descending order
+        # Sort the entries by date if the file is in descending
+        # order. The sort is stable, thus entries with the same date
+        # maintain the relative order in which they appear in the
+        # input file.
         if not is_ascending:
-            entries = list(reversed(entries))
+            entries.sort(key=lambda entry: entry.date)
 
         # Add a balance entry if possible. If more than one currency
         # can appear in the input, add one balance statement for each.

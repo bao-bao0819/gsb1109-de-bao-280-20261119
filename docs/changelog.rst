@@ -16,6 +16,7 @@ Deprecations
 Enhancements
 ############
 
+- The Admin import confirmation step now stores a fingerprint of the import-affecting resource configuration with the preview. If the configuration (for example a column-to-field mapping) changes before the import is confirmed, the import is refused and the reviewer is asked to preview again, so a stale preview can never write data with a different mapping. Display-only configuration (e.g. the resource display name or widget rendering options) does not invalidate the preview. See :meth:`~import_export.resources.Resource.get_import_configuration_fingerprint`
 - Added :meth:`~import_export.widgets.Widget.is_equal` hook so that widgets control how :meth:`~import_export.resources.Resource.skip_row` compares imported values against persisted values. The date / time widgets and ``ManyToManyWidget`` override it (`2174 <https://github.com/django-import-export/django-import-export/pull/2174>`_)
 - Added :meth:`~import_export.widgets.ManyToManyWidget.get_queryset` to customize the related objects available during import (`2172 <https://github.com/django-import-export/django-import-export/pull/2172>`_)
 - Replace ``DEFAULT_FORMATS`` and ``BINARY_FORMATS`` constants with ``get_default_formats()`` and ``get_binary_formats()`` functions to avoid expensive library imports at Django startup (`2149 <https://github.com/django-import-export/django-import-export/issues/2149>`_)

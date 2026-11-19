@@ -1,4 +1,6 @@
 import functools
+import hashlib
+import json
 import logging
 import types
 from collections import OrderedDict
@@ -14,6 +16,7 @@ from django.core.management.color import no_style
 from django.core.paginator import Paginator
 from django.db import connections, router
 from django.db.models import fields
+from django.db.models.fields import NOT_PROVIDED
 from django.db.models.fields.related import ForeignKey
 from django.db.models.manager import BaseManager
 from django.db.models.query import QuerySet
@@ -525,6 +528,98 @@ class Resource(metaclass=DeclarativeMetaclass):
                     import_fields.append(field)
                     continue
         return import_fields
+
+    def get_import_configuration_fingerprint(self):
+        """
+        Return a hash of the resource configuration which determines the
+        outcome of an import.
+
+        The Admin import workflow runs the import twice: once as a dry run to
+        build the preview, and again when the user confirms the import.  This
+        fingerprint is stored with the confirmation form so that the second run
+        can be refused if the configuration changed in the meantime, in which
+        case the preview no longer represents what would be written to the
+        database.
+
+        Only configuration which affects the data written to the database is
+        included.  Presentational configuration used by the preview page (for
+        example the resource display name, widget ``coerce_to_string`` which
+        only changes rendered values, or HTML diff settings) is deliberately
+        excluded, so that changing display text does not invalidate a preview.
+        """
+        meta = self._meta
+        instance_loader = meta.instance_loader_class
+        payload = {
+            "model": meta.model._meta.label if meta.model is not None else None,
+            "import_id_fields": list(self.get_import_id_fields()),
+            "instance_loader": (
+                f"{instance_loader.__module__}.{instance_loader.__qualname__}"
+                if instance_loader is not None
+                else None
+            ),
+            # Meta options which change which rows are written or how they are
+            # validated.  Display-only options (skip_diff, skip_html_diff,
+            # store_row_values, store_instance, ...) are intentionally omitted.
+            "skip_unchanged": meta.skip_unchanged,
+            "force_init_instance": meta.force_init_instance,
+            "clean_model_instances": meta.clean_model_instances,
+            "use_bulk": meta.use_bulk,
+            "fields": [
+                self._get_import_field_fingerprint(field)
+                for field in self.get_import_fields()
+            ],
+        }
+        serialized = json.dumps(
+            payload, default=self._fingerprint_default, sort_keys=True
+        )
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    def _get_import_field_fingerprint(self, field):
+        return {
+            "attribute": field.attribute,
+            "column_name": field.column_name,
+            "readonly": field.readonly,
+            "default": self._fingerprint_default(field.default),
+            "saves_null_values": field.saves_null_values,
+            "m2m_add": field.m2m_add,
+            "widget": self._get_widget_fingerprint(field.widget),
+        }
+
+    def _get_widget_fingerprint(self, widget):
+        # Widget attributes which only change the rendered (export) value are
+        # excluded: they affect preview text, not what is persisted on import.
+        attributes = (
+            "model",
+            "field",
+            "format",
+            "formats",
+            "separator",
+            "key_is_id",
+            "use_natural_foreign_keys",
+            "allow_blank",
+        )
+        fingerprint = {
+            "type": f"{widget.__class__.__module__}.{widget.__class__.__qualname__}"
+        }
+        for attribute in attributes:
+            if hasattr(widget, attribute):
+                fingerprint[attribute] = self._fingerprint_default(
+                    getattr(widget, attribute)
+                )
+        return fingerprint
+
+    @staticmethod
+    def _fingerprint_default(value):
+        # ``json`` calls this only for values it cannot serialize.  Lists,
+        # tuples and dicts are handled by ``json`` itself, which recurses into
+        # them and invokes this hook for any non-serializable members.
+        if value is NOT_PROVIDED:
+            return None
+        if isinstance(value, type):
+            return f"{value.__module__}.{value.__qualname__}"
+        if callable(value):
+            return getattr(value, "__qualname__", repr(value))
+        return repr(value)
 
     def import_instance(self, instance, row, **kwargs):
         r"""

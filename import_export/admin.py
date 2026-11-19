@@ -172,6 +172,42 @@ class ImportMixin(BaseImportMixin, ImportExportMixinBase):
 
         confirm_form = self.create_confirm_form(request)
         if confirm_form.is_valid():
+            # The preview was generated from a dry run of the resource
+            # configuration as it existed at preview time.  Refuse to write
+            # anything if the import-affecting configuration has changed since
+            # then, because the confirmed preview would no longer match the
+            # data actually persisted.  The reviewer has to generate a new
+            # preview.  Display-only configuration changes do not alter the
+            # fingerprint and do not block the import.
+            res_kwargs = self.get_import_resource_kwargs(
+                request, form=confirm_form, **kwargs
+            )
+            resource = self.choose_import_resource_class(confirm_form, request)(
+                **res_kwargs
+            )
+            expected_fingerprint = confirm_form.cleaned_data.get(
+                "import_configuration_fingerprint"
+            )
+            if (
+                expected_fingerprint
+                and expected_fingerprint
+                != resource.get_import_configuration_fingerprint()
+            ):
+                messages.error(
+                    request,
+                    _(
+                        "The resource configuration changed after this preview "
+                        "was generated. Please preview the import again before "
+                        "confirming it."
+                    ),
+                )
+                return HttpResponseRedirect(
+                    reverse(
+                        "admin:%s_%s_import" % self.get_model_info(),
+                        current_app=self.admin_site.name,
+                    )
+                )
+
             import_formats = self.get_import_formats()
             input_format = import_formats[int(confirm_form.cleaned_data["format"])](
                 encoding=self.from_encoding
@@ -511,9 +547,16 @@ class ImportMixin(BaseImportMixin, ImportExportMixinBase):
                     context["result"] = result
 
                     if not result.has_errors() and not result.has_validation_errors():
-                        context["confirm_form"] = self.create_confirm_form(
+                        confirm_form = self.create_confirm_form(
                             request, import_form=import_form
                         )
+                        # Record the import-affecting configuration used for
+                        # this preview, so process_import() can detect that the
+                        # configuration changed before the import is confirmed.
+                        confirm_form.initial[
+                            "import_configuration_fingerprint"
+                        ] = resource.get_import_configuration_fingerprint()
+                        context["confirm_form"] = confirm_form
         else:
             res_kwargs = self.get_import_resource_kwargs(
                 request=request, form=import_form, **kwargs

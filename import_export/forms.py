@@ -107,6 +107,13 @@ class ConfirmImportForm(FieldNamePrefixMixin, forms.Form):
     original_file_name = forms.CharField(widget=forms.HiddenInput())
     format = forms.CharField(widget=forms.HiddenInput())
     resource = forms.CharField(widget=forms.HiddenInput(), required=False)
+    # Hash of the import-affecting resource configuration used to build the
+    # preview.  It lets the confirm step detect that the resource configuration
+    # changed after the preview was generated, so that a stale preview can
+    # never be used to write data with different mappings.
+    import_configuration_fingerprint = forms.CharField(
+        widget=forms.HiddenInput(), required=False
+    )
 
     def clean_import_file_name(self):
         data = self.cleaned_data["import_file_name"]

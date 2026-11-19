@@ -84,6 +84,19 @@ To support import confirmation, uploaded data is written to temporary storage af
 step 1 (:ref:`choose file<change-screen-figure>`), and read back for final import after step 2
 (:ref:`import confirmation<confirm-import-figure>`).
 
+When the preview is generated, a hash of the resource configuration which determines the
+import result (field-to-column mappings, widgets, ``import_id_fields`` and similar import
+rules) is stored in a hidden field of the confirmation form.  When the import is confirmed,
+the hash is recomputed from the current configuration.  If the two do not match, the
+configuration changed after the preview was generated, so the preview no longer represents
+what would be written to the database.  In that case the import is refused, no data is
+written, and an error message asks the reviewer to preview the import again.
+
+Only rules which affect the imported data are part of the hash.  Configuration used purely
+for the preview display, such as the resource display name (``Meta.name``) or widget
+rendering options, does not invalidate a preview.  The hash can be inspected or overridden
+via :meth:`~import_export.resources.Resource.get_import_configuration_fingerprint`.
+
 There are three mechanisms for temporary storage.
 
 #. Temporary file storage on the host server (default).  This is suitable for development only.

@@ -24,6 +24,7 @@ Note: This supersedes the beangulp.cache module, which should get deleted at
 some point.
 """
 
+import hashlib
 import os
 import pickle
 import sys
@@ -104,10 +105,18 @@ def convert(file_path: str, converter: ConverterFunc) -> Any:
         if sentinel_mtime < threshold_time.timestamp():
             _cleanup_old_cache_files()
 
-    # Create a unique cache filename based on the file path and converter.
+    # Create a unique cache filename based on the file path, the converter
+    # and the file contents. Hashing the contents makes sure a file replaced
+    # in place, e.g. a statement downloaded again over the previous one, is
+    # not served stale results, even when the new file has the same size and
+    # modification time as the previous one.
     file_hash = hash(file_path)
     converter_hash = hash(converter.__code__)
-    cache_filename = os.path.join(CACHEDIR, f"{file_hash}_{converter_hash}.pickle")
+    with open(file_path, "rb") as file:
+        content_hash = hashlib.sha1(file.read()).hexdigest()
+    cache_filename = os.path.join(
+        CACHEDIR, f"{file_hash}_{converter_hash}_{content_hash}.pickle"
+    )
 
     # Check if the cache file exists and is still valid.
     if os.path.exists(cache_filename):

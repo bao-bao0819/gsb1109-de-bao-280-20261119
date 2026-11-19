@@ -102,6 +102,36 @@ class SimpleCacheTest(unittest.TestCase):
             # Verify it's in the cache directory
             self.assertEqual(cache_file, simple_cache.CACHEDIR)
 
+    def test_convert_detects_file_replaced(self):
+        """Test that overwriting the file invalidates the cached result."""
+        call_count = 0
+
+        def converter(filename):
+            nonlocal call_count
+            call_count += 1
+            with open(filename, "r") as f:
+                return f"converted: {f.read()}"
+
+        result1 = simple_cache.convert(self.test_file, converter)
+        self.assertEqual(result1, "converted: test content")
+        self.assertEqual(call_count, 1)
+
+        # Overwrite the file with different contents of the same size,
+        # keeping the same modification time.
+        stat = os.stat(self.test_file)
+        with open(self.test_file, "w") as f:
+            f.write("TEST CONTENT")
+        os.utime(self.test_file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+        result2 = simple_cache.convert(self.test_file, converter)
+        self.assertEqual(result2, "converted: TEST CONTENT")
+        self.assertEqual(call_count, 2)
+
+        # The new result is cached as well.
+        result3 = simple_cache.convert(self.test_file, converter)
+        self.assertEqual(result3, "converted: TEST CONTENT")
+        self.assertEqual(call_count, 2)
+
     def test_sentinel_file_creation(self):
         """Test that the sentinel file is created."""
 

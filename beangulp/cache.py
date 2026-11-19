@@ -53,6 +53,11 @@ class _FileMemo:
         # A cache of converter function to saved conversion value.
         self._cache = {}
 
+        # A signature of the file contents the cached conversion values were
+        # computed from. Used to detect the file having been replaced on disk
+        # and invalidate the cached values.
+        self._signature = None
+
     def __str__(self):
         return f'<FileWrapper filename="{self.name}">'
 
@@ -64,6 +69,7 @@ class _FileMemo:
         Returns:
           A bytes object, with the contents of the entire file.
         """
+        self._invalidate_if_changed()
         try:
             result = self._cache[converter_func]
         except KeyError:
@@ -71,6 +77,22 @@ class _FileMemo:
             # reporting later.
             result = self._cache[converter_func] = converter_func(self.name)
         return result
+
+    def _invalidate_if_changed(self):
+        """Drop the cached conversion values if the file contents changed.
+
+        The file may have been overwritten in place, e.g. a bank statement
+        downloaded again over the previous one. Comparing a hash of the
+        contents detects a replacement even when the new file has the same
+        size and modification time as the previous one.
+        """
+        try:
+            signature = utils.sha1sum(self.name)
+        except OSError:
+            signature = None
+        if signature != self._signature:
+            self._cache.clear()
+            self._signature = signature
 
     def mimetype(self):
         """Computes the MIME type of the file."""

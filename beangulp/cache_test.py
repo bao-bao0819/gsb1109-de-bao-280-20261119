@@ -65,6 +65,84 @@ class TestFileMemo(unittest.TestCase):
             string = cache._FileMemo("filepath").head(num_bytes, encoding="utf-8")
             self.assertEqual(string, "asciiHeader1,")
 
+    def test_cache_invalidate_file_replaced(self):
+        # A file overwritten in place with contents of the same size and the
+        # same modification time must be recognized as a new version.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, "statement.csv")
+            with open(filename, "w") as f:
+                f.write("headerA,amount\n1,2\n")
+            stat = os.stat(filename)
+
+            wrap = cache._FileMemo(filename)
+            self.assertIn("headerA", wrap.head())
+            self.assertIn("headerA", wrap.contents())
+
+            # Overwrite with a different header, keeping the same number of
+            # bytes and the same modification time.
+            with open(filename, "w") as f:
+                f.write("headerB,amount\n3,4\n")
+            os.utime(filename, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+            self.assertIn("headerB", wrap.head())
+            self.assertIn("headerB", wrap.contents())
+
+    def test_cache_kept_file_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, "statement.csv")
+            with open(filename, "w") as f:
+                f.write("header,amount\n1,2\n")
+
+            wrap = cache._FileMemo(filename)
+            converter = mock.MagicMock(return_value="abc")
+            self.assertEqual("abc", wrap.convert(converter))
+            self.assertEqual("abc", wrap.convert(converter))
+
+            # Rewriting identical contents does not invalidate the cache.
+            with open(filename, "w") as f:
+                f.write("header,amount\n1,2\n")
+            self.assertEqual("abc", wrap.convert(converter))
+            self.assertEqual(1, converter.call_count)
+
+    def test_cache_invalidate_does_not_affect_other_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename_a = os.path.join(tmpdir, "a.csv")
+            filename_b = os.path.join(tmpdir, "b.csv")
+            for filename in (filename_a, filename_b):
+                with open(filename, "w") as f:
+                    f.write("header,amount\n1,2\n")
+
+            wrap_a = cache._FileMemo(filename_a)
+            wrap_b = cache._FileMemo(filename_b)
+            converter_b = mock.MagicMock(return_value="bbb")
+            wrap_a.head()
+            self.assertEqual("bbb", wrap_b.convert(converter_b))
+
+            # Replacing a file only invalidates its own cached values.
+            with open(filename_a, "w") as f:
+                f.write("updated,amount\n3,4\n")
+            self.assertIn("updated", wrap_a.head())
+            self.assertEqual("bbb", wrap_b.convert(converter_b))
+            self.assertEqual(1, converter_b.call_count)
+
+    def test_get_file_invalidate_file_replaced(self):
+        # Exercise the global registry used by the identify/extract code path.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, "statement.csv")
+            with open(filename, "w") as f:
+                f.write("headerA,amount\n1,2\n")
+
+            wrap = cache.get_file(filename)
+            self.assertIn("headerA", wrap.head())
+
+            with open(filename, "w") as f:
+                f.write("headerB,amount\n3,4\n")
+
+            # A second pass over the same path reuses the registered FileMemo
+            # but sees the new contents.
+            self.assertIs(wrap, cache.get_file(filename))
+            self.assertIn("headerB", wrap.head())
+
 
 class CacheTestCase(unittest.TestCase):
     def setUp(self):

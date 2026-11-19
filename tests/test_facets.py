@@ -683,6 +683,45 @@ async def test_array_facet_handle_duplicate_tags():
     }
 
 
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+async def test_array_facet_empty_array_and_null_rows_are_not_tags():
+    ds = Datasette([], memory=True)
+    db = ds.add_database(Database(ds, memory_name="test_array_edge"))
+    await db.execute_write("create table creatures(name text, tags text)")
+    for name, tags in (
+        ("Beatrice", json.dumps(["friendly", "cunning", "friendly"])),
+        ("Simon", json.dumps(["cunning", "empathetic"])),
+        ("Empty", json.dumps([])),
+        ("Nullish", None),
+        ("Tracy", json.dumps(["eager"])),
+    ):
+        await db.execute_write(
+            "insert into creatures (name, tags) values (?, ?)", [name, tags]
+        )
+
+    response = await ds.client.get(
+        "/test_array_edge/creatures.json?_facet_array=tags&_extra=count"
+    )
+    data = response.json()
+
+    # The table is still returned one record per row, matching the plain request
+    assert data["count"] == 5
+    assert len(data["rows"]) == 5
+    plain = await ds.client.get("/test_array_edge/creatures.json")
+    assert data["rows"] == plain.json()["rows"]
+    tags_by_name = {row["name"]: row["tags"] for row in data["rows"]}
+    assert tags_by_name["Empty"] == "[]"
+    assert tags_by_name["Nullish"] is None
+
+    # Empty arrays and NULL contribute no string labels, while a tag repeated
+    # within one row only counts once for that row and each distinct tag counts once
+    facet = data["facet_results"]["results"]["tags"]
+    counts = {result["value"]: result["count"] for result in facet["results"]}
+    assert counts == {"cunning": 2, "eager": 1, "empathetic": 1, "friendly": 1}
+    assert "[]" not in counts
+    assert "null" not in counts
+
+
 async def test_date_facet_results(ds_client):
     facet = DateFacet(
         ds_client.ds,

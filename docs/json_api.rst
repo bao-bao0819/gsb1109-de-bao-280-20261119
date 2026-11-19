@@ -330,6 +330,28 @@ query string arguments:
 
     Compare `this query without the argument <https://latest.datasette.io/fixtures/-/query.json?sql=select+%27%7B%22this+is%22%3A+%22a+json+object%22%7D%27+as+d&_shape=array>`_ to `this query using the argument <https://latest.datasette.io/fixtures/-/query.json?sql=select+%27%7B%22this+is%22%3A+%22a+json+object%22%7D%27+as+d&_shape=array&_json=d>`_
 
+``?_json_shape=SHAPE``
+    Controls what a column named by ``_json=`` returns. The default,
+    ``parsed``, returns the decoded JSON value and is the behavior described
+    above. ``raw`` returns the original stored text without decoding it.
+    ``both`` returns an object with three keys for each value::
+
+        {
+          "raw": "{\"a\": [1, 2]}",
+          "parsed": {"a": [1, 2]},
+          "valid": true
+        }
+
+    ``raw`` is always the original value, while ``parsed`` is the decoded
+    value when it parses and ``null`` otherwise. ``valid`` reports whether
+    parsing succeeded, so JSON ``null`` can be told apart from invalid text.
+    A row that does not parse does not cause the request to fail: its
+    ``raw`` text and ``valid: false`` status are still returned, and other
+    rows are returned normally.
+
+    Requesting a value other than ``parsed``, ``raw`` or ``both`` returns a
+    ``400`` error.
+
 ``?_json_infinity=on``
     If your data contains infinity or -infinity values, Datasette will replace
     them with None when returning them as JSON. If you pass ``_json_infinity=1``
@@ -355,6 +377,55 @@ query string arguments:
     and very likely to change.
 
     Only available if the :ref:`setting_trace_debug` setting is enabled.
+
+.. _json_api_json_shape:
+
+Returning JSON values with their raw text
+-----------------------------------------
+
+Consider a table with three rows: two containing valid JSON and one containing
+text that is not valid JSON::
+
+    GET /fixtures/json_values.json?_json=payload&_json_shape=both&_shape=array
+
+.. code-block:: json
+
+    [
+      {
+        "id": 1,
+        "payload": {
+          "raw": "{\"a\": [1, 2]}",
+          "parsed": {"a": [1, 2]},
+          "valid": true
+        }
+      },
+      {
+        "id": 2,
+        "payload": {
+          "raw": "not JSON",
+          "parsed": null,
+          "valid": false
+        }
+      },
+      {
+        "id": 3,
+        "payload": {
+          "raw": "null",
+          "parsed": null,
+          "valid": true
+        }
+      }
+    ]
+
+``_json_shape=both`` is useful for scripts that need the original text and the
+parsed value at the same time, or that need to report which rows could not be
+parsed without losing the rest of the response. JSON ``null`` parses
+successfully and is reported with ``"valid": true``, distinguishing it from a
+value that is not valid JSON.
+
+Null database values are returned as ``{"raw": null, "parsed": null, "valid":
+true}``. ``_json_shape=raw`` returns the stored text unchanged, including text
+that is not valid JSON.
 
 .. _json_api_extra:
 

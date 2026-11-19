@@ -960,6 +960,258 @@ async def test_json_columns(ds_client, extra_args, expected):
     assert response.json() == expected
 
 
+async def test_json_shape_raw_leaves_values_untouched():
+    ds = Datasette()
+    db = ds.add_memory_database("json_raw_shape")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    await db.execute_write("INSERT INTO t VALUES (1, ?)", ['["a"]'])
+    try:
+        response = await ds.client.get(
+            "/json_raw_shape/t.json?_json=value&_json_shape=raw"
+        )
+        assert response.status_code == 200
+        assert response.json()["rows"] == [{"id": 1, "value": '["a"]'}]
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_returns_raw_parsed_and_status():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_shape")
+    await db.execute_write(
+        "CREATE TABLE t (id integer primary key, value text, other text)"
+    )
+    await db.execute_write(
+        "INSERT INTO t VALUES (1, ?, ?)", ['{"a": [1, 2]}', "untouched"]
+    )
+    try:
+        response = await ds.client.get(
+            "/json_both_shape/t.json?_json=value&_json_shape=both"
+        )
+        assert response.status_code == 200
+        assert response.json()["rows"] == [
+            {
+                "id": 1,
+                "value": {
+                    "raw": '{"a": [1, 2]}',
+                    "parsed": {"a": [1, 2]},
+                    "valid": True,
+                },
+                "other": "untouched",
+            }
+        ]
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_keeps_going_when_one_row_is_invalid():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_invalid")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    await db.execute_write(
+        "INSERT INTO t VALUES (1, ?), (2, ?), (3, ?)",
+        ['{"ok": true}', "not JSON", '["still", "parsed"]'],
+    )
+    try:
+        response = await ds.client.get(
+            "/json_both_invalid/t.json?_json=value&_json_shape=both"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["rows"] == [
+            {
+                "id": 1,
+                "value": {"raw": '{"ok": true}', "parsed": {"ok": True}, "valid": True},
+            },
+            {
+                "id": 2,
+                "value": {"raw": "not JSON", "parsed": None, "valid": False},
+            },
+            {
+                "id": 3,
+                "value": {
+                    "raw": '["still", "parsed"]',
+                    "parsed": ["still", "parsed"],
+                    "valid": True,
+                },
+            },
+        ]
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_distinguishes_json_null_and_invalid():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_null")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    await db.execute_write("INSERT INTO t VALUES (1, 'null'), (2, 'not JSON')")
+    try:
+        response = await ds.client.get(
+            "/json_both_null/t.json?_json=value&_json_shape=both&_shape=array"
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {"id": 1, "value": {"raw": "null", "parsed": None, "valid": True}},
+            {"id": 2, "value": {"raw": "not JSON", "parsed": None, "valid": False}},
+        ]
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_preserves_string_values_separately():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_strings")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    await db.execute_write("INSERT INTO t VALUES (1, '\"same\"'), (2, 'same')")
+    try:
+        response = await ds.client.get(
+            "/json_both_strings/t.json?_json=value&_json_shape=both&_shape=array"
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {"id": 1, "value": {"raw": '"same"', "parsed": "same", "valid": True}},
+            {"id": 2, "value": {"raw": "same", "parsed": None, "valid": False}},
+        ]
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_for_row_and_query():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_views")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    await db.execute_write("INSERT INTO t VALUES (1, '{\"a\": 1}')")
+    try:
+        row_response = await ds.client.get(
+            "/json_both_views/t/1.json?_json=value&_json_shape=both"
+        )
+        assert row_response.status_code == 200
+        assert row_response.json()["row"] == {
+            "id": 1,
+            "value": {"raw": '{"a": 1}', "parsed": {"a": 1}, "valid": True},
+        }
+        query_response = await ds.client.get(
+            "/json_both_views/-/query.json?"
+            + urllib.parse.urlencode(
+                {
+                    "sql": "select value from t",
+                    "_json": "value",
+                    "_json_shape": "both",
+                    "_shape": "array",
+                }
+            )
+        )
+        assert query_response.status_code == 200
+        assert query_response.json() == [
+            {"value": {"raw": '{"a": 1}', "parsed": {"a": 1}, "valid": True}}
+        ]
+    finally:
+        ds.close()
+
+
+@pytest.mark.parametrize("shape", ["objects", "arrays", "array", "arrayfirst"])
+async def test_json_shape_both_with_output_shapes(shape):
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_shapes")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    await db.execute_write("INSERT INTO t VALUES (1, '[\"a\"]')")
+    try:
+        response = await ds.client.get(
+            "/json_both_shapes/t.json?"
+            + urllib.parse.urlencode(
+                {"_json": "value", "_json_shape": "both", "_shape": shape}
+            )
+        )
+        assert response.status_code == 200
+        cell = {"raw": '["a"]', "parsed": ["a"], "valid": True}
+        result = response.json()
+        if shape == "objects":
+            assert result["rows"] == [{"id": 1, "value": cell}]
+        elif shape == "arrays":
+            assert result["rows"] == [[1, cell]]
+        elif shape == "array":
+            assert result == [{"id": 1, "value": cell}]
+        else:
+            assert result == [1]
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_shape_object_keys_use_raw_primary_key():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_object")
+    await db.execute_write("CREATE TABLE t (id text primary key, value text)")
+    await db.execute_write("INSERT INTO t VALUES ('\"raw-id\"', '{\"a\": 1}')")
+    try:
+        response = await ds.client.get(
+            "/json_both_object/t.json?_json=id&_json_shape=both&_shape=object"
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "~22raw-id~22": {
+                "id": {
+                    "raw": '"raw-id"',
+                    "parsed": "raw-id",
+                    "valid": True,
+                },
+                "value": '{"a": 1}',
+            }
+        }
+    finally:
+        ds.close()
+
+
+async def test_json_shape_both_with_empty_results():
+    ds = Datasette()
+    db = ds.add_memory_database("json_both_empty")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    try:
+        response = await ds.client.get(
+            "/json_both_empty/t.json?_json=value&_json_shape=both"
+        )
+        assert response.status_code == 200
+        assert response.json()["rows"] == []
+    finally:
+        ds.close()
+
+
+async def test_json_shape_invalid_is_a_400():
+    ds = Datasette()
+    db = ds.add_memory_database("json_bad_shape")
+    await db.execute_write("CREATE TABLE t (id integer primary key, value text)")
+    try:
+        response = await ds.client.get(
+            "/json_bad_shape/t.json?_json=value&_json_shape=nope"
+        )
+        assert response.status_code == 400
+        assert response.json() == {
+            "ok": False,
+            "error": "Invalid _json_shape: nope",
+            "errors": ["Invalid _json_shape: nope"],
+            "status": 400,
+        }
+    finally:
+        ds.close()
+
+
+async def test_json_shape_default_is_unchanged(ds_client):
+    path = "/fixtures/-/query.json?" + urllib.parse.urlencode(
+        {
+            "sql": "select '{\"a\": 1}' as valid, 'not JSON' as invalid",
+            "_json": ["valid", "invalid"],
+            "_shape": "array",
+        },
+        doseq=True,
+    )
+    response = await ds_client.get(path)
+    assert response.status_code == 200
+    assert response.json() == [{"valid": {"a": 1}, "invalid": "not JSON"}]
+    explicit = await ds_client.get(path + "&_json_shape=parsed")
+    assert explicit.status_code == 200
+    assert explicit.json() == response.json()
+
+
 async def test_config_cache_size():
     ds = await make_ds(settings={"cache_size_kb": 2500})
     response = await ds.client.get("/fixtures/pragma_cache_size.json")

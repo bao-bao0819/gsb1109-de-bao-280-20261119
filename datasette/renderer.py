@@ -47,7 +47,33 @@ def _load_json_value(value):
         return value
 
 
-def convert_specific_columns_to_json(rows, columns, json_cols):
+def _json_value_with_status(value):
+    """
+    Return (parsed_value, valid) for a stored column value.
+
+    Values that are already Python objects (for example after a column type
+    transform) are valid JSON values and are returned unchanged. Stored text
+    that does not parse is reported as invalid instead of being silently
+    substituted for the parsed value.
+    """
+    if not isinstance(value, (str, bytes, bytearray)):
+        return value, True
+    try:
+        return json.loads(value), True
+    except (TypeError, ValueError):
+        return None, False
+
+
+def _convert_json_value(value, mode):
+    if mode == "raw":
+        return value
+    if mode == "both":
+        parsed, valid = _json_value_with_status(value)
+        return {"raw": value, "parsed": parsed, "valid": valid}
+    return _load_json_value(value)
+
+
+def convert_specific_columns_to_json(rows, columns, json_cols, mode="parsed"):
     if not rows:
         return rows
     if columns is None:
@@ -62,10 +88,10 @@ def convert_specific_columns_to_json(rows, columns, json_cols):
         if isinstance(row, dict):
             new_row = dict(row)
             for column in json_cols.intersection(row):
-                new_row[column] = _load_json_value(row[column])
+                new_row[column] = _convert_json_value(row[column], mode)
         else:
             new_row = [
-                _load_json_value(value) if column in json_cols else value
+                _convert_json_value(value, mode) if column in json_cols else value
                 for value, column in zip(row, columns)
             ]
         new_rows.append(new_row)
@@ -117,6 +143,15 @@ async def json_renderer(
     json_cols = []
     if "_json" in args:
         json_cols = args.getlist("_json")
+    # _json_shape=raw leaves values undecoded, _json_shape=both returns
+    # {"raw": ..., "parsed": ..., "valid": ...} objects. The default keeps
+    # returning the decoded value on its own.
+    json_shape = args.get("_json_shape", "parsed")
+    if not error and json_shape not in ("parsed", "raw", "both"):
+        status_code = 400
+        return Response.json(
+            error_body(f"Invalid _json_shape: {json_shape}", status_code), status_code
+        )
     object_keys = None
     pks = data.get("primary_keys")
     if (
@@ -132,7 +167,7 @@ async def json_renderer(
             object_keys.append(path_from_row_pks(row, pks, False))
     if json_cols:
         data["rows"] = convert_specific_columns_to_json(
-            data["rows"], columns, json_cols
+            data["rows"], columns, json_cols, json_shape
         )
 
     # unless _json_infinity=1 requested, replace infinity with None

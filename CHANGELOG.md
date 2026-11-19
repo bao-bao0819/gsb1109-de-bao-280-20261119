@@ -1,6 +1,7 @@
 # DeepDiff Change log
 
 - v9-2-0
+    - Added `report_reference_topology` to DeepDiff: an opt-in report that validates the reference (identity) topology of the compared objects. It reports `shared_reference_splits` (paths that shared one object in t1 but point to distinct objects in t2) and `reference_cycles` (self-referencing structures, detected without hanging)
     - Added `iterable_match_keys` to match list items by key per path, e.g. `{"root['orders']": "order_id", "root['orders'][*]['lines']": ("sku", "warehouse")}`. Inserted, removed and reordered records are reported per record at real list indexes, and `Delta` round-trips (#664)
     - Support for Python 3.15
     - Dropping support for Python 3.10, which reached end-of-life in October 2026

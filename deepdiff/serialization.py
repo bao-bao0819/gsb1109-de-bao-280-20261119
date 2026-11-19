@@ -241,7 +241,11 @@ class SerializationMixin:
                 verbose_level = 2
             else:
                 verbose_level = self.verbose_level  # type: ignore
-        return dict(self._get_view_results(TEXT_VIEW, verbose_level=verbose_level))  # type: ignore
+        result = dict(self._get_view_results(TEXT_VIEW, verbose_level=verbose_level))  # type: ignore
+        topology_report = getattr(self, '_reference_topology_report', None)
+        if topology_report:
+            result.update(topology_report)
+        return result
 
     def _to_delta_dict(
         self,

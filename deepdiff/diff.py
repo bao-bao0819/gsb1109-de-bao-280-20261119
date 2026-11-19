@@ -45,6 +45,7 @@ from deepdiff.base import Base
 from deepdiff.lfucache import LFUCache, DummyLFU
 from deepdiff.colored_view import ColoredView
 from deepdiff.match_keys import CompiledMatchKeys, KeySpec, get_key_matching_pairs
+from deepdiff.reference_topology import analyze_reference_topology
 from deepdiff._multiprocessing import (
     normalize_mp_config, compute_distances_parallel,
     compute_hashes_parallel, compute_subtree_diffs_parallel,
@@ -201,6 +202,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  number_format_notation: Literal["f", "e"]="f",
                  number_to_string_func: Optional[Callable]=None,
                  progress_logger: Callable[[str], None]=logger.info,
+                 report_reference_topology: bool=False,
                  report_repetition: bool=False,
                  significant_digits: Optional[int]=None,
                  threshold_to_diff_deeper: float = 0.33,
@@ -220,10 +222,13 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         self.include_glob_paths = None
         self.iterable_match_keys = None
         self._compiled_match_keys = None
+        # Same for report_reference_topology: _parameters dicts built
+        # before this parameter existed do not carry it.
+        self.report_reference_topology = False
         if kwargs:
             raise ValueError((
                 "The following parameter(s) are not valid: %s\n"
-                "The valid parameters are ignore_order, report_repetition, significant_digits, "
+                "The valid parameters are ignore_order, report_repetition, report_reference_topology, significant_digits, "
                 "number_format_notation, exclude_paths, include_paths, exclude_types, exclude_regex_paths, ignore_type_in_groups, "
                 "ignore_string_type_changes, ignore_numeric_type_changes, ignore_type_subclasses, ignore_uuid_types, truncate_datetime, "
                 "ignore_private_variables, ignore_nan_inequality, number_to_string_func, verbose_level, "
@@ -269,6 +274,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                 ignore_type_subclasses=ignore_type_subclasses,
                 ignore_uuid_types=ignore_uuid_types)
             self.report_repetition = report_repetition
+            self.report_reference_topology = report_reference_topology
             _exclude_set = convert_item_or_items_into_set_else_none(exclude_paths)
             _exclude_exact, self.exclude_glob_paths = separate_wildcard_and_exact_paths(_exclude_set)
             self.exclude_paths = add_root_to_paths(_exclude_exact)
@@ -423,6 +429,15 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                 self._colored_view = view_results
             else:
                 self.update(view_results)
+            if self.is_root and self.report_reference_topology:
+                topology_report = {
+                    report_key: report_value
+                    for report_key, report_value in analyze_reference_topology(self.t1, self.t2).items()
+                    if report_value
+                }
+                if topology_report:
+                    self._reference_topology_report = topology_report
+                    self.update(topology_report)
         finally:
             if self.is_root:
                 if cache_purge_level:

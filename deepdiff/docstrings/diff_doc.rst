@@ -193,6 +193,28 @@ report_repetition : Boolean, default=False
     :ref:`report_repetition_label` reports repetitions when set True
     It only works when ignore_order is set to True too.
 
+report_reference_topology : Boolean, default=False
+    reports changes in the reference (identity) topology of the objects when set to True.
+    The normal diff compares objects by value: two copies of the same data are considered equal
+    to one shared object referenced from two places. When this parameter is set to True,
+    DeepDiff additionally validates that references which were shared in t1 are still shared
+    in t2 and reports up to two extra keys:
+
+    - shared_reference_splits: a list of {'paths': [...]} entries. Each entry lists the paths
+      that referenced one single object in t1 while the corresponding paths in t2 reference
+      distinct objects (for example two equal copies instead of one shared canonical object).
+    - reference_cycles: a list of {'tree', 'path', 'target'} entries for self-referencing
+      structures. Each entry means the object found at 'path' is identical to its ancestor
+      at 'target'. The traversal is guaranteed to terminate on cyclic structures.
+
+    Example:
+        >>> from deepdiff import DeepDiff
+        >>> shared = {'id': 1}
+        >>> t1 = {'a': shared, 'b': shared}
+        >>> t2 = {'a': {'id': 1}, 'b': {'id': 1}}
+        >>> DeepDiff(t1, t2, report_reference_topology=True)
+        {'shared_reference_splits': [{'paths': ["root['a']", "root['b']"]}]}
+
 significant_digits : int >= 0, default=None
     :ref:`significant_digits_label` defines the number of digits AFTER the decimal point to be used in the comparison. However you can override that by setting the number_format_notation="e" which will make it mean the digits in scientific notation.
 

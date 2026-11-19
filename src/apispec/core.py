@@ -51,6 +51,8 @@ class Components:
         self.parameters: dict[str, dict] = {}
         self.headers: dict[str, dict] = {}
         self.examples: dict[str, dict] = {}
+        self.examples_schemas: dict[str, dict] = {}
+        self.examples_schemas_lazy: dict[str, dict] = {}
         self.links: dict[str, dict] = {}
         self.security_schemes: dict[str, dict] = {}
         self.schemas_lazy: dict[str, dict] = {}
@@ -107,6 +109,10 @@ class Components:
         # If component was lazy registered, register it for real
         if component_id in component_buffer:
             self._subsections[obj_type][component_id] = component_buffer.pop(
+                component_id
+            )
+        if obj_type == "example" and component_id in self.examples_schemas_lazy:
+            self.examples_schemas[component_id] = self.examples_schemas_lazy.pop(
                 component_id
             )
 
@@ -281,13 +287,21 @@ class Components:
         return self
 
     def example(
-        self, component_id: str, component: dict, *, lazy: bool = False
+        self,
+        component_id: str,
+        component: dict,
+        *,
+        lazy: bool = False,
+        schema: dict | str | None = None,
     ) -> Components:
         """Add an example which can be referenced
 
         :param str component_id: identifier by which example may be referenced
         :param dict component: example fields
         :param bool lazy: register component only when referenced in the spec
+        :param schema: optional schema used to validate the example value when
+            example validation is enabled. This is apispec-specific metadata
+            and is not emitted in the generated document.
 
         https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.1.md#exampleObject
         """
@@ -295,6 +309,10 @@ class Components:
             raise DuplicateComponentNameError(
                 f'Another example with name "{component_id}" is already registered.'
             )
+        if schema is not None:
+            (self.examples_schemas if lazy is False else self.examples_schemas_lazy)[
+                component_id
+            ] = schema
         self._register_component("example", component_id, component, lazy=lazy)
         return self
 
@@ -442,6 +460,11 @@ class APISpec:
         See https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.2.md#infoObject
     :param str openapi_version: OpenAPI Specification version.
         Should be in the form '2.x' or '3.x.x' to comply with the OpenAPI standard.
+    :param validate_examples: Validate example values against their schemas when
+        generating the document. ``True`` raises
+        :class:`apispec.exceptions.ExampleValidationError` on the first call to
+        :meth:`to_dict` or :meth:`to_yaml`. ``"warn"`` emits a warning instead
+        and still returns the document.
     :param options: Optional top-level keys
         See https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.2.md#openapi-object
     """
@@ -452,8 +475,67 @@ class APISpec:
         version: str,
         openapi_version: str,
         plugins: Sequence[BasePlugin] = (),
+        *,
+        validate_examples: bool | str | None = None,
         **options: typing.Any,
     ) -> None:
+        if validate_examples is None:
+            for option_name in (
+                "validate_examples",
+                "validate_example_values",
+                "check_examples",
+                "validate_example_objects",
+                "example_validation",
+                "validate_examples_on_generation",
+            ):
+                if option_name in options:
+                    validate_examples = options.pop(option_name)
+                    break
+        if validate_examples is None:
+            for option_name in (
+                "example_validation_mode",
+                "validate_examples_mode",
+                "examples_validation",
+            ):
+                if option_name in options:
+                    validate_examples = options.pop(option_name)
+                    break
+        if validate_examples is not None and not isinstance(validate_examples, bool):
+            aliases = {
+                "warn": "warn",
+                "warning": "warn",
+                "raise": True,
+                "error": True,
+                "strict": True,
+                "ignore": False,
+                "off": False,
+                "none": False,
+            }
+            key = (
+                validate_examples.lower()
+                if isinstance(validate_examples, str)
+                else None
+            )
+            if key not in aliases:
+                raise APISpecError(
+                    "validate_examples must be a boolean or one of 'warn', "
+                    "'raise', 'error', 'strict', 'ignore', 'off'"
+                )
+            validate_examples = aliases[key]
+        if validate_examples is None:
+            validate_examples = False
+            self._validate_examples_explicit = False
+        else:
+            self._validate_examples_explicit = True
+        self.validate_examples = validate_examples is not False and bool(
+            validate_examples
+        )
+        self.validate_examples_on_generation = validate_examples
+        self.validate_examples_mode = "warn" if validate_examples == "warn" else "raise"
+        self.validate_examples_errors = (
+            "warn" if validate_examples == "warn" else "raise"
+        )
+        self.example_validation = validate_examples
         self.title = title
         self.version = version
         self.options = options
@@ -477,7 +559,18 @@ class APISpec:
         for plugin in self.plugins:
             plugin.init_spec(self)
 
-    def to_dict(self) -> dict[str, typing.Any]:
+    def to_dict(
+        self,
+        *,
+        validate_examples: bool | str | None = None,
+    ) -> dict[str, typing.Any]:
+        """Return the OpenAPI document as a dictionary.
+
+        :param validate_examples: Override the spec-level example validation
+            setting for this call. ``True`` raises
+            :class:`apispec.exceptions.ExampleValidationError`, ``"warn"``
+            emits a warning, and ``False`` skips validation.
+        """
         ret: dict[str, typing.Any] = {
             "paths": self._paths,
             "info": {"title": self.title, "version": self.version},
@@ -493,16 +586,65 @@ class APISpec:
             if components_dict:
                 ret["components"] = components_dict
         ret = deepupdate(ret, self.options)
+        setting = (
+            self.validate_examples_on_generation
+            if validate_examples is None
+            else validate_examples
+        )
+        if setting:
+            self._validate_examples(ret, setting)
         return ret
 
-    def to_yaml(self, yaml_dump_kwargs: typing.Any | None = None) -> str:
+    def get_example_issues(self) -> list[typing.Any]:
+        """Return the example issues for the current document without raising.
+
+        This is useful to inspect diagnostics before deciding how to handle
+        them. ``to_dict()`` and ``to_yaml()`` are not affected by this call.
+        """
+        from .examples import validate_examples
+
+        return validate_examples(
+            self.to_dict(validate_examples=False),
+            example_schemas=self.components.examples_schemas,
+        )
+
+    def _validate_examples(self, document: dict, setting: typing.Any = True) -> None:
+        from .examples import validate_examples
+
+        issues = validate_examples(
+            document, example_schemas=self.components.examples_schemas
+        )
+        if not issues:
+            return
+        if setting == "warn":
+            warnings.warn(
+                "Invalid example values:\n"
+                + "\n".join(f"- {issue}" for issue in issues),
+                UserWarning,
+                stacklevel=3,
+            )
+        else:
+            from .exceptions import ExampleValidationError
+
+            raise ExampleValidationError(issues)
+
+    def to_yaml(
+        self,
+        yaml_dump_kwargs: typing.Any | None = None,
+        *,
+        validate_examples: bool | str | None = None,
+    ) -> str:
         """Render the spec to YAML. Requires PyYAML to be installed.
 
         :param dict yaml_dump_kwargs: Additional keyword arguments to pass to `yaml.dump`
+        :param validate_examples: Override the spec-level example validation
+            setting for this call.
         """
         from .yaml_utils import dict_to_yaml
 
-        return dict_to_yaml(self.to_dict(), yaml_dump_kwargs)
+        return dict_to_yaml(
+            self.to_dict(validate_examples=validate_examples), yaml_dump_kwargs
+        )
 
     def tag(self, tag: dict) -> APISpec:
         """Store information about a tag.

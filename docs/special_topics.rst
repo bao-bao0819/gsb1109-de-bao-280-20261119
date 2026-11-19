@@ -163,3 +163,90 @@ reference is not supported. In other words, rather than passing
 ``{"schema": "Pet"}``. APISpec assumes a schema reference named ``"Pet"`` has
 been defined and builds the reference using the components location
 corresponding to the OpenAPI version.
+
+Validating Examples
+-------------------
+
+Example values are not validated by default. Pass
+``validate_examples=True`` to `APISpec <apispec.APISpec>` to check every
+example against its schema when the document is generated:
+
+.. code-block:: python
+
+    from apispec import APISpec
+    from apispec.exceptions import ExampleValidationError
+
+    spec = APISpec(
+        title="Pets",
+        version="1.0.0",
+        openapi_version="3.0.2",
+        validate_examples=True,
+    )
+
+    spec.components.schema(
+        "Pet",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    )
+    spec.components.response(
+        "GetPet",
+        {
+            "content": {
+                "application/json": {
+                    "schema": "Pet",
+                    "examples": {"wrong": {"value": {"name": 3}}},
+                }
+            }
+        },
+    )
+
+    try:
+        spec.to_dict()
+    except ExampleValidationError as error:
+        print(error.issues[0].path)  # $.name
+
+Each issue has a ``path`` with the failing property path. Array elements are
+included as indexes, so an invalid second item is reported as
+``$.pets[1].name``. ``$ref`` values are resolved against the generated
+document, and recursive schemas are followed until the example ends.
+
+Request examples are validated in write direction: a missing ``readOnly``
+property is accepted, and a ``writeOnly`` property may be supplied. Response
+examples are validated in read direction: a missing ``writeOnly`` property is
+accepted, but a ``writeOnly`` property present in the example is reported.
+Note that ``readOnly`` is not prohibited in request values: it only makes the
+property optional.
+
+Pass ``validate_examples="warn"`` to emit a ``UserWarning`` and still return
+the document. The setting may also be overridden per call with
+``spec.to_dict(validate_examples=True)`` or
+``spec.to_yaml(validate_examples=True)``. To check a document that has already
+been generated without the option, use
+`apispec.examples.validate_examples`:
+
+.. code-block:: python
+
+    from apispec.examples import validate_examples
+
+    issues = validate_examples(spec.to_dict(validate_examples=False))
+    for issue in issues:
+        print(issue.location, issue.path, issue.message)
+
+Examples registered as components can be bound to a schema with the
+``schema`` argument. The schema is used for validation and is not emitted in
+the document:
+
+.. code-block:: python
+
+    spec.components.example(
+        "PetExample",
+        {"value": {"name": "Rex"}},
+        schema="Pet",
+    )
+
+An example component that is not referenced is validated against this schema
+where it is registered. A referenced example component is validated at the
+point of use so that request and response direction rules apply.

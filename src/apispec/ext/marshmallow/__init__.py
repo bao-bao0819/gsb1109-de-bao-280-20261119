@@ -103,6 +103,9 @@ class MarshmallowPlugin(BasePlugin):
         Receives the `Schema` class and returns the name to be used in refs within
         the generated spec. When working with circular referencing this function
         must must not return `None` for schemas in a circular reference chain.
+    :param validate_examples: Enable example validation on the attached
+        :class:`apispec.APISpec` when it has no explicit setting. Accepts the
+        same values as ``APISpec(validate_examples=...)``.
 
         Example: ::
 
@@ -120,9 +123,12 @@ class MarshmallowPlugin(BasePlugin):
     def __init__(
         self,
         schema_name_resolver: typing.Callable[[type[Schema]], str] | None = None,
+        *,
+        validate_examples: bool | str | None = None,
     ) -> None:
         super().__init__()
         self.schema_name_resolver = schema_name_resolver or resolver
+        self.validate_examples = validate_examples
         self.spec: APISpec | None = None
         self.openapi_version: Version | None = None
         self.converter: OpenAPIConverter | None = None
@@ -130,6 +136,15 @@ class MarshmallowPlugin(BasePlugin):
 
     def init_spec(self, spec: APISpec) -> None:
         super().init_spec(spec)
+        if self.validate_examples is not None and not getattr(
+            spec, "_validate_examples_explicit", False
+        ):
+            setting = self.validate_examples
+            if isinstance(setting, str) and setting not in ("warn",):
+                setting = True
+            spec.validate_examples_on_generation = setting
+            spec.validate_examples = setting is not False
+            spec.validate_examples_mode = "warn" if setting == "warn" else "raise"
         self.spec = spec
         self.openapi_version = spec.openapi_version
         self.converter = self.Converter(

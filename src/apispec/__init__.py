@@ -3,9 +3,24 @@
 import typing
 
 from .core import APISpec
+from .examples import (
+    ExamplePath,
+    ExampleValidationIssue,
+    ExampleValidator,
+    validate_examples,
+)
+from .exceptions import ExampleValidationError
 from .plugin import BasePlugin
 
-__all__ = ["APISpec", "BasePlugin"]
+__all__ = [
+    "APISpec",
+    "BasePlugin",
+    "ExamplePath",
+    "ExampleValidationError",
+    "ExampleValidationIssue",
+    "ExampleValidator",
+    "validate_examples",
+]
 
 
 def __getattr__(name: str) -> typing.Any:

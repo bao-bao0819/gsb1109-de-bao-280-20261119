@@ -1,6 +1,21 @@
 Changelog
 ---------
 
+6.11.0 (unreleased)
+********************
+
+Features:
+
+- Add optional validation of example values when generating the document.
+  ``APISpec(validate_examples=True)`` raises
+  ``ExampleValidationError`` with a property path for each invalid example.
+  Array elements, recursive schemas and ``$ref`` values are handled, and
+  request/response direction rules for ``readOnly`` and ``writeOnly``
+  properties are applied. ``validate_examples="warn"`` reports problems
+  without failing generation.
+- ``Components.example`` accepts a ``schema`` argument used to validate
+  standalone Example Objects.
+
 6.10.1 (2026-11-03)
 *******************
 

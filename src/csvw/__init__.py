@@ -8,7 +8,7 @@ from .metadata import (
 
 from .dsv import (UnicodeWriter,
     UnicodeReader, UnicodeReaderWithLineNumber, UnicodeDictReader, NamedTupleReader,
-    iterrows, rewrite)
+    LineNumber, iterrows, rewrite)
 
 __all__ = [
     'TableGroup',
@@ -18,7 +18,7 @@ __all__ = [
     'URITemplate',
     'Dialect', 'UnicodeWriter',
     'UnicodeReader', 'UnicodeReaderWithLineNumber', 'UnicodeDictReader', 'NamedTupleReader',
-    'iterrows', 'rewrite',
+    'LineNumber', 'iterrows', 'rewrite',
     'CSVW',
 ]
 

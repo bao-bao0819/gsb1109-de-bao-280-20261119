@@ -2,6 +2,15 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Report physical line ranges for logical records: `dsv.UnicodeReaderWithLineNumber` now yields
+  `dsv.LineNumber` objects with `start` and `end` attributes, and `Table.iterdicts` exposes them
+  when called with `with_metadata=True`. Line numbers are not shifted by skipped blank lines,
+  comments or skipped rows.
+
+
 Version 4.2.0
 -------------
 

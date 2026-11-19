@@ -31,7 +31,7 @@ import uritemplate
 
 from . import utils
 from .datatypes import DATATYPES
-from .dsv import Dialect as BaseDialect, UnicodeReaderWithLineNumber, UnicodeWriter
+from .dsv import Dialect as BaseDialect, LineNumber, UnicodeReaderWithLineNumber, UnicodeWriter
 from .frictionless import DataPackage
 from . import jsonld
 from .metadata_utils import DescriptionBase, dataclass_asdict, NAMESPACES, dialect_props, \
@@ -892,7 +892,7 @@ class TableLike(Description):
 class CsvRow:
     """A bag of attributes specifying a row in a CSV file."""
     fname: str
-    lineno: int
+    lineno: LineNumber
     row: list[str]
 
 
@@ -1189,7 +1189,9 @@ class Table(TableLike):
 
         :param log: Logger object (default None) The object that reports parsing errors.\
         If none is given, parsing errors raise ValueError instead.
-        :param bool with_metadata: (default False) Also yield fname and lineno
+        :param bool with_metadata: (default False) Also yield fname and lineno, where lineno\
+        is the :class:`~csvw.dsv.LineNumber` range of physical lines occupied by the row in\
+        the source file.
         :param fname: file-like, pathlib.Path, or str (default None)\
         The file to be read. Defaults to inheriting from a parent object, if one exists.
         :param strict: Flag signaling whether data is read strictly - i.e. raising `ValueError` \
@@ -1497,7 +1499,7 @@ class ReferencedTable:
 class RefValues:
     """Bundle properties of a table row for simpler checking."""
     fname: str
-    lineno: int
+    lineno: LineNumber
     values: Union[str, list[str]]
 
     def __str__(self):
@@ -1705,7 +1707,7 @@ class CSVW:
 
     def _row_to_json(self, table, cols, row, rownum, rowsourcenum):  # pylint: disable=R0913,R0917
         res = collections.OrderedDict()
-        res['url'] = f'{table.url.resolve(table.base)}#row={rowsourcenum}'
+        res['url'] = f'{table.url.resolve(table.base)}#row={rowsourcenum.start}'
         res['rownum'] = rownum
         if table.tableSchema.rowTitles:
             res['titles'] = [

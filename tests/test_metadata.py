@@ -314,6 +314,33 @@ class TestTableGroup:
             tg = csvw.TableGroup.from_frictionless_datapackage(FIXTURES / 'datapackage.json')
             assert list(tg.tables[0])
 
+    def test_row_line_numbers(self, tmp_path):
+        metadata = """\
+{
+  "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+  "dialect": {"skipBlankRows": true},
+  "tables": [{
+    "url": "csv.txt",
+    "tableSchema": {
+      "columns": [{"name": "ID", "required": true}, {"name": "note"}],
+      "primaryKey": "ID"
+    }
+  }]
+}"""
+        data = 'ID,note\n1,"first\nsecond"\n\n2,other\n'
+        tg = self._make_tablegroup(tmp_path, data=data, metadata=metadata)
+        table = tg.tables[0]
+        ranges = [
+            (row['ID'], lineno.start, lineno.end)
+            for _, lineno, row in table.iterdicts(with_metadata=True)]
+        # Blank lines are skipped for reading, but the physical line numbers stay unchanged:
+        assert ranges == [('1', 2, 3), ('2', 5, 5)]
+
+        # Error messages point at the physical line range of the logical record:
+        table.tableSchema.columns[1].datatype = csvw.Datatype.fromvalue('integer')
+        with pytest.raises(ValueError, match=r'csv\.txt:2-3:2 note'):
+            list(table)
+
     def test_iteritems_column_renaming(self):
         t = csvw.TableGroup.from_file(FIXTURES / 'test.tsv-metadata.json')
         items = list(t.tables[0])

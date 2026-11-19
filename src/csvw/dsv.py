@@ -29,7 +29,7 @@ from .dsv_dialects import Dialect
 __all__ = [
     'UnicodeWriter',
     'UnicodeReader', 'UnicodeReaderWithLineNumber', 'UnicodeDictReader', 'NamedTupleReader',
-    'iterrows',
+    'LineNumber', 'iterrows',
     'rewrite', 'add_rows', 'filter_rows_as_dict',
 ]
 
@@ -42,6 +42,57 @@ DictRowType = collections.OrderedDict[str, Union[str, list[str]]]
 def normalize_encoding(encoding: str) -> str:
     """Normalize the name of the encoding."""
     return codecs.lookup(encoding).name
+
+
+def _count_lines(s: str) -> int:
+    """Count the line breaks in a cell value, supporting `\\r\\n` and bare `\\r` line endings."""
+    return s.count('\n') + s.count('\r') - s.count('\r\n')
+
+
+class LineNumber(collections.namedtuple('LineNumber', ['start', 'end'])):
+    """
+    The range of physical lines occupied by a logical record in a DSV file.
+
+    `start` and `end` are 1-based line numbers in the source file. For records spanning a single
+    line `start == end`. The object unpacks as a `(start, end)` tuple; for backwards compatibility
+    it also compares equal to and converts to an `int` giving the last physical line of the
+    record, as plain line numbers did before.
+    """
+    __slots__ = ()
+
+    def __new__(cls, start: int, end: Optional[int] = None):
+        return super().__new__(cls, start, start if end is None else end)
+
+    @property
+    def start_lineno(self) -> int:
+        """Alias for `start`."""
+        return self.start
+
+    @property
+    def end_lineno(self) -> int:
+        """Alias for `end`."""
+        return self.end
+
+    def __str__(self):
+        return f'{self.start}' if self.start == self.end else f'{self.start}-{self.end}'
+
+    def __int__(self):
+        return self.end
+
+    def __index__(self):
+        return self.end
+
+    def __eq__(self, other):
+        if isinstance(other, int):
+            return other == self.end or other == self.start
+        return tuple.__eq__(self, other)
+
+    def __ne__(self, other):
+        res = self.__eq__(other)
+        return res if res is NotImplemented else not res
+
+    def __hash__(self):
+        return tuple.__hash__(self)
 
 
 class UnicodeWriter:  # pylint: disable=too-many-instance-attributes
@@ -180,6 +231,7 @@ class UnicodeReader:  # pylint: disable=too-many-instance-attributes
         self.newline = kw.pop('lineterminator', None)
         self.dialect = dialect if isinstance(dialect, Dialect) else None
         self.lineno = None
+        self._start_lineno = None
         self.reader = None
         if self.dialect:
             self.encoding = self.dialect.python_encoding
@@ -222,10 +274,11 @@ class UnicodeReader:  # pylint: disable=too-many-instance-attributes
 
     def _next_row(self):
         self.lineno += 1
+        self._start_lineno = self.lineno
         row = [
             s if isinstance(s, str) else s.decode(self._reader_encoding)
             for s in next(self.reader)]
-        self.lineno += sum(list(s).count('\n') for s in row)
+        self.lineno += sum(_count_lines(s) for s in row)
         return row
 
     def __next__(self):
@@ -256,16 +309,23 @@ class UnicodeReader:  # pylint: disable=too-many-instance-attributes
 
 class UnicodeReaderWithLineNumber(UnicodeReader):  # pylint: disable=too-few-public-methods
     """
-    A `UnicodeReader` yielding (lineno, row) pairs, where "lineno" is the 1-based number of the
-    the **text line** where the (possibly multi-line) row data starts in the DSV file.
+    A `UnicodeReader` yielding `(lineno, row)` pairs, where `lineno` is a :class:`LineNumber`:
+
+    - `lineno.start` is the 1-based number of the first **text line** occupied by the
+      (possibly multi-line) logical record in the DSV file.
+    - `lineno.end` is the 1-based number of the last text line occupied by the record.
+
+    For single-line records `start == end`. Blank lines and skipped rows are not renumbered,
+    i.e. the numbers always refer to physical lines of the source file.
     """
     def __next__(self):
         """
-        :return: a pair (1-based line number in the input, row)
+        :return: a pair (`LineNumber`, row)
         """
-        # Retrieve the row, thereby incrementing the line number:
+        # Retrieve the row. `self.lineno` points to the last physical line of the record
+        # after this call, `self._start_lineno` to the first one.
         row = super().__next__()
-        return self.lineno + 1, row
+        return LineNumber(self._start_lineno + 1, self.lineno + 1), row
 
 
 class UnicodeDictReader(UnicodeReader):

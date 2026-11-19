@@ -204,7 +204,22 @@ def test_UnicodeReaderWithLineNumber(tmp_path):
     p.write_text('col1,col2\n"a\n\nb",c')
     with UnicodeReaderWithLineNumber(p) as reader:
         linenos = [item[0] for item in reader]
+        # The first line is the header, the second record spans physical lines 2-4:
+        assert [(ln.start, ln.end) for ln in linenos] == [(1, 1), (2, 4)]
+        assert str(linenos[1]) == '2-4'
+        # Backwards compatibility: int() and comparisons use the last line as before.
+        assert int(linenos[1]) == 4
         assert linenos == [1, 4]
+
+
+def test_UnicodeReaderWithLineNumber_record_range_skips(tmp_path):
+    p = tmp_path / 'test.csv'
+    p.write_text('col1,col2\n\n"a\nb",c\n\n\nd,e\n')
+    dialect = Dialect(skipBlankRows=True)
+    with UnicodeReaderWithLineNumber(p, dialect=dialect) as reader:
+        # Skipped blank lines don't shift the numbering: ranges refer to physical lines.
+        ranges = [(item[0].start, item[0].end) for item in reader]
+        assert ranges == [(1, 1), (3, 4), (7, 7)]
 
 
 def test_UnicodeReader_R_encodings(tmp_path):

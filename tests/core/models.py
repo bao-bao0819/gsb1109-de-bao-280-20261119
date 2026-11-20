@@ -193,3 +193,19 @@ class UUIDBook(models.Model):
 class WithPositiveIntegerFields(models.Model):
     big = models.PositiveBigIntegerField(null=True)
     small = models.PositiveSmallIntegerField(null=True)
+
+
+class Supplier(models.Model):
+    """Vendor master data imported from CSV via both the admin and the
+    ``import`` management command.
+
+    ``order_no`` and ``store_no`` are both free-form identifiers, so swapped
+    columns still parse as legal values.  The resource maps the legacy
+    ``store_id`` header onto ``store_no`` as an alias.
+    """
+
+    order_no = models.CharField(max_length=32)
+    store_no = models.CharField(max_length=32)
+
+    def __str__(self):
+        return f"{self.order_no} / {self.store_no}"

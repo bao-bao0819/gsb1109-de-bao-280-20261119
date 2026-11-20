@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.core.exceptions import ValidationError
 
 from import_export.admin import (
     ExportActionModelAdmin,
@@ -9,7 +10,16 @@ from import_export.fields import Field
 from import_export.resources import ModelResource
 
 from .forms import CustomConfirmImportForm, CustomExportForm, CustomImportForm
-from .models import Author, Book, Category, Child, EBook, UUIDBook, UUIDCategory
+from .models import (
+    Author,
+    Book,
+    Category,
+    Child,
+    EBook,
+    Supplier,
+    UUIDBook,
+    UUIDCategory,
+)
 
 
 @admin.register(Child)
@@ -94,6 +104,77 @@ class AuthorAdmin(ImportExportModelAdmin, ExportActionModelAdmin, admin.ModelAdm
 class UUIDBookResource(ModelResource):
     class Meta:
         model = UUIDBook
+
+
+class SupplierResource(ModelResource):
+    """Resource for the supplier CSV regression tests.
+
+    The legacy ``store_id`` header is accepted as an alias of ``store_no``.
+    Alias normalisation and the duplicate/conflict checks run in
+    :meth:`before_import` against the raw :class:`tablib.Dataset`, because
+    that is the last point where the physical column positions are still
+    observable: afterwards each row is collapsed into an ``OrderedDict``
+    keyed by header name, so two columns mapping to the same field can no
+    longer be told apart.
+    """
+
+    #: historical header which is normalised onto the ``store_no`` column
+    store_no_alias = "store_id"
+
+    order_no = Field(attribute="order_no", column_name="order_no")
+    store_no = Field(attribute="store_no", column_name="store_no")
+
+    class Meta:
+        model = Supplier
+        fields = ("id", "order_no", "store_no")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        #: headers seen by the resource after alias normalisation, in file order
+        self.canonical_headers = []
+        #: every row handed to the resource during import
+        self.received_rows = []
+
+    def before_import(self, dataset, **kwargs):
+        raw_headers = list(dataset.headers or [])
+        canonical_headers = [
+            "store_no" if header == self.store_no_alias else header
+            for header in raw_headers
+        ]
+        self.canonical_headers = canonical_headers
+
+        # Two physical columns resolving to the same canonical header are
+        # ambiguous: this covers both an alias/canonical pair
+        # (store_id + store_no) and an exact raw duplicate (store_no twice).
+        first_position = {}
+        for position, canonical in enumerate(canonical_headers, start=1):
+            if canonical in first_position:
+                first = first_position[canonical]
+                raise ValidationError(
+                    "Ambiguous column mapping after alias normalisation: "
+                    "columns %d and %d (headers %r and %r) both resolve to %r"
+                    % (
+                        first,
+                        position,
+                        raw_headers[first - 1],
+                        raw_headers[position - 1],
+                        canonical,
+                    )
+                )
+            first_position[canonical] = position
+
+        if canonical_headers != raw_headers:
+            dataset.headers = canonical_headers
+        super().before_import(dataset, **kwargs)
+
+    def before_import_row(self, row, **kwargs):
+        self.received_rows.append(dict(row))
+        super().before_import_row(row, **kwargs)
+
+
+@admin.register(Supplier)
+class SupplierAdmin(ImportExportModelAdmin):
+    resource_classes = [SupplierResource]
 
 
 class EBookResource(ModelResource):

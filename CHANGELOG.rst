@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+6.10.2 (unreleased)
+*******************
+
+Bug fixes:
+
+- Serialize ``Date``, ``DateTime`` and ``Time`` field choices through the
+  field itself in ``field2choices``. Fields using a custom format (e.g.
+  ``Date(format="%d/%m/%Y")``) now expose their ``enum`` in the same wire
+  format Marshmallow actually (de)serializes, instead of the internal Python
+  value. Enums of non-temporal fields are unchanged.
+
 6.10.1 (2026-11-03)
 *******************
 

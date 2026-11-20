@@ -237,17 +237,26 @@ class FieldConverterMixin:
     ) -> dict:
         """Return the dictionary of OpenAPI field attributes for valid choices definition.
 
+        Temporal field choices are serialized with the field so that, for
+        instance, a :class:`marshmallow.fields.Date` with a custom ``format``
+        exposes its choices using the same wire format the field actually
+        (de)serializes instead of the internal Python value. Other fields keep
+        their choices untouched.
+
         :param Field field: A marshmallow field.
         :rtype: dict
         """
         attributes = {}
 
+        serialize_choice = self._make_choice_serializer(field)
+
         choices = []
         for validator in field.validators:
             if hasattr(validator, "choices"):
-                choices.append(OrderedSet(validator.choices))
+                serialized = (serialize_choice(v) for v in validator.choices)
+                choices.append(OrderedSet(serialized))
             elif hasattr(validator, "comparable"):
-                choices.append(OrderedSet([validator.comparable]))
+                choices.append(OrderedSet([serialize_choice(validator.comparable)]))
         if choices:
             attributes["enum"] = list(functools.reduce(operator.and_, choices))
 
@@ -257,6 +266,35 @@ class FieldConverterMixin:
                 attributes["enum"].append(None)
 
         return attributes
+
+    @staticmethod
+    def _make_choice_serializer(
+        field: marshmallow.fields.Field,
+    ) -> typing.Callable[[typing.Any], typing.Any]:
+        """Return a callable mapping a validator choice to its wire value.
+
+        Only temporal fields need conversion: their validators compare
+        internal Python objects (e.g. ``datetime.date``) while the JSON
+        contract uses the field's (possibly custom) string format. Every
+        other field type keeps its raw choices.
+        """
+        if isinstance(
+            field,
+            (
+                marshmallow.fields.Date,
+                marshmallow.fields.DateTime,
+                marshmallow.fields.Time,
+            ),
+        ):
+
+            def serialize_choice(value: typing.Any) -> typing.Any:
+                if value is None:
+                    return None
+                return field._serialize(value, None, None)
+
+            return serialize_choice
+
+        return lambda value: value
 
     def field2read_only(
         self, field: marshmallow.fields.Field, **kwargs: typing.Any

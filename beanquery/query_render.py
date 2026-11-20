@@ -7,6 +7,7 @@ import collections
 import csv
 import datetime
 import enum
+import json
 import typing
 
 from decimal import Decimal
@@ -15,6 +16,8 @@ from beancount.core import amount
 from beancount.core import display_context
 from beancount.core import inventory
 from beancount.core import position
+
+from . import serialize
 
 
 class Align(enum.Enum):
@@ -580,3 +583,26 @@ def render_csv(columns, rows, dcontext, file, expand=False, nullvalue='', **kwar
     writer = csv.writer(file)
     writer.writerow(headers)
     writer.writerows(render_rows(rows, renderers, ctx))
+
+
+def render_json(columns, rows, dcontext, file, **kwargs):
+    """Render the result of executing a query as a machine-readable document.
+
+    The output is a self-describing JSON document carrying the column
+    order, names and types together with every row encoded so that the
+    original values can be reconstructed without any display
+    formatting.  Exact decimals are emitted as strings and structured
+    values (amounts, costs, positions, inventories) retain their
+    components.  An empty result set still includes the complete
+    column description.
+
+    Args:
+      columns: A list of beanquery.Column describing the table columns.
+      rows: Data to render.
+      dcontext: A DisplayContext object. Unused, present for interface
+        consistency with the other renderers.
+      file: A file object to render the results to.
+    """
+    document = serialize.serialize_result(columns, rows)
+    json.dump(document, file, indent=2, sort_keys=False)
+    file.write('\n')

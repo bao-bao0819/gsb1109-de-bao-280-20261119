@@ -1,6 +1,16 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- A new ``json`` output format emits a machine-readable, self-describing
+  document intended for audit programs that need to read query results
+  back without guessing.  The document reports the column order, names
+  and types even when no row matches, encodes repeated column aliases
+  positionally, serializes exact decimals as strings without going
+  through floating point or display formatting, distinguishes the empty
+  string from missing values and from the absence of a position, and
+  keeps distinct cost lots of an inventory as separate structured
+  values.  The existing ``text`` and ``csv`` formats are unchanged.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

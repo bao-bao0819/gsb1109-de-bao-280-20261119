@@ -2,6 +2,7 @@ __copyright__ = "Copyright (C) 2014-2016  Martin Blais"
 __license__ = "GNU GPLv2"
 
 import functools
+import json
 import re
 import sys
 import textwrap
@@ -377,6 +378,29 @@ class TestShell(ClickTestCase):
             ---  ---
             111  222
         '''))
+
+    @test_utils.docfile
+    def test_format_json(self, filename):
+        """
+        """
+        r = self.main(filename, '--format=json', "SELECT 111 AS one, 222 AS two FROM #")
+        document = json.loads(r.stdout)
+        self.assertEqual(document['columns'], [
+            {'name': 'one', 'type': 'int', 'index': 0},
+            {'name': 'two', 'type': 'int', 'index': 1},
+        ])
+        self.assertEqual(document['rows'], [[111, 222]])
+
+    @test_utils.docfile
+    def test_format_json_empty_result(self, filename):
+        """
+        """
+        r = self.main(filename, '--format=json',
+                      "SELECT 1 AS one, 'a' AS two FROM # WHERE 1 = 0")
+        document = json.loads(r.stdout)
+        self.assertEqual(document['rows'], [])
+        self.assertEqual([c['name'] for c in document['columns']], ['one', 'two'])
+        self.assertEqual([c['type'] for c in document['columns']], ['int', 'str'])
 
 
 if __name__ == '__main__':

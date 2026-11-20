@@ -480,6 +480,62 @@ framework_response_data = response_encoder.encode(response_model)
 
 This avoids encoding JSON to text and parsing it again just to reach the typed conversion layer.
 
+## Streaming JSON Lines from byte chunks
+
+Daily JSON Lines dumps can contain millions of records, so reading the whole file is not an option. `JSONLStreamReader` wraps an ordinary `JSONDecoder` and accepts arbitrary byte chunks. A chunk may end in the middle of a multi-byte UTF-8 character or a CRLF ending — the fragment stays buffered until the next chunk completes it.
+
+```python
+from mashumaro.codecs.json import JSONDecoder
+from mashumaro.codecs.jsonl import (
+    JSONLRecord,
+    JSONLRejectedLine,
+    JSONLStreamReader,
+)
+
+decoder = JSONDecoder(Event)
+reader = JSONLStreamReader(decoder)
+
+while chunk := dump_file.read(1 << 20):
+    reader.feed(chunk)
+    for event in reader.events():
+        if isinstance(event, JSONLRecord):
+            handle(event.value)
+        else:
+            rerun_tool.reject(
+                line_number=event.line_number,
+                start=event.start,
+                end=event.end,
+                error_kind=event.error_kind,
+                raw=event.raw,
+            )
+
+reader.close()  # flush the final line even without a trailing newline
+for event in reader.events():
+    handle(event)
+```
+
+Every event carries the physical line number and an absolute byte span excluding the line ending, so keeping the original file is enough to seek back to a rejected line. The span covers the complete original line without borrowing bytes from the next line, which keeps parsing after it. `error_kind` is `"parse"` for invalid or incomplete JSON and `"model"` for valid JSON that the target type cannot unpack — the original exception is preserved on `error`. Empty and whitespace-only lines are skipped but still occupy a line number, matching line-by-line reading.
+
+For a plain chunk iterator, `stream_jsonl` drives the same reader:
+
+```python
+from mashumaro.codecs.jsonl import stream_jsonl
+
+events = stream_jsonl(read_chunks(), Event)
+```
+
+Cancellation must not rely on how many chunks were pulled, because a fetched chunk can hold undelivered lines. Resume from the byte position and line number reached by the last confirmed event instead:
+
+```python
+resume_reader = JSONLStreamReader(
+    decoder,
+    start_offset=reader.position,
+    start_line=reader.line_number,
+)
+```
+
+The replay can use different chunk sizes: line numbers, byte spans, and decoded objects stay identical, and a final record without a terminating newline is still delivered.
+
 ## Compatibility tests
 
 For a durable contract, test exact representations in both directions:

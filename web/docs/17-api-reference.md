@@ -136,6 +136,34 @@ JSONEncoder(
 )
 ```
 
+### Streaming JSON Lines
+
+```text
+from mashumaro.codecs.jsonl import (
+    JSONLRecord,
+    JSONLRejectedLine,
+    JSONLStreamReader,
+    stream_jsonl,
+)
+
+JSONLStreamReader(
+    decoder,
+    *,
+    start_offset=0,
+    start_line=0,
+)
+stream_jsonl(
+    chunks,
+    shape_type,
+    *,
+    default_dialect=None,
+    start_offset=0,
+    start_line=0,
+)
+```
+
+`JSONLStreamReader.feed(chunk)` buffers arbitrary byte chunks (splitting UTF-8 characters or CRLF endings is safe) and `.events()` yields a `JSONLRecord` or `JSONLRejectedLine` per completed line. Both carry `line_number`, `start`, and `end`; rejected lines additionally carry `error_kind` (`"parse"` or `"model"`), the original `error`, and the `raw` line bytes. `.position` and `.line_number` resume a cancelled run; `.close()` flushes a final line without a trailing newline.
+
 ### orjson
 
 ```text

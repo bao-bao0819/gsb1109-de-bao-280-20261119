@@ -2983,3 +2983,349 @@ async def test_create_table_respects_predeclared_table_level_denial():
     assert response.status_code == 403, response.json()
     assert response.json()["errors"] == ["Permission denied: need insert-row"]
     assert not await db.table_exists("planned_table")
+
+
+async def _row_version_token(ds, path, token=None):
+    headers = _headers(token) if token else None
+    response = await ds.client.get(
+        f"{path}.json?_extra=row_version", headers=headers
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["row_version"]
+
+
+async def test_row_version_extra_is_row_scoped_and_stable(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    path = f"/data/docs/{pk}"
+    first = await _row_version_token(ds_write, path, token)
+    # Re-reading the unchanged row hands back the same token
+    second = await _row_version_token(ds_write, path, token)
+    assert first == second
+    # The extra is not available on table-scope responses
+    response = await ds_write.client.get(
+        "/data/docs.json?_extra=row_version", headers=_headers(token)
+    )
+    assert response.status_code == 400
+    assert "Unknown _extra: row_version" in response.json()["errors"]
+
+
+async def test_two_reviewers_same_token_only_one_succeeds(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    path = f"/data/docs/{pk}/-/update"
+    shared_version = await _row_version_token(ds_write, f"/data/docs/{pk}", token)
+
+    # Two reviewers started from the same read, editing different columns
+    first = await ds_write.client.post(
+        path,
+        json={"update": {"title": "Reviewer one"}, "version": shared_version},
+        headers=_headers(token),
+    )
+    assert first.status_code == 200
+    second = await ds_write.client.post(
+        path,
+        json={"update": {"score": 9.9}, "version": shared_version},
+        headers=_headers(token),
+    )
+    # The loser gets a 409, not a data-format error
+    assert second.status_code == 409
+    body = second.json()
+    assert body["ok"] is False
+    assert body["status"] == 409
+    assert "version conflict" in body["error"]
+    # The conflict must not have touched any column
+    row = (
+        await ds_write.client.get(
+            f"/data/docs/{pk}.json?_shape=array", headers=_headers(token)
+        )
+    ).json()[0]
+    assert row["title"] == "Reviewer one"
+    assert row["score"] == 1.2
+
+    # A reviewer with read access can re-read and retry against the current version
+    refreshed = await _row_version_token(ds_write, f"/data/docs/{pk}", token)
+    retry = await ds_write.client.post(
+        path,
+        json={"update": {"score": 9.9}, "version": refreshed},
+        headers=_headers(token),
+    )
+    assert retry.status_code == 200
+    row = (
+        await ds_write.client.get(
+            f"/data/docs/{pk}.json?_shape=array", headers=_headers(token)
+        )
+    ).json()[0]
+    assert row["score"] == 9.9
+
+
+async def test_version_conflict_is_distinct_from_bad_token(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    path = f"/data/docs/{pk}/-/update"
+    good_version = await _row_version_token(ds_write, f"/data/docs/{pk}", token)
+    # Burn the good token so it becomes a valid-but-stale token
+    await ds_write.client.post(
+        path,
+        json={"update": {"title": "Changed"}, "version": good_version},
+        headers=_headers(token),
+    )
+
+    bad_inputs = (
+        (123, "version must be a string"),
+        ("not-a-real-token", "Invalid row version token signature"),
+    )
+    for bad_version, message in bad_inputs:
+        response = await ds_write.client.post(
+            path,
+            json={"update": {"title": "X"}, "version": bad_version},
+            headers=_headers(token),
+        )
+        assert response.status_code == 400
+        assert response.json()["errors"] == [message]
+
+    # A correctly signed token for a different row is a 400 input error too
+    other_pk = await _insert_row(ds_write)
+    other_version = await _row_version_token(
+        ds_write, f"/data/docs/{other_pk}", token
+    )
+    response = await ds_write.client.post(
+        path,
+        json={"update": {"title": "X"}, "version": other_version},
+        headers=_headers(token),
+    )
+    assert response.status_code == 400
+    assert "different row" in response.json()["error"]
+
+    # The stale but otherwise valid token is a 409 conflict
+    response = await ds_write.client.post(
+        path,
+        json={"update": {"title": "X"}, "version": good_version},
+        headers=_headers(token),
+    )
+    assert response.status_code == 409
+
+
+async def test_delete_and_recreate_invalidates_old_token_even_with_identical_data(
+    ds_write,
+):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    row_path = f"/data/docs/{pk}"
+    old_version = await _row_version_token(ds_write, row_path, token)
+    original = (
+        await ds_write.client.get(
+            f"{row_path}.json?_shape=array", headers=_headers(token)
+        )
+    ).json()[0]
+
+    # Delete and re-receive through the same interfaces with identical data
+    delete = await ds_write.client.post(
+        f"{row_path}/-/delete", headers=_headers(token)
+    )
+    assert delete.status_code == 200
+    recreate = await ds_write.client.post(
+        "/data/docs/-/insert",
+        json={"row": {key: original[key] for key in original}},
+        headers=_headers(token),
+    )
+    assert recreate.status_code == 201
+
+    # The fields read back identical, but the old token cannot update the new row
+    recreated = (
+        await ds_write.client.get(
+            f"{row_path}.json?_shape=array", headers=_headers(token)
+        )
+    ).json()[0]
+    assert recreated == original
+    stale = await ds_write.client.post(
+        f"{row_path}/-/update",
+        json={"update": {"title": "Should not land"}, "version": old_version},
+        headers=_headers(token),
+    )
+    assert stale.status_code == 409
+    untouched = (
+        await ds_write.client.get(
+            f"{row_path}.json?_shape=array", headers=_headers(token)
+        )
+    ).json()[0]
+    assert untouched == original
+
+    # The current token completes a correct update
+    current_version = await _row_version_token(ds_write, row_path, token)
+    ok = await ds_write.client.post(
+        f"{row_path}/-/update",
+        json={"update": {"title": "Lands"}, "version": current_version},
+        headers=_headers(token),
+    )
+    assert ok.status_code == 200
+
+
+async def test_version_check_is_opt_in(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    path = f"/data/docs/{pk}/-/update"
+    # No version key: the legacy flow works exactly as before
+    response = await ds_write.client.post(
+        path, json={"update": {"title": "Legacy"}}, headers=_headers(token)
+    )
+    assert response.status_code == 200
+    assert "version" not in response.json()
+    # An unknown top-level key is still rejected
+    response = await ds_write.client.post(
+        path,
+        json={"update": {"title": "X"}, "version_token": "x"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == ["Invalid keys: version_token"]
+
+
+async def test_successful_versioned_update_returns_new_token(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    path = f"/data/docs/{pk}/-/update"
+    version = await _row_version_token(ds_write, f"/data/docs/{pk}", token)
+    response = await ds_write.client.post(
+        path,
+        json={"update": {"title": "New"}, "version": version, "return": True},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rows"][0]["title"] == "New"
+    new_version = body["version"]
+    assert new_version != version
+    # The returned token is the current one and the old one now conflicts
+    assert await _row_version_token(ds_write, f"/data/docs/{pk}", token) == new_version
+    stale = await ds_write.client.post(
+        path,
+        json={"update": {"title": "X"}, "version": version},
+        headers=_headers(token),
+    )
+    assert stale.status_code == 409
+
+
+async def test_version_conflict_does_not_leak_data_to_write_only_actor(ds_write):
+    root = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    good_version = await _row_version_token(ds_write, f"/data/docs/{pk}", root)
+    # Make it stale using the privileged actor
+    await ds_write.client.post(
+        f"/data/docs/{pk}/-/update",
+        json={"update": {"title": "Secret"}, "version": good_version},
+        headers=_headers(root),
+    )
+
+    # This actor can update rows but cannot view the table
+    writer = write_token(ds_write, permissions=["ur"])
+    writer_headers = _headers(writer)
+    # The row itself is not readable
+    forbidden = await ds_write.client.get(
+        f"/data/docs/{pk}.json", headers=writer_headers
+    )
+    assert forbidden.status_code == 403
+    # The row version extra is not readable either
+    assert (
+        await ds_write.client.get(
+            f"/data/docs/{pk}.json?_extra=row_version", headers=writer_headers
+        )
+    ).status_code == 403
+
+    # A conflict response carries no field data, only the generic message
+    conflict = await ds_write.client.post(
+        f"/data/docs/{pk}/-/update",
+        json={"update": {"title": "X"}, "version": good_version},
+        headers=writer_headers,
+    )
+    assert conflict.status_code == 409
+    assert conflict.json() == {
+        "ok": False,
+        "error": "Row version conflict: the row has changed",
+        "errors": ["Row version conflict: the row has changed"],
+        "status": 409,
+    }
+    # A successful update still does not return the row or a token without
+    # view-table permission, even with return=true
+    fresh = await _row_version_token(ds_write, f"/data/docs/{pk}", root)
+    success = await ds_write.client.post(
+        f"/data/docs/{pk}/-/update",
+        json={"update": {"title": "Written"}, "version": fresh, "return": True},
+        headers=writer_headers,
+    )
+    assert success.status_code == 200
+    assert success.json() == {"ok": True}
+
+
+async def test_row_version_tracks_composite_primary_keys(ds_write):
+    token = write_token(ds_write)
+    create = await ds_write.client.post(
+        "/data/-/create",
+        json={
+            "table": "archive",
+            "row": {"source": "s", "event_no": 7, "note": "original"},
+            "pks": ["source", "event_no"],
+        },
+        headers=_headers(token),
+    )
+    assert create.status_code == 201
+    row_path = "/data/archive/s,7"
+    version = await _row_version_token(ds_write, row_path, token)
+    ok = await ds_write.client.post(
+        f"{row_path}/-/update",
+        json={"update": {"note": "edited"}, "version": version},
+        headers=_headers(token),
+    )
+    assert ok.status_code == 200
+    conflict = await ds_write.client.post(
+        f"{row_path}/-/update",
+        json={"update": {"note": "again"}, "version": version},
+        headers=_headers(token),
+    )
+    assert conflict.status_code == 409
+    row = (
+        await ds_write.client.get(
+            f"{row_path}.json?_shape=array", headers=_headers(token)
+        )
+    ).json()[0]
+    assert row["note"] == "edited"
+
+
+async def test_version_state_is_hidden_from_table_listings(ds_write):
+    token = write_token(ds_write)
+    pk = await _insert_row(ds_write)
+    await _row_version_token(ds_write, f"/data/docs/{pk}", token)
+    db = ds_write.get_database("data")
+    # The leading underscore marks it as a hidden internal table, excluded
+    # from the visible table catalog rather than shown as user data
+    hidden = await db.hidden_table_names()
+    assert "_datasette_row_versions" in hidden
+    visible = set(await db.table_names()) - set(hidden)
+    assert "_datasette_row_versions" not in visible
+
+
+async def test_row_version_extra_works_on_immutable_database(tmp_path):
+    db_path = tmp_path / "immutable_row_version.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("create table docs (id integer primary key, title text)")
+    conn.execute("insert into docs values (1, 'a')")
+    conn.commit()
+    conn.close()
+    ds = Datasette(immutables=[str(db_path)])
+    await ds.invoke_startup()
+    try:
+        first = await ds.client.get(
+            "/immutable_row_version/docs/1.json?_extra=row_version"
+        )
+        assert first.status_code == 200
+        # No writable version table is created, and tokens stay stable
+        second = await ds.client.get(
+            "/immutable_row_version/docs/1.json?_extra=row_version"
+        )
+        assert second.json()["row_version"] == first.json()["row_version"]
+        assert not await ds.get_database(
+            "immutable_row_version"
+        ).table_exists("_datasette_row_versions")
+    finally:
+        ds.close()
+

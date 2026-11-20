@@ -1192,6 +1192,15 @@ The following extras are available for row JSON responses.
           }
         ]
 
+``row_version``
+    Opaque signed token identifying this exact version of the row. Pass it back as the ``version`` key of a :ref:`row update <RowUpdateView>` to make the update conditional on the row not having changed. Re-reading an unchanged row returns the same token; any update, or a delete followed by re-creating the row with the same primary key, invalidates it. Requires view-table permission.
+
+    ``GET /fixtures/simple_primary_key/1.json?_extra=row_version``
+
+    .. code-block:: json
+
+        "eyJ0IjoxLCJrIjpbIjEiXX0.example"
+
 Query JSON responses
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -2128,6 +2137,51 @@ The returned JSON will look like this:
 Any errors will use the :ref:`standard error format <json_api_errors>`, with a ``400`` status code for a bad input or a ``403`` status code for an authentication or permission error.
 
 Pass ``"alter: true`` to automatically add any missing columns to the table. This requires the :ref:`actions_alter_table` permission.
+
+Optimistic concurrency with row versions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If several people may edit the same row, updates can be made conditional on the row not having changed since you read it. First read the row with the ``row_version`` extra to obtain an opaque version token:
+
+::
+
+    GET /<database>/<table>/<row-pks>.json?_extra=row_version
+
+.. code-block:: json
+
+    {
+        "row_version": "eyJ0IjoidGVzdCIsImsiOlsiMSJdLCJ2IjoxfQ..."
+    }
+
+Then pass that token back as the ``version`` key of the update request:
+
+.. code-block:: json
+
+    {
+        "update": {
+            "title": "New title"
+        },
+        "version": "eyJ0IjoidGVzdCIsImsiOlsiMSJdLCJ2IjoxfQ..."
+    }
+
+The update only succeeds if the row stored under that primary key is still at the version the token was issued for. If another update landed in the meantime, the response is a ``409`` conflict and none of the requested fields are changed:
+
+.. code-block:: json
+
+    {
+        "ok": false,
+        "error": "Row version conflict: the row has changed",
+        "errors": [
+            "Row version conflict: the row has changed"
+        ],
+        "status": 409
+    }
+
+The version check is opt-in: a request without a ``version`` key follows the original unconditional update flow. A token that is malformed, has a bad signature, or was issued for a different table or row is instead a ``400`` input error, so clients can distinguish a data-format mistake from a genuine concurrent modification.
+
+A token identifies one particular version of a row, not just its visible values. If the row is deleted and another row is received with the same primary key and identical column values, the old token still fails with a ``409`` because the new row is a fresh version. Re-read the row to obtain a current token and retry the correction.
+
+When ``"return": true`` is used together with a ``version``, the response includes the new ``version`` token for the updated row, ready for the next conditional update. The ``row_version`` extra and the returned token are only available to actors that can view the table; the conflict response itself never contains field data, so an actor with update-row but not view-table permission cannot use it to read a row they cannot otherwise see.
 
 .. _RowDeleteView:
 

@@ -19,6 +19,10 @@ from datasette.column_types import SQLiteType
 from datasette.database import QueryInterrupted
 from datasette.events import AlterTableEvent, CreateTableEvent, InsertRowsEvent
 from datasette.resources import DatabaseResource, TableResource
+from datasette.row_versions import (
+    clear_table_row_versions,
+    record_row_version,
+)
 from datasette.utils import (
     WriteJsonValueError,
     decode_write_json_rows,
@@ -931,9 +935,59 @@ class TableCreateView(BaseView):
             db_for_write = sqlite_utils.Database(conn)
             table = db_for_write[table_name]
             if rows:
+                pk_columns = pks or ([pk] if pk else [])
+                existing_rowids = set()
+                if table.exists():
+                    existing_rowids = {
+                        row[0]
+                        for row in conn.execute(
+                            "select rowid from {}".format(escape_sqlite(table_name))
+                        )
+                    }
                 table.insert_all(
                     rows, pk=pks or pk, ignore=ignore, replace=replace, alter=alter
                 )
+                new_rowids = [
+                    row[0]
+                    for row in conn.execute(
+                        "select rowid from {}".format(escape_sqlite(table_name))
+                    )
+                    if row[0] not in existing_rowids
+                ]
+                affected_pk_values = []
+                if pk_columns:
+                    # Read the (possibly auto-generated) primary key values
+                    # back from the newly inserted rows.
+                    pk_select = ", ".join(
+                        escape_sqlite(column) for column in pk_columns
+                    )
+                    placeholders = ", ".join("?" for _ in new_rowids)
+                    pk_rows = conn.execute(
+                        "select {} from {} where rowid in ({})".format(
+                            pk_select, escape_sqlite(table_name), placeholders
+                        ),
+                        new_rowids,
+                    ).fetchall()
+                    affected_pk_values.extend(list(pk_row) for pk_row in pk_rows)
+                    # replace can overwrite an existing row while keeping its
+                    # rowid; bump explicitly-keyed input rows too. ignore
+                    # instead leaves conflicting rows untouched.
+                    if replace:
+                        affected_pk_values.extend(
+                            [row[column] for column in pk_columns]
+                            for row in rows
+                            if all(column in row for column in pk_columns)
+                        )
+                else:
+                    # No explicit primary key: version rows are keyed by rowid.
+                    affected_pk_values.extend([rowid] for rowid in new_rowids)
+                seen = set()
+                for pk_values in affected_pk_values:
+                    key = tuple(pk_values)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    record_row_version(conn, table_name, pk_values)
             else:
                 not_null = [column.name for column in columns if column.not_null]
                 defaults = {}
@@ -1365,11 +1419,20 @@ class TableAlterView(BaseView):
                         )
                         current_table_name = rename_table_to
 
-                return current_table_name, _table_schema_from_conn(
-                    operation_conn, current_table_name
+                return (
+                    current_table_name,
+                    _table_schema_from_conn(
+                        operation_conn, current_table_name
+                    ),
+                    should_transform,
                 )
 
-            after_table_name, after_schema = apply_operations(conn)
+            after_table_name, after_schema, did_transform = apply_operations(conn)
+            # A transform rebuilds the table and a rename changes the name
+            # tokens are scoped to; in both cases outstanding tokens must
+            # fail rather than silently match the rebuilt rows.
+            if did_transform or after_table_name != table_name:
+                clear_table_row_versions(conn, table_name)
             return before_schema, after_schema, after_table_name
 
         try:

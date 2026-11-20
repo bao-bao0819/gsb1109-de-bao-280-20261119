@@ -13,6 +13,14 @@ from datasette.events import DeleteRowEvent, UpdateRowEvent
 from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.plugins import pm
 from datasette.resources import TableResource
+from datasette.row_versions import (
+    RowVersionConflict,
+    RowVersionTokenInvalid,
+    check_row_version,
+    decode_row_version,
+    issue_row_version,
+    record_row_version,
+)
 from datasette.utils import (
     CustomJSONEncoder,
     CustomRow,
@@ -776,6 +784,12 @@ class RowDeleteView(BaseView):
         def delete_row(conn):
             check_structured_write_table(conn, resolved.table)
             sqlite_utils.Database(conn)[resolved.table].delete(resolved.pk_values)
+            # Intentionally keep the version row: the version number for a
+            # (table, primary key) pair is monotonically increasing for its
+            # whole lifetime, including delete/re-create cycles. When the key
+            # is re-inserted record_row_version() increments the old number,
+            # so a token issued to the deleted row cannot match the new one
+            # even when every visible column value is identical.
 
         try:
             await resolved.db.execute_write_fn(delete_row, request=request)
@@ -829,7 +843,7 @@ class RowUpdateView(BaseView):
         if "update" not in data or not isinstance(data["update"], dict):
             return Response.error(["JSON must contain an update dictionary"])
 
-        invalid_keys = set(data.keys()) - {"update", "return", "alter"}
+        invalid_keys = set(data.keys()) - {"update", "return", "alter", "version"}
         if invalid_keys:
             return Response.error(["Invalid keys: {}".format(", ".join(invalid_keys))])
 
@@ -848,6 +862,21 @@ class RowUpdateView(BaseView):
         if ct_errors:
             return Response.error(ct_errors, 400)
 
+        # The version check is opt-in: it only runs when a token is supplied.
+        # A malformed or mismatched token is a 400 input error, distinct from
+        # a 409 conflict where the token was valid but the row moved on.
+        expected_version = None
+        version_token = data.get("version")
+        if version_token is not None:
+            if not isinstance(version_token, str):
+                return Response.error(["version must be a string"], 400)
+            try:
+                expected_version = decode_row_version(
+                    self.ds, resolved.table, resolved.pk_values, version_token
+                )
+            except RowVersionTokenInvalid as e:
+                return Response.error([str(e)], 400)
+
         alter = data.get("alter")
         if alter and not await self.ds.allowed(
             action="alter-table",
@@ -858,31 +887,51 @@ class RowUpdateView(BaseView):
 
         def update_row(conn):
             check_structured_write_table(conn, resolved.table)
+            if expected_version is not None:
+                check_row_version(
+                    conn, resolved.table, resolved.pk_values, expected_version
+                )
             sqlite_utils.Database(conn)[resolved.table].update(
                 resolved.pk_values, update, alter=alter
             )
+            # Bump the stored version on every update so tokens issued before
+            # any concurrent write cannot be replayed against the new row.
+            return record_row_version(conn, resolved.table, resolved.pk_values)
 
         try:
-            await resolved.db.execute_write_fn(update_row, request=request)
+            new_version = await resolved.db.execute_write_fn(
+                update_row, request=request
+            )
+        except RowVersionConflict as e:
+            # No field data is disclosed: the actor already knows the table
+            # and primary key from the request they were allowed to make.
+            return Response.error([str(e)], 409)
         except Exception as e:  # noqa: BLE001
             # TODO: narrow to expected write errors so Datasette bugs surface as 500s
             return Response.error([str(e)], 400)
 
         result = {"ok": True}
         returned_row = None
-        # Only read back and disclose the stored row if the actor is also
-        # allowed to view this table - update-row alone must not be usable
-        # to read data the actor cannot otherwise see.
-        if data.get("return") and await self.ds.allowed(
+        can_view = await self.ds.allowed(
             action="view-table",
             resource=TableResource(database=resolved.db.name, table=resolved.table),
             actor=request.actor,
-        ):
+        )
+        # Only read back and disclose the stored row if the actor is also
+        # allowed to view this table - update-row alone must not be usable
+        # to read data the actor cannot otherwise see.
+        if data.get("return") and can_view:
             results = await resolved.db.execute(
                 resolved.sql, resolved.params, truncate=True
             )
             returned_row = results.dicts()[0]
             result["rows"] = [returned_row]
+            if version_token is not None:
+                # Only surface the next token when the caller opted into the
+                # version flow, so plain update responses keep their old shape.
+                result["version"] = issue_row_version(
+                    self.ds, resolved.table, resolved.pk_values, new_version
+                )
 
         await self.ds.track_event(
             UpdateRowEvent(

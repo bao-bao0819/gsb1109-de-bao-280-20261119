@@ -25,6 +25,7 @@ from datasette.filters import Filters
 from datasette.plugins import pm
 from datasette.renderer import apply_column_type_transforms
 from datasette.resources import DatabaseResource, TableResource
+from datasette.row_versions import clear_table_row_versions, record_row_version
 from datasette.utils import (
     CustomJSONEncoder,
     CustomRow,
@@ -1244,11 +1245,51 @@ class TableInsertView(BaseView):
             else:
                 # Insert
                 kwargs = {"ignore": ignore, "replace": replace, "alter": alter}
+
+            is_rowid_table = pks == ["rowid"]
+
+            def rowids_in_table():
+                return [
+                    row[0]
+                    for row in conn.execute(
+                        "select rowid from {}".format(escape_sqlite(table_name))
+                    )
+                ]
+
+            def pk_values_for_rowid(rowid):
+                if is_rowid_table:
+                    return (rowid,)
+                pk_columns = ", ".join(escape_sqlite(pk) for pk in pks)
+                row = conn.execute(
+                    "select {} from {} where rowid = ?".format(
+                        pk_columns, escape_sqlite(table_name)
+                    ),
+                    [rowid],
+                ).fetchone()
+                return tuple(row) if row is not None else None
+
+            def bump_versions(affected_pk_values):
+                # De-duplicate so a row reached through two paths (e.g. an
+                # explicit-key insert whose rowid is also new) is bumped once.
+                seen = set()
+                for pk_values in affected_pk_values:
+                    if pk_values is None or pk_values in seen:
+                        continue
+                    seen.add(pk_values)
+                    record_row_version(conn, table_name, list(pk_values))
+
             if should_return and not upsert:
+                before_rowids = set(rowids_in_table())
                 rowids = []
                 method = table.upsert if upsert else table.insert
                 for row in rows:
                     rowids.append(method(row, **kwargs).last_rowid)
+                affected = [
+                    pk_values_for_rowid(rowid)
+                    for rowid in rowids
+                    if not ignore or rowid not in before_rowids
+                ]
+                bump_versions(affected)
                 return list(
                     table.rows_where(
                         "rowid in ({})".format(",".join("?" for _ in rowids)),
@@ -1257,7 +1298,31 @@ class TableInsertView(BaseView):
                 )
             else:
                 method_all = table.upsert_all if upsert else table.insert_all
-                method_all(rows, **kwargs)
+                if upsert:
+                    # Upsert requires explicit primary key values on every
+                    # input row, and each one is inserted or overwritten.
+                    method_all(rows, **kwargs)
+                    bump_versions(tuple(row[pk] for pk in pks) for row in rows)
+                else:
+                    before_rowids = set(rowids_in_table())
+                    method_all(rows, **kwargs)
+                    after_rowids = rowids_in_table()
+                    # New rowids always correspond to newly written rows.
+                    affected = [
+                        pk_values_for_rowid(rowid)
+                        for rowid in after_rowids
+                        if rowid not in before_rowids
+                    ]
+                    if replace:
+                        # replace can overwrite an existing row while keeping
+                        # its rowid; bump any explicitly-keyed input row too.
+                        # ignore instead leaves conflicting rows untouched.
+                        affected.extend(
+                            tuple(row[pk] for pk in pks)
+                            for row in rows
+                            if all(pk in row for pk in pks)
+                        )
+                    bump_versions(affected)
 
         try:
             rows = await db.execute_write_fn(insert_or_upsert_rows, request=request)
@@ -1519,6 +1584,9 @@ class TableDropView(BaseView):
             table = sqlite_utils.Database(conn)[table_name]
             table.disable_fts()
             table.drop()
+            # Version tokens reference this table by name, so they become
+            # meaningless once it is gone.
+            clear_table_row_versions(conn, table_name)
 
         await db.execute_write_fn(drop_table, request=request)
         await self.ds.track_event(

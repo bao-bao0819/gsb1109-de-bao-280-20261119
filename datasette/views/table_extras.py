@@ -1204,6 +1204,29 @@ class ExpandedColumnsExtra(Extra):
         return list(context.expanded_columns)
 
 
+class RowVersionExtra(Extra):
+    description = (
+        "Opaque signed token identifying this exact version of the row. "
+        "Pass it back as the ``version`` key of a row update to make the "
+        "update fail with a 409 conflict if the row was changed (or deleted "
+        "and re-created with the same primary key) after the token was issued."
+    )
+    example = ExtraExample(
+        "/fixtures/simple_primary_key/1.json?_extra=row_version"
+    )
+    scopes: ClassVar[set[ExtraScope]] = {ExtraScope.ROW}
+
+    async def resolve(self, context):
+        from datasette.row_versions import get_row_version_token
+
+        return await get_row_version_token(
+            context.datasette,
+            context.db,
+            context.table_name,
+            context.pk_values,
+        )
+
+
 class ForeignKeyTablesExtra(Extra):
     description = "List of tables that link to this row using foreign keys. Each item includes the foreign key fields plus ``count`` for matching rows and ``link`` for the filtered table URL."
     example = ExtraExample(
@@ -1356,6 +1379,7 @@ TABLE_EXTRA_CLASSES = [
     ExpandableColumnsExtra,
     ExpandedColumnsExtra,
     ForeignKeyTablesExtra,
+    RowVersionExtra,
     FormHiddenArgsExtra,
 ]
 

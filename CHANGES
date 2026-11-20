@@ -2,6 +2,13 @@ Changelog
 =========
 
 
+Version 4.3.0
+-------------
+
+- Added optional per-item expansion of `valueUrl` for list-valued columns in `CSVW.to_json`
+  (via `per_item=True`).
+
+
 Version 4.2.0
 -------------
 

@@ -21,7 +21,7 @@ from .utils import is_url
 if TYPE_CHECKING:
     from .metadata import Table, Column  # pragma: no cover
 
-__all__ = ['group_triples', 'to_json', 'Triple', 'format_value']
+__all__ = ['group_triples', 'to_json', 'Triple', 'format_value', 'expand_value_url']
 
 
 def format_value(value: Any, col: 'Column') -> str:  # pylint: disable=R0911
@@ -57,6 +57,37 @@ def format_value(value: Any, col: 'Column') -> str:  # pylint: disable=R0911
     return value
 
 
+def expand_value_url(  # pylint: disable=R0913,R0917
+        table: 'Table',
+        value_url,
+        row: collections.OrderedDict[str, Any],
+        val: Any,
+        rownum: int,
+        name: str = None,
+        per_item: bool = False,
+        qname: bool = False,
+) -> Any:
+    """
+    Expand a `valueUrl` template for a cell value.
+
+    If `per_item` is true and `val` is a list (i.e. the column is list-valued), the template is
+    expanded once per non-null item, with the variable for the column bound to that item. All
+    other variables are taken from `row`, and each result is resolved against the table's base.
+    """
+    if per_item and isinstance(val, list):
+        res = []
+        for item in val:
+            if item is None or item == '':
+                continue
+            item_row = collections.OrderedDict(row)
+            if name is not None:
+                item_row[name] = item
+            res.append(
+                table.expand(value_url, item_row, _row=rownum, _name=name, qname=qname))
+        return res
+    return table.expand(value_url, row, _row=rownum, _name=name, qname=qname)
+
+
 @dataclasses.dataclass
 class Triple:
     """
@@ -82,9 +113,13 @@ class Triple:
             prop: str,
             val: Any,
             rownum: int,
-    ) -> 'Triple':
+            per_item: bool = False,
+    ) -> Union['Triple', list['Triple']]:
         """
         Instantiate a triple from the data (and metadata) of a column value.
+
+        If `per_item` is true and the column is list-valued, a list of triples - one per
+        non-null value - is returned.
         """
         _name = col.header if col else None
 
@@ -95,14 +130,28 @@ class Triple:
 
         is_type = prop == 'rdf:type'
         valueUrl = col.valueUrl if col else table.inherit('valueUrl')  # pylint: disable=C0103
-        if valueUrl:
-            val = table.expand(valueUrl, row, _row=rownum, _name=_name, qname=is_type)
-        val = format_value(val, col)
         s = None
         aboutUrl = col.aboutUrl if col else None  # pylint: disable=invalid-name
         if aboutUrl:
             s = table.expand(aboutUrl, row, _row=rownum, _name=_name) or s
-        return cls(about=s, property=prop, value=val)
+
+        if valueUrl:
+            # The variable used for the current cell in a URI template is the column's header.
+            vals = expand_value_url(
+                table,
+                valueUrl,
+                row,
+                val,
+                rownum,
+                name=_name or (prop if not col else None),
+                per_item=per_item,
+                qname=is_type,
+            )
+            if isinstance(vals, list):
+                return [
+                    cls(about=s, property=prop, value=format_value(v, col)) for v in vals]
+            return cls(about=s, property=prop, value=format_value(vals, col))
+        return cls(about=s, property=prop, value=format_value(val, col))
 
 
 def frame(data: list[dict]) -> list:

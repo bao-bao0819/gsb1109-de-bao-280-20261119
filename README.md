@@ -169,6 +169,15 @@ print(json.dumps(data.to_json(minimal=True), indent=4))
 ]
 ```
 
+By default, `valueUrl` templates are expanded once per cell, passing list-valued cells as a
+whole. Passing `per_item=True` (either to `CSVW.to_json` or when creating the `CSVW` instance)
+expands the template once per non-null item of a list-valued column instead, so that each item
+becomes a separate link:
+
+```python
+data = CSVW('items.csv-metadata.json', per_item=True)
+```
+
 
 ## Known limitations
 

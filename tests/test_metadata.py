@@ -908,3 +908,104 @@ def test_CSVW():
     assert res.to_json()
     res = csvw.CSVW(FIXTURES / 'csv.txt-table-metadata.json')
     assert res.to_json()
+
+
+def _per_item_table(tmp_path, tags, name='P01', data_dir='data'):
+    """Write a table with a list-valued `Tags` column and a `valueUrl` for it."""
+    md_dir = tmp_path / data_dir
+    md_dir.mkdir(exist_ok=True)
+    md_dir.joinpath('items.csv').write_text(
+        f'ID,Tags,Name\n{name},{tags},the name\n', encoding='utf8')
+    md_dir.joinpath('items.csv-metadata.json').write_text(json.dumps({
+        '@context': 'http://www.w3.org/ns/csvw',
+        'url': 'items.csv',
+        'tableSchema': {
+            'aboutUrl': 'http://example.org/items/{ID}',
+            'propertyUrl': 'http://example.org/prop/{_name}',
+            'columns': [
+                {'name': 'ID', 'datatype': 'string'},
+                {
+                    'name': 'Tags',
+                    'separator': ';',
+                    'datatype': 'string',
+                    'valueUrl': 'http://example.org/resource/{ID}/tags/{Tags}',
+                },
+                {'name': 'Name', 'datatype': 'string'},
+            ],
+        },
+    }), encoding='utf8')
+    return csvw.CSVW(str(md_dir / 'items.csv-metadata.json'))
+
+
+def test_per_item_value_url(tmp_path):
+    # The empty item must be skipped, all other items expanded separately:
+    ds = _per_item_table(tmp_path, 'a/b;;a b;a%2Fb')
+    row = ds.to_json(per_item=True)['tables'][0]['row'][0]['describes'][0]
+    assert row['@id'] == 'http://example.org/items/P01'
+    assert row['http://example.org/prop/Tags'] == [
+        'http://example.org/resource/P01/tags/a%2Fb',
+        'http://example.org/resource/P01/tags/a%20b',
+        'http://example.org/resource/P01/tags/a%252Fb',
+    ]
+    # Other columns remain scalar:
+    assert row['http://example.org/prop/ID'] == 'P01'
+    assert row['http://example.org/prop/Name'] == 'the name'
+    # The flattened output used by downstream programs has the same link list:
+    items = ds.to_json(minimal=True, per_item=True)
+    assert items[0]['http://example.org/prop/Tags'] == row['http://example.org/prop/Tags']
+
+
+@pytest.mark.parametrize('tags', ['', ';', ';;'])
+def test_per_item_value_url_no_tags(tmp_path, tags):
+    ds = _per_item_table(tmp_path, tags)
+    for row in [ds.to_json(per_item=True)['tables'][0]['row'][0]['describes'][0]] + \
+            ds.to_json(minimal=True, per_item=True):
+        assert 'http://example.org/prop/Tags' not in row
+
+
+def test_per_item_value_url_relative_base(tmp_path):
+    from csvw.jsonld import Triple
+
+    tmp_path.joinpath('items.csv-metadata.json').write_text(json.dumps({
+        '@context': 'http://www.w3.org/ns/csvw',
+        'url': 'items.csv',
+        'tableSchema': {
+            'columns': [
+                {'name': 'ID'},
+                {
+                    'name': 'Tags',
+                    'separator': ';',
+                    'valueUrl': 'tags/{ID}/{Tags}',
+                },
+            ],
+        },
+    }), encoding='utf8')
+    table = csvw.Table.from_file(tmp_path / 'items.csv-metadata.json')
+    col = table.tableSchema.columns[1]
+    row = collections.OrderedDict(ID='P01', Tags=['a/b', None, 'a b', 'a%2Fb'])
+    triples = Triple.from_col(table, col, row, 'Tags', row['Tags'], 1, per_item=True)
+    assert [t.value for t in triples] == [
+        str(tmp_path / 'tags' / 'P01' / 'a%2Fb'),
+        str(tmp_path / 'tags' / 'P01' / 'a%20b'),
+        str(tmp_path / 'tags' / 'P01' / 'a%252Fb'),
+    ]
+    assert all(t.about is None for t in triples)
+
+
+def test_per_item_value_url_default(tmp_path):
+    # Without the option, the whole list is expanded once - including the "None" placeholder:
+    ds = _per_item_table(tmp_path, 'a;b')
+    row = ds.to_json()['tables'][0]['row'][0]['describes'][0]
+    assert row['http://example.org/prop/Tags'] == \
+        'http://example.org/resource/P01/tags/a,b'
+
+    # The option can also be set for the CSVW instance:
+    assert _per_item_table(tmp_path, 'a;b').to_json(per_item_urls=True)['tables'][0][
+        'row'][0]['describes'][0]['http://example.org/prop/Tags'] == [
+            'http://example.org/resource/P01/tags/a',
+            'http://example.org/resource/P01/tags/b']
+    assert csvw.CSVW(
+        str(tmp_path / 'data' / 'items.csv-metadata.json'), per_item=True
+    ).to_json()['tables'][0]['row'][0]['describes'][0]['http://example.org/prop/Tags'] == [
+        'http://example.org/resource/P01/tags/a',
+        'http://example.org/resource/P01/tags/b']

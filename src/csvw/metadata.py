@@ -1514,9 +1514,14 @@ class CSVW:
             md_url: Optional[str] = None,
             validate: bool = False,
             strict: bool = True,
+            per_item: bool = False,
+            per_item_urls: Optional[bool] = None,
     ):
         self.warnings = []
         self._strict = strict
+        # Whether `valueUrl` templates of list-valued columns should be expanded per item by
+        # default. `per_item_urls` is accepted as a more explicit alias.
+        self.per_item = per_item if per_item_urls is None else per_item_urls
         w = None
         with contextlib.ExitStack() as stack:
             if validate:
@@ -1659,24 +1664,42 @@ class CSVW:
             res['url'] = p.name
         return res, no_header
 
-    def to_json(self, minimal=False):
+    def to_json(
+            self,
+            minimal=False,
+            per_item: Optional[bool] = None,
+            per_item_urls: Optional[bool] = None,
+    ):
         """
         Implements algorithm described in `<https://w3c.github.io/csvw/csv2json/#standard-mode>`_
+
+        :param minimal: If `True`, only the row objects are returned, rather than the full \
+        JSON-LD structure.
+        :param per_item: If `True`, a `valueUrl` of a list-valued column is expanded once per \
+        non-null item, resulting in one link per item. By default, a list is expanded as a \
+        whole, as in CSVW's URI template expansion. Defaults to the value set when initializing \
+        the `CSVW` instance.
+        :param per_item_urls: Alias for `per_item`.
         """
+        if per_item_urls is not None:
+            per_item = per_item_urls
+        if per_item is None:
+            per_item = self.per_item
         res = collections.OrderedDict()
         # Insert any notes and non-core annotations specified for the group of tables into object
         # G according to the rules provided in § 5. JSON-LD to JSON.
         if self.t.common_props and not isinstance(self.t, Table):
             res.update(jsonld.to_json(self.t.common_props, flatten_list=True))
         res['tables'] = [
-            self._table_to_json(table) for table in self.tables if not table.suppressOutput]
+            self._table_to_json(table, per_item=per_item)
+            for table in self.tables if not table.suppressOutput]
         if minimal:
             return list(
                 itertools.chain(*[[r['describes'][0] for r in t['row']] for t in res['tables']]))
 
         return res
 
-    def _table_to_json(self, table):
+    def _table_to_json(self, table, per_item=False):
         res = collections.OrderedDict()
         # FIXME: id  pylint: disable=W0511
         res['url'] = str(table.url.resolve(table.base))
@@ -1694,7 +1717,7 @@ class CSVW:
             col.valueUrl = col.inherit('valueUrl')
 
         row = [
-            self._row_to_json(table, cols, row, rownum, rowsourcenum)
+            self._row_to_json(table, cols, row, rownum, rowsourcenum, per_item=per_item)
             for rownum, (_, rowsourcenum, row) in enumerate(
                 table.iterdicts(with_metadata=True, strict=False), start=1)
         ]
@@ -1703,7 +1726,8 @@ class CSVW:
         res['row'] = row
         return res
 
-    def _row_to_json(self, table, cols, row, rownum, rowsourcenum):  # pylint: disable=R0913,R0917
+    def _row_to_json(  # pylint: disable=R0913,R0917
+            self, table, cols, row, rownum, rowsourcenum, per_item=False):
         res = collections.OrderedDict()
         res['url'] = f'{table.url.resolve(table.base)}#row={rowsourcenum}'
         res['rownum'] = rownum
@@ -1715,10 +1739,10 @@ class CSVW:
         # Insert any notes and non-core annotations specified for the group of tables into object
         # G according to the rules provided in § 5. JSON-LD to JSON.
 
-        res['describes'] = self._describes(table, cols, row, rownum)
+        res['describes'] = self._describes(table, cols, row, rownum, per_item=per_item)
         return res
 
-    def _describes(self, table, cols, row, rownum):
+    def _describes(self, table, cols, row, rownum, per_item=False):
         triples = []
 
         aboutUrl = table.tableSchema.inherit('aboutUrl')  # pylint: disable=invalid-name
@@ -1736,15 +1760,25 @@ class CSVW:
             if any([null and v in null, v == "", v is None, col and col.separator and v == []]):
                 continue
 
-            triples.append(jsonld.Triple.from_col(
+            triple = jsonld.Triple.from_col(
                 table,
                 col,
                 row,
                 f'_col.{i}' if (not table.tableSchema.columns and not self.no_metadata) else k,
                 v,
-                rownum))
+                rownum,
+                per_item=per_item)
+            if isinstance(triple, list):
+                triples.extend(triple)
+            else:
+                triples.append(triple)
 
         for col in table.tableSchema.columns:
             if col.virtual:
-                triples.append(jsonld.Triple.from_col(table, col, row, col.header, None, rownum))
+                triple = jsonld.Triple.from_col(
+                    table, col, row, col.header, None, rownum, per_item=per_item)
+                if isinstance(triple, list):
+                    triples.extend(triple)
+                else:
+                    triples.append(triple)
         return jsonld.group_triples(triples)

@@ -179,6 +179,29 @@ Importing again the same file results in entries marked as duplicates:
   ;   Assets:Tests  2 TESTS
 
 
+Merging
+-------
+
+Entries extracted from all the documents can be printed as a single
+stream ordered by date instead of being grouped by source document.
+Each entry is preceded by a comment recording the document and line
+it was extracted from:
+
+  >>> r = run('extract', '--merge', downloads, '-o', output)
+  >>> r.exit_code
+  0
+  >>> print(pathlib.Path(output).read_text())
+  ;; -*- mode: beancount -*-
+  <BLANKLINE>
+  ; source: .../downloads/one.beans:2
+  2023-01-01 * "Test"
+    Assets:Tests  2 TESTS
+  ; duplicate of .../downloads/one.beans:2
+  ; source: .../downloads/two.beans:2
+  ; 2023-01-01 * "Test"
+  ;   Assets:Tests  2 TESTS
+
+
 Cleanup
 -------
 

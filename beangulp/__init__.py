@@ -69,6 +69,13 @@ def _walk(file_or_dirs, log):
     help="Existing Beancount ledger for de-duplication.",
 )
 @click.option("--reverse", "-r", is_flag=True, help="Sort entries in reverse order.")
+@click.option(
+    "--merge",
+    "-m",
+    is_flag=True,
+    help="Merge entries from all documents in a single stream ordered by date "
+    "instead of grouping them by source document.",
+)
 @click.option("--failfast", "-x", is_flag=True, help="Stop processing at the first error.")
 @click.option("--quiet", "-q", count=True, help="Suppress all output.")
 @click.pass_obj
@@ -78,6 +85,7 @@ def _extract(
     output: io.TextIOBase,
     existing: Optional[str],
     reverse: bool,
+    merge: bool,
     failfast: bool,
     quiet: bool,
 ):
@@ -131,7 +139,13 @@ def _extract(
         extracted = func(extracted, existing_entries)
 
     # Serialize entries.
-    extract.print_extracted_entries(extracted, output)
+    if merge:
+        conflicts = extract.print_merged_entries(extracted, output)
+        if conflicts:
+            log("# Errors: conflicting ordering relations.")
+            sys.exit(1)
+    else:
+        extract.print_extracted_entries(extracted, output)
 
     if errors:
         sys.exit(1)

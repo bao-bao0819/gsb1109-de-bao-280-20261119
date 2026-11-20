@@ -12,18 +12,21 @@ Usage:
           text = simple_cache.convert(file_path, slow_pdf2txt_converter)
           ...
 
-  If the call has been made before and the file hasn't changed nor the function
-  definition, you will get the result of the conversion from a file that was
-  pickled on the first call.
+  If the call has been made before and the file contents haven't
+  changed nor the function code or configuration, you will get the
+  result of the conversion from a file that was pickled on the first
+  call.
 
-- The cache will be automatically cleaned up periodically. We leave a sentinel
-  file for cleaning and if enough time has gone by we scan the timestamps of the
-  cache contents and delete old files.
+- The cache will be automatically cleaned up periodically. We leave a
+  sentinel file for cleaning and if enough time has gone by we scan
+  the timestamps of the cache contents and delete old files.
 
 Note: This supersedes the beangulp.cache module, which should get deleted at
 some point.
 """
 
+import functools
+import hashlib
 import os
 import pickle
 import sys
@@ -48,6 +51,74 @@ GC_THRESHOLD_DAYS = 7  # Clean files older than 7 days
 
 
 ConverterFunc = Callable[[str], Any]
+
+
+def _file_key(file_path: str) -> str:
+    """Compute a key for a file and its current contents.
+
+    The key is derived from the file path and the file contents. The
+    cached conversion results are thus reused when the file is
+    replaced by a copy with identical contents, and recomputed when
+    the contents change, even when the replacement preserves the file
+    modification time and size.
+
+    """
+    digest = hashlib.sha1()
+    digest.update(os.fsencode(file_path))
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _describe_converter(converter: ConverterFunc) -> Any:
+    """Reduce a converter to a picklable description.
+
+    The description captures the converter code and its configuration
+    so that converters sharing the same code but configured
+    differently, for example functools.partial objects binding
+    different arguments or bound methods of differently configured
+    instances, are assigned different cache keys and their results are
+    not mixed up.
+
+    """
+    if isinstance(converter, functools.partial):
+        return (
+            "partial",
+            _describe_converter(converter.func),
+            converter.args,
+            converter.keywords,
+        )
+    instance = getattr(converter, "__self__", None)
+    func = getattr(converter, "__func__", None)
+    if instance is not None and func is not None:
+        # A bound method. The instance carries the configuration.
+        return ("method", instance, _describe_converter(func))
+    code = getattr(converter, "__code__", None)
+    if code is not None:
+        return (
+            "function",
+            code.co_code,
+            code.co_name,
+            code.co_filename,
+            code.co_firstlineno,
+            converter.__defaults__,
+            converter.__kwdefaults__,
+        )
+    return ("object", converter)
+
+
+def _converter_key(converter: ConverterFunc) -> str:
+    """Compute a stable key for a converter function."""
+    descriptor = _describe_converter(converter)
+    try:
+        payload = pickle.dumps(descriptor)
+    except Exception:
+        # The converter configuration cannot be pickled. Fall back to
+        # its repr(). This may not be stable across processes, but it
+        # is always safe: distinct converters get distinct keys.
+        payload = repr(descriptor).encode("utf-8", "replace")
+    return hashlib.sha1(payload).hexdigest()
 
 
 def _cleanup_old_cache_files():
@@ -87,6 +158,12 @@ def convert(file_path: str, converter: ConverterFunc) -> Any:
 
     This will cache the result in a file in the cache directory.
     The cache is cleaned up periodically.
+
+    The cache key is computed from the file path, the file contents,
+    and the converter code and configuration. Cached results are
+    reused for files whose contents did not change and recomputed when
+    the contents change, without requiring the cache directory to be
+    cleared.
     """
     # Create the cache directory if it doesn't exist.
     os.makedirs(CACHEDIR, exist_ok=True)
@@ -104,10 +181,11 @@ def convert(file_path: str, converter: ConverterFunc) -> Any:
         if sentinel_mtime < threshold_time.timestamp():
             _cleanup_old_cache_files()
 
-    # Create a unique cache filename based on the file path and converter.
-    file_hash = hash(file_path)
-    converter_hash = hash(converter.__code__)
-    cache_filename = os.path.join(CACHEDIR, f"{file_hash}_{converter_hash}.pickle")
+    # Create a unique cache filename based on the file path and
+    # contents and on the converter code and configuration.
+    cache_filename = os.path.join(
+        CACHEDIR, f"{_file_key(file_path)}_{_converter_key(converter)}.pickle"
+    )
 
     # Check if the cache file exists and is still valid.
     if os.path.exists(cache_filename):

@@ -22,6 +22,7 @@ from os import path
 
 import chardet
 
+from beangulp import exceptions
 from beangulp import mimetypes
 from beangulp import utils
 
@@ -53,8 +54,41 @@ class _FileMemo:
         # A cache of converter function to saved conversion value.
         self._cache = {}
 
+        # The signature of the file version the cached conversion
+        # results have been computed from. None until the version of
+        # the file has been confirmed by reading the file.
+        self._signature = None
+
     def __str__(self):
         return f'<FileWrapper filename="{self.name}">'
+
+    def _file_signature(self):
+        """Compute a signature for the current version of the file.
+
+        The signature is derived from the file contents because a file
+        may be replaced by a new version preserving the modification
+        time and the size of the file it replaces.
+
+        """
+        try:
+            return utils.sha1sum(self.name)
+        except OSError:
+            return None
+
+    def rebind(self):
+        """Confirm the version of the file backing this memo.
+
+        Discard the cached conversion results if the file contents
+        changed since they have been computed. This is called at the
+        beginning of each processing round to anchor the memo to the
+        version of the file being processed. Conversion results
+        computed from files whose contents did not change are kept.
+
+        """
+        signature = self._file_signature()
+        if signature is not None and signature != self._signature:
+            self._cache.clear()
+            self._signature = signature
 
     def convert(self, converter_func):
         """Registers a callable used to convert the file contents.
@@ -63,13 +97,36 @@ class _FileMemo:
           derived version of the file contents.
         Returns:
           A bytes object, with the contents of the entire file.
+        Raises:
+          beangulp.exceptions.Error: The file changed since the
+            processing of it started and the requested conversion
+            result is not already at hand.
         """
         try:
-            result = self._cache[converter_func]
+            # Results computed from the confirmed version of the file
+            # are returned even when the file has been replaced in the
+            # meanwhile: a processing round either completes using the
+            # confirmed version of the file throughout...
+            return self._cache[converter_func]
         except KeyError:
-            # FIXME: Implement timing of conversions here. Store it for
-            # reporting later.
-            result = self._cache[converter_func] = converter_func(self.name)
+            pass
+
+        # ...or it is terminated explicitly. Reading from a version of
+        # the file different from the confirmed one would mix data
+        # from different versions of the file into the results.
+        signature = self._file_signature()
+        if self._signature is None:
+            self._signature = signature
+        elif signature != self._signature:
+            raise exceptions.Error(
+                "File changed while being processed. "
+                "Identify the file again to process the new version.",
+                self.name,
+            )
+
+        # FIXME: Implement timing of conversions here. Store it for
+        # reporting later.
+        result = self._cache[converter_func] = converter_func(self.name)
         return result
 
     def mimetype(self):

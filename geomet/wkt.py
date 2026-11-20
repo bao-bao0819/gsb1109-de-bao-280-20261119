@@ -13,6 +13,7 @@
 #  limitations under the License.
 import io
 import itertools
+import re
 import tokenize
 
 import geomet
@@ -186,6 +187,352 @@ def _tokenize_wkt(string):
 
 def _unsupported_geom_type(geom_type):
     raise ValueError("Unsupported geometry type '%s'" % geom_type)
+
+
+# ---------------------------------------------------------------------------
+# Strict WKT reading, intended for cleaning data before ingestion.
+#
+# A CSV geometry cell must hold exactly one WKT geometry. The strict reader
+# therefore rejects trailing/extra content and incomplete geometries instead
+# of silently ignoring them, and reports every error against the original,
+# unmodified cell text (no trimming, line splitting or SRID stripping).
+# ---------------------------------------------------------------------------
+
+_SRID_INTEGER_RE = re.compile(r'\d+\Z')
+
+
+def _line_starts(text):
+    """Return the character offset at which each 1-based line starts."""
+    starts = [0]
+    for index, char in enumerate(text):
+        if char == '\n':
+            starts.append(index + 1)
+    return starts
+
+
+def _line_col(text, line_starts, position):
+    """
+    Convert an absolute character ``position`` in ``text`` to a 1-based
+    ``(line, column)`` pair. Line offsets are anchored at the starts of the
+    original lines, so both ``\\n`` and ``\\r\\n`` count as a single line
+    break and multi-line cells are located correctly without normalising
+    the text first.
+    """
+    line = 1
+    while line < len(line_starts) and line_starts[line] <= position:
+        line += 1
+    column = position - line_starts[line - 1]
+    return line, column + 1
+
+
+def _strict_error(text, line_starts, position, message):
+    line, column = _line_col(text, line_starts, position)
+    raise geomet.InvalidWKTException(
+        '%s (at character %d, line %d, column %d)'
+        % (message, position + 1, line, column),
+        text=text,
+        position=position + 1,
+        line=line,
+        column=column,
+    )
+
+
+def _strict_tokens(text, line_starts):
+    """
+    Tokenize ``text`` while retaining the span of every token.
+
+    Yields ``(token, start_offset, end_offset)`` tuples whose offsets refer
+    to the original cell text. Like :func:`_tokenize_wkt`, a leading ``-``
+    is joined to the following number so negative coordinates stay a single
+    token.
+    """
+    sio = io.StringIO(text)
+    pending_minus = None
+    try:
+        for tok in tokenize.generate_tokens(sio.readline):
+            kind = tok[0]
+            string = tok[1]
+            start_row, start_col = tok[2]
+            end_row, end_col = tok[3]
+            if kind in (tokenize.NEWLINE, tokenize.NL, tokenize.INDENT,
+                        tokenize.DEDENT, tokenize.ENDMARKER):
+                continue
+            start = line_starts[start_row - 1] + start_col
+            end = line_starts[end_row - 1] + end_col
+            if string == '-':
+                pending_minus = start
+                continue
+            if pending_minus is not None:
+                yield ('-' + string, pending_minus, end)
+                pending_minus = None
+            else:
+                yield (string, start, end)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        # An unclosed bracket/construct: simply stop, the structural scan
+        # below reports the missing closing parenthesis.
+        pass
+    if pending_minus is not None:
+        yield ('-', pending_minus, pending_minus + 1)
+
+
+class _StrictParser(object):
+    """Position-aware parser enforcing the single-geometry-per-cell rule."""
+
+    _EOF = object()
+
+    def __init__(self, text):
+        self.text = text
+        self.line_starts = _line_starts(text)
+        self.tokens = list(_strict_tokens(text, self.line_starts))
+        self.cursor = 0
+        self.reject_stray_characters()
+
+    def reject_stray_characters(self):
+        # Python's tokenizer silently drops comments and a few stray
+        # characters. WKT has neither, so any non-whitespace character not
+        # covered by a token span is reported at its exact original offset.
+        covered = [False] * len(self.text)
+        for _token, start, end in self.tokens:
+            for index in range(start, min(end, len(covered))):
+                covered[index] = True
+        for index, char in enumerate(self.text):
+            if not covered[index] and not char.isspace():
+                self.error(
+                    index,
+                    'Unexpected character %r in WKT value' % char,
+                )
+
+    def error(self, position, message):
+        _strict_error(self.text, self.line_starts, position, message)
+
+    def end_position(self):
+        return len(self.text)
+
+    def peek(self):
+        if self.cursor >= len(self.tokens):
+            return self._EOF
+        return self.tokens[self.cursor]
+
+    def advance(self):
+        token = self.peek()
+        if token is not self._EOF:
+            self.cursor += 1
+        return token
+
+    def expect(self, expected):
+        token = self.peek()
+        if token is self._EOF:
+            self.error(
+                self.end_position(),
+                'Unexpected end of value: expected %r' % expected,
+            )
+        value, position, _ = token
+        if value != expected:
+            self.error(
+                position,
+                'Expected %r but found %r' % (expected, value),
+            )
+        self.advance()
+
+    def parse(self):
+        if not self.tokens:
+            self.error(0, 'Empty WKT value: expected a geometry')
+        srid = None
+        if self.peek()[0] == 'SRID':
+            srid = self.parse_srid_header()
+        geom_type = self.expect_geom_keyword()
+        result = self.parse_geometry(geom_type)
+        leftover = self.peek()
+        if leftover is not self._EOF:
+            value, position, _ = leftover
+            self.error(
+                position,
+                'Unexpected extra content %r after the complete geometry; '
+                'each cell must contain exactly one WKT geometry' % value,
+            )
+        if srid is not None:
+            result['meta'] = dict(srid=srid)
+        return result
+
+    def parse_srid_header(self):
+        self.expect('SRID')
+        self.expect('=')
+        number = self.peek()
+        if number is self._EOF or not _SRID_INTEGER_RE.match(number[0]):
+            position = (self.end_position() if number is self._EOF
+                        else number[1])
+            self.error(
+                position,
+                'Invalid SRID header: expected an integer after "SRID="',
+            )
+        self.advance()
+        self.expect(';')
+        return int(number[0])
+
+    def expect_geom_keyword(self):
+        token = self.peek()
+        if token is self._EOF:
+            self.error(
+                self.end_position(),
+                'Unexpected end of value: expected a geometry type keyword',
+            )
+        value, position, _ = token
+        if value not in _loads_registry:
+            self.error(
+                position,
+                'Unsupported or unexpected geometry type %r' % value,
+            )
+        self.advance()
+        return value
+
+    def parse_geometry(self, geom_type):
+        token = self.peek()
+        if token is self._EOF:
+            self.error(
+                self.end_position(),
+                'Expected "EMPTY" or "(" after %s' % geom_type,
+            )
+        if token[0] == 'EMPTY':
+            self.advance()
+            if geom_type == 'GEOMETRYCOLLECTION':
+                return dict(type='GeometryCollection', geometries=[])
+            return dict(type=_type_map_caps_to_mixed[geom_type],
+                        coordinates=[])
+        if geom_type == 'GEOMETRYCOLLECTION':
+            return self.parse_geometrycollection_body()
+        return self.parse_coordinate_body(geom_type)
+
+    def parse_geometrycollection_body(self):
+        self.expect('(')
+        geoms = []
+        while True:
+            token = self.peek()
+            if token is self._EOF:
+                self.error(
+                    self.end_position(),
+                    'Unclosed GEOMETRYCOLLECTION: expected another geometry '
+                    'or ")"',
+                )
+            if token[0] == ')':
+                self.advance()
+                return dict(type='GeometryCollection', geometries=geoms)
+            sub_type = self.expect_geom_keyword()
+            geoms.append(self.parse_geometry(sub_type))
+            separator = self.peek()
+            if separator is self._EOF:
+                self.error(
+                    self.end_position(),
+                    'Unclosed GEOMETRYCOLLECTION: expected "," or ")"',
+                )
+            if separator[0] == ')':
+                self.advance()
+                return dict(type='GeometryCollection', geometries=geoms)
+            if separator[0] == ',':
+                self.advance()
+                continue
+            # The collection was never closed before another keyword
+            # appeared: report the syntax position inside the first item
+            # rather than pretending a boundary was found.
+            self.error(
+                separator[1],
+                'Incomplete GEOMETRYCOLLECTION: expected "," or ")" after '
+                'the previous geometry but found %r' % separator[0],
+            )
+
+    def scan_coordinate_span(self, open_index):
+        """
+        Validate the coordinate construct starting at ``open_index`` and
+        return the index of its matching closing parenthesis.
+        """
+        depth = 0
+        index = open_index
+        while index < len(self.tokens):
+            value, position, _ = self.tokens[index]
+            if value == '(':
+                depth += 1
+            elif value == ')':
+                depth -= 1
+                if depth == 0:
+                    return index
+            elif value != ',':
+                try:
+                    float(value)
+                except ValueError:
+                    self.error(
+                        position,
+                        'Expected a coordinate number but found %r' % value,
+                    )
+            index += 1
+        self.error(
+            self.end_position(),
+            'Unclosed geometry: %d opening parenthesis was never closed'
+            % depth,
+        )
+
+    def parse_coordinate_body(self, geom_type):
+        token = self.peek()
+        if token is self._EOF or token[0] != '(':
+            position = (self.end_position() if token is self._EOF
+                        else token[1])
+            self.error(
+                position,
+                'Expected "(" after geometry type %s' % geom_type,
+            )
+        open_index = self.cursor
+        close_index = self.scan_coordinate_span(open_index)
+        span = [item[0] for item in self.tokens[open_index:close_index + 1]]
+        # Reuse the existing importer so successful strict reads produce the
+        # exact same GeoJSON as the lenient reader. The structural scan
+        # above already validated the span, so failures here become strict
+        # errors rather than leaking a different exception type.
+        importer = _loads_registry[geom_type]
+        try:
+            result = importer(iter(span), self.text)
+        except (ValueError, StopIteration, tokenize.TokenError):
+            self.error(
+                self.tokens[open_index][1],
+                'Invalid %s geometry' % geom_type,
+            )
+        self.cursor = close_index + 1
+        return result
+
+
+def loads_strict(string):
+    """
+    Construct a GeoJSON `dict` from a WKT cell, enforcing strict rules.
+
+    Unlike :func:`loads`, the input must contain exactly one complete WKT
+    geometry. Only leading and trailing whitespace (including newlines and
+    CRLF) is tolerated around that geometry: any extra content after the
+    geometry, or an incomplete geometry, raises
+    :class:`geomet.InvalidWKTException`.
+
+    Error positions refer to the original ``string``: nothing is trimmed,
+    split by line or has its ``SRID=...;`` header removed before locating
+    the offending character, so the supplier can fix the original cell.
+
+    :param str string:
+        The raw WKT cell text.
+
+    :returns:
+        A GeoJSON `dict` representing the single geometry in the cell.
+
+    :raises geomet.InvalidWKTException:
+        If the cell is empty, holds more than one geometry / trailing
+        content, or its single geometry is syntactically incomplete.
+    """
+    if not isinstance(string, str):
+        raise TypeError(
+            'WKT input must be a string, not %s' % type(string).__name__
+        )
+    return _StrictParser(string).parse()
+
+
+def load_strict(source_file):
+    """
+    Strict counterpart of :func:`load` for a readable file-like object.
+    """
+    return loads_strict(source_file.read())
 
 
 def _round_and_pad(value, decimals):

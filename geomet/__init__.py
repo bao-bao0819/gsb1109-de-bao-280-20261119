@@ -18,3 +18,29 @@ class InvalidGeoJSONException(Exception):
     """
     Simple exception class to indicate if invalid GeoJSON is encountered.
     """
+
+
+class InvalidWKTException(ValueError):
+    """
+    A WKT value failed strict parsing.
+
+    Strict parsing requires a cell to contain exactly one complete WKT
+    geometry, optionally surrounded by leading and trailing whitespace.
+    Unlike the lenient reader, trailing content or an incomplete geometry
+    are never silently ignored.
+
+    ``position``, ``line`` and ``column`` refer to the original, unmodified
+    cell text (no trimming, line splitting or SRID stripping), so data
+    suppliers can locate the offending character in the field they sent.
+
+    Subclasses :class:`ValueError` so callers which already catch
+    ``ValueError`` keep working unchanged.
+    """
+
+    def __init__(self, message, text=None, position=None, line=None,
+                 column=None):
+        super(InvalidWKTException, self).__init__(message)
+        self.text = text
+        self.position = position
+        self.line = line
+        self.column = column

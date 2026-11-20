@@ -89,6 +89,38 @@ Converting 'Point' WKT to GeoJSON:
     >>> wkt.loads('POINT(10 20)')
     {'type': 'Point', 'coordinates': [10.0, 20.0]}
 
+### Strict reading for cleaning CSV cells
+
+A CSV geometry cell is expected to hold exactly one WKT geometry. The lenient
+`wkt.loads` keeps its historical behaviour, but `wkt.loads_strict` enforces the
+one-geometry-per-cell rule: only leading and trailing whitespace (including
+newlines and CRLF) is tolerated, while extra content after a complete geometry
+or an incomplete geometry raise `geomet.InvalidWKTException` instead of being
+silently ignored.
+
+    >>> wkt.loads_strict('  SRID=4326;GEOMETRYCOLLECTION(\n POINT(-1 -2)\n) \n')
+    {'type': 'GeometryCollection', 'geometries': [{'type': 'Point', 'coordinates': [-1.0, -2.0]}], 'meta': {'srid': 4326}}
+
+Every rejection is located against the original, unmodified cell (no trimming,
+line splitting or SRID stripping), so the data supplier can find the offending
+character in the field they actually sent. When the first geometry is already
+complete, the start of the extra content is reported; when it is not, the
+syntax position inside the unfinished geometry is reported:
+
+    >>> try:
+    ...     wkt.loads_strict('GEOMETRYCOLLECTION(POINT(1 2))POINT(3 4')
+    ... except geomet.InvalidWKTException as exc:
+    ...     exc.position, exc.line, exc.column
+    (31, 1, 31)
+    >>> try:
+    ...     wkt.loads_strict('GEOMETRYCOLLECTION(POINT(1 2)POINT(3 4))')
+    ... except geomet.InvalidWKTException as exc:
+    ...     exc.position, exc.line, exc.column
+    (30, 1, 30)
+
+`InvalidWKTException` is a subclass of `ValueError`. Use `wkt.load_strict` for
+a readable file-like object, and keep `wkt.loads` for the legacy lenient path.
+
 Converting 'GeometryCollection' WKT to GeoJSON:
 
     >>> wkt.loads('GEOMETRYCOLLECTION(POINT(10 20),POLYGON(((0 0), (10 30), (30 10), (0 0)))')

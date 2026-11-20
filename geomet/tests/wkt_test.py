@@ -1253,3 +1253,252 @@ class TestMisc(unittest.TestCase):
 
         expected = 'Expected "b" but found "a"'
         self.assertEqual(expected, str(ar.exception))
+
+
+class StrictLoadsTestCase(unittest.TestCase):
+    """Tests for the strict, ingestion-cleaning WKT reader."""
+
+    # A valid cell: leading blank/CRLF, an SRID-prefixed collection spread
+    # over several lines, negative coordinates, and trailing whitespace.
+    valid_collection = (
+        '  \r\n'
+        'SRID=4326;GEOMETRYCOLLECTION(\r\n'
+        ' POINT(-1 -2),\r\n'
+        ' LINESTRING(0 0, 3 -4)\r\n'
+        ') \t\r\n '
+    )
+    valid_collection_expected = {
+        'type': 'GeometryCollection',
+        'geometries': [
+            {'type': 'Point', 'coordinates': [-1.0, -2.0]},
+            {'type': 'LineString',
+             'coordinates': [[0.0, 0.0], [3.0, -4.0]]},
+        ],
+        'meta': {'srid': 4326},
+    }
+
+    # Bad sample 1: the first collection is complete, then an unclosed second
+    # geometry is appended.
+    extra_unclosed = 'SRID=4326;GEOMETRYCOLLECTION(POINT(1 2))POINT(3 4'
+    # Same shape, but the appended geometry is itself well formed.
+    extra_closed = 'GEOMETRYCOLLECTION(POINT(1 2)) POINT(3 4)'
+    # Bad sample 2: the first collection is never closed before a keyword
+    # which looks like the start of a second geometry appears.
+    unclosed_collection = (
+        'SRID=4326;GEOMETRYCOLLECTION(POINT(1 2)POINT(3 4))'
+    )
+    # A historical, leniently-accepted record carrying trailing content.
+    historical_record = 'POINT(1 2) garbage'
+
+    def _assert_position(self, exc, text, position, line, column):
+        self.assertEqual(position, exc.position)
+        self.assertEqual(line, exc.line)
+        self.assertEqual(column, exc.column)
+        # The reported position points into the original, unmodified cell.
+        self.assertEqual(text, exc.text)
+
+    def test_valid_collection_multiline_srid_negative(self):
+        self.assertEqual(
+            self.valid_collection_expected,
+            wkt.loads_strict(self.valid_collection),
+        )
+
+    def test_leading_and_trailing_whitespace_only(self):
+        self.assertEqual(
+            dict(type='Point', coordinates=[1.0, 2.0]),
+            wkt.loads_strict('  \t\r\n POINT (1 2) \n\t  '),
+        )
+
+    def test_strict_matches_lenient_output_for_every_fixture(self):
+        for value in WKT.values():
+            variants = value.values() if isinstance(value, dict) else [value]
+            for sample in variants:
+                self.assertEqual(wkt.loads(sample), wkt.loads_strict(sample))
+
+    def test_empty_and_whitespace_cells_are_rejected(self):
+        for sample in ('', '   \n\t\r\n  '):
+            with self.assertRaises(geomet.InvalidWKTException) as ar:
+                wkt.loads_strict(sample)
+            self.assertEqual(1, ar.exception.position)
+            self.assertEqual(1, ar.exception.line)
+            self.assertEqual(1, ar.exception.column)
+
+    def test_extra_content_after_complete_geometry(self):
+        # First item complete: the start of the second item is reported as
+        # extra content even though that second item is itself unclosed.
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(self.extra_unclosed)
+        exc = ar.exception
+        self._assert_position(exc, self.extra_unclosed, 41, 1, 41)
+        self.assertEqual('P', exc.text[exc.position - 1])
+        self.assertIn('Unexpected extra content', str(exc))
+
+    def test_extra_content_when_second_item_is_well_formed(self):
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(self.extra_closed)
+        exc = ar.exception
+        self._assert_position(exc, self.extra_closed, 32, 1, 32)
+        self.assertEqual('P', exc.text[exc.position - 1])
+
+    def test_unclosed_collection_reports_first_item_syntax_position(self):
+        # First item never closed: report the syntax position inside the
+        # first item, not the start of a bogus boundary.
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(self.unclosed_collection)
+        exc = ar.exception
+        self._assert_position(exc, self.unclosed_collection, 40, 1, 40)
+        self.assertEqual('P', exc.text[exc.position - 1])
+        self.assertIn('Incomplete GEOMETRYCOLLECTION', str(exc))
+
+    def test_positions_keep_leading_whitespace_and_srid(self):
+        # No trimming or SRID stripping before computing the position.
+        sample = '   SRID=9;POINT (1 abc)'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(sample)
+        exc = ar.exception
+        self.assertEqual(sample, exc.text)
+        self.assertEqual(sample.index('abc') + 1, exc.position)
+        self.assertEqual(1, exc.line)
+        self.assertEqual(sample.index('abc') + 1, exc.column)
+
+    def test_multiline_crlf_positions(self):
+        # Unclosed collection spread over CRLF lines: the offending keyword
+        # is located on its physical line and column in the original cell.
+        sample = (
+            'SRID=1;GEOMETRYCOLLECTION(\r\n'
+            ' POINT(1 2)\r\n'
+            ' POINT(3 4))'
+        )
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(sample)
+        exc = ar.exception
+        self.assertEqual(43, exc.position)
+        self.assertEqual(3, exc.line)
+        self.assertEqual(2, exc.column)
+        self.assertEqual('P', exc.text[exc.position - 1])
+
+    def test_multiline_extra_content_line_and_column(self):
+        sample = 'GEOMETRYCOLLECTION(\n  POINT(1 2)\n)\nPOINT(3 4'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(sample)
+        exc = ar.exception
+        self.assertEqual(36, exc.position)
+        self.assertEqual(4, exc.line)
+        self.assertEqual(1, exc.column)
+
+    def test_unclosed_simple_geometry_points_at_end_of_cell(self):
+        sample = 'POINT (0 1'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(sample)
+        exc = ar.exception
+        self.assertEqual(len(sample) + 1, exc.position)
+        self.assertIn('Unclosed geometry', str(exc))
+
+    def test_invalid_srid_header_position(self):
+        sample = 'SRID=x;POINT(1 2)'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(sample)
+        exc = ar.exception
+        self.assertEqual(sample.index('x') + 1, exc.position)
+
+    def test_unsupported_geometry_type(self):
+        sample = 'CIRCLE (1 2)'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(sample)
+        exc = ar.exception
+        self.assertEqual(1, exc.position)
+
+    def test_exception_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            wkt.loads_strict('POINT (1')
+
+    def test_non_string_input_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            wkt.loads_strict(b'POINT (1 2)')
+
+    def test_comment_and_stray_characters_are_rejected(self):
+        comment = 'POINT(1 2) # not part of WKT'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(comment)
+        exc = ar.exception
+        self.assertEqual(comment.index('#') + 1, exc.position)
+
+        stray = 'POINT(1 2)\\'
+        with self.assertRaises(geomet.InvalidWKTException) as ar:
+            wkt.loads_strict(stray)
+        exc = ar.exception
+        self.assertEqual(len(stray), exc.position)
+        self.assertEqual('\\', exc.text[exc.position - 1])
+
+    def test_scientific_notation_and_nested_collection(self):
+        self.assertEqual(
+            dict(type='Point', coordinates=[1e-5, -2.0]),
+            wkt.loads_strict('POINT (1e-5 -2.0)'),
+        )
+        nested = 'GEOMETRYCOLLECTION(GEOMETRYCOLLECTION(POINT(1 2)))'
+        self.assertEqual(
+            dict(
+                type='GeometryCollection',
+                geometries=[
+                    dict(
+                        type='GeometryCollection',
+                        geometries=[
+                            dict(type='Point', coordinates=[1.0, 2.0]),
+                        ],
+                    ),
+                ],
+            ),
+            wkt.loads_strict(nested),
+        )
+
+    def test_empty_geometry_keyword_is_a_complete_geometry(self):
+        self.assertEqual(
+            dict(type='Point', coordinates=[]),
+            wkt.loads_strict('POINT EMPTY'),
+        )
+        with self.assertRaises(geomet.InvalidWKTException):
+            wkt.loads_strict('POINT EMPTY POINT (1 2)')
+
+    def test_load_strict_reads_file_object(self):
+        fobj = StringIO.StringIO('  POINT (1 2)  ')
+        self.assertEqual(
+            dict(type='Point', coordinates=[1.0, 2.0]),
+            wkt.load_strict(fobj),
+        )
+
+    def test_cleaning_pipeline_and_lenient_reread(self):
+        # Drive the single cleaning entry point in the required order:
+        # valid collection, sample with extra input, damaged collection,
+        # and a historical lenient record.
+        strict_results = []
+        strict_rejections = []
+        for sample in (
+            self.valid_collection,
+            self.extra_unclosed,
+            self.unclosed_collection,
+            self.historical_record,
+        ):
+            try:
+                strict_results.append(wkt.loads_strict(sample))
+            except geomet.InvalidWKTException as exc:
+                strict_rejections.append((sample, exc))
+
+        # Only the fully valid collection is admitted.
+        self.assertEqual(
+            [self.valid_collection_expected], strict_results)
+        self.assertEqual(
+            [self.extra_unclosed, self.unclosed_collection,
+             self.historical_record],
+            [sample for sample, _ in strict_rejections],
+        )
+
+        # The default lenient reader keeps its historical behaviour and
+        # still accepts the legacy record, writing out just this one record.
+        self.assertEqual(
+            dict(type='Point', coordinates=[1.0, 2.0]),
+            wkt.loads(self.historical_record),
+        )
+        self.assertEqual(
+            'POINT (1.0000000000000000 2.0000000000000000)',
+            wkt.dumps(wkt.loads(self.historical_record)),
+        )

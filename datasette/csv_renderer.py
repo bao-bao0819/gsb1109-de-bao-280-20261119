@@ -56,11 +56,28 @@ def render_delimited(
     pks = page.get("primary_keys") or []
     # Columns expanded using ?_labels= get an additional column_label heading
     expanded_columns = set(page.get("expanded_columns") or [])
+    # The label heading must not shadow a column the table already has, or
+    # DictReader and similar tools would see that heading twice and lose one
+    # of the values. Pick a unique heading from the result columns alone, so
+    # it stays the same for every page of a streamed response.
+    label_headings = {}
+    used_headings = {column.lower() for column in columns}
+    for column in columns:
+        if column not in expanded_columns:
+            continue
+        heading = f"{column}_label"
+        if heading.lower() in used_headings:
+            suffix = 2
+            while f"{heading}_{suffix}".lower() in used_headings:
+                suffix += 1
+            heading = f"{heading}_{suffix}"
+        used_headings.add(heading.lower())
+        label_headings[column] = heading
     headings = []
     for column in columns:
         headings.append(column)
         if column in expanded_columns:
-            headings.append(f"{column}_label")
+            headings.append(label_headings[column])
 
     def cells(row):
         for column, cell in zip(columns, row):

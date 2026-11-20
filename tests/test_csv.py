@@ -1,3 +1,5 @@
+import csv
+import io
 import urllib.parse
 
 import pytest
@@ -122,6 +124,161 @@ async def test_table_csv_with_invalid_labels():
         "2,3,,b,beta\r\n"
         "3,2,two,c,\r\n"
     )
+
+
+async def _label_collision_datasette(**settings):
+    ds = Datasette(memory=True, settings={"default_page_size": 2, **settings})
+    await ds.invoke_startup()
+    db = ds.add_memory_database("labels", name="labels")
+    await db.execute_write_script("""
+        create table owners (id integer primary key, name text);
+        insert into owners (id, name) values
+            (1, 'Ada, Lovelace'),
+            (2, 'Grace
+Hopper'),
+            (3, 'Alan Turing');
+        create table reconciliation (
+            id integer primary key,
+            owner_id integer references owners(id),
+            owner_id_label text,
+            owner_id_label_2 text
+        );
+        insert into reconciliation (id, owner_id, owner_id_label, owner_id_label_2)
+        values
+            (1, null, 'null-a', 'null-a-2'),
+            (2, null, 'null-b', 'null-b-2'),
+            (3, 1, 'key-a', 'key-a-2'),
+            (4, 2, 'key-b', 'key-b-2'),
+            (5, 999, 'key-missing', 'key-missing-2');
+    """)
+    return ds
+
+
+def _dict_reader_rows(text, dialect="excel"):
+    reader = csv.DictReader(io.StringIO(text, newline=""), dialect=dialect)
+    return reader.fieldnames, list(reader)
+
+
+@pytest.mark.parametrize("format_,dialect", (("csv", "excel"), ("tsv", "excel-tab")))
+@pytest.mark.parametrize("page_size", (1, 2, 3, 10))
+async def test_label_headings_do_not_collide_with_table_columns(
+    format_, dialect, page_size
+):
+    ds = await _label_collision_datasette()
+    try:
+        response = await ds.client.get(
+            f"/labels/reconciliation.{format_}?_labels=1&_stream=1&_size={page_size}"
+        )
+        assert response.status_code == 200
+        headings, rows = _dict_reader_rows(response.text, dialect)
+        assert headings == [
+            "id",
+            "owner_id",
+            "owner_id_label_3",
+            "owner_id_label",
+            "owner_id_label_2",
+        ]
+        assert len(rows) == 5
+        for row in rows:
+            # DictReader gives None for any value past a short row
+            assert None not in row
+            assert len(row) == len(headings)
+            assert row["owner_id_label"] == {
+                "1": "null-a",
+                "2": "null-b",
+                "3": "key-a",
+                "4": "key-b",
+                "5": "key-missing",
+            }[row["id"]]
+            assert row["owner_id_label_2"] == {
+                "1": "null-a-2",
+                "2": "null-b-2",
+                "3": "key-a-2",
+                "4": "key-b-2",
+                "5": "key-missing-2",
+            }[row["id"]]
+        by_id = {row["id"]: row for row in rows}
+        # First page has only null keys: no resolved label
+        assert by_id["1"]["owner_id"] == ""
+        assert by_id["1"]["owner_id_label_3"] == ""
+        assert by_id["2"]["owner_id_label_3"] == ""
+        # A key that resolves gets the label for that key
+        assert by_id["3"]["owner_id"] == "1"
+        assert by_id["3"]["owner_id_label_3"] == "Ada, Lovelace"
+        assert by_id["4"]["owner_id_label_3"] == "Grace\nHopper"
+        # A key that is present but has no matching row gets an empty label
+        # and is not folded into any business column
+        assert by_id["5"]["owner_id"] == "999"
+        assert by_id["5"]["owner_id_label_3"] == ""
+        assert by_id["5"]["owner_id_label"] == "key-missing"
+    finally:
+        ds.close()
+
+
+@pytest.mark.parametrize("format_,dialect", (("csv", "excel"), ("tsv", "excel-tab")))
+async def test_label_headings_stay_the_same_when_paging_and_column_order_change(
+    format_, dialect
+):
+    ds = await _label_collision_datasette()
+    try:
+        # Change page size and the order of the requested columns as well
+        first = await ds.client.get(
+            f"/labels/reconciliation.{format_}?_labels=1&_stream=1&_size=1"
+        )
+        second = await ds.client.get(
+            f"/labels/reconciliation.{format_}?_labels=1&_stream=1&_size=4"
+            "&_col=owner_id_label_2&_col=id&_col=owner_id&_col=owner_id_label"
+        )
+        first_headings, first_rows = _dict_reader_rows(first.text, dialect)
+        second_headings, second_rows = _dict_reader_rows(second.text, dialect)
+        # The requested column order changes, so the headings move with it,
+        # but the label heading attached to owner_id stays the same
+        assert first_headings == [
+            "id",
+            "owner_id",
+            "owner_id_label_3",
+            "owner_id_label",
+            "owner_id_label_2",
+        ]
+        assert second_headings == [
+            "id",
+            "owner_id_label_2",
+            "owner_id",
+            "owner_id_label_3",
+            "owner_id_label",
+        ]
+        assert sorted(first_headings) == sorted(second_headings)
+        for row in first_rows + second_rows:
+            assert None not in row
+            assert len(row) == len(second_headings)
+        by_id = {row["id"]: row for row in second_rows}
+        assert first_rows[0]["id"] == "1"
+        assert by_id["3"]["owner_id_label_3"] == "Ada, Lovelace"
+        assert by_id["3"]["owner_id_label"] == "key-a"
+        assert by_id["3"]["owner_id_label_2"] == "key-a-2"
+    finally:
+        ds.close()
+
+
+async def test_label_column_unchanged_without_labels_expansion(ds_client):
+    # Un-expanded requests do not gain any extra field, even when the table
+    # has a column whose name would be the label heading
+    response = await ds_client.get("/fixtures/facetable.csv?_size=1")
+    headings, rows = _dict_reader_rows(response.text)
+    assert headings == [
+        "pk",
+        "created",
+        "planet_int",
+        "on_earth",
+        "state",
+        "_city_id",
+        "_neighborhood",
+        "tags",
+        "complex_array",
+        "distinct_some_null",
+        "n",
+    ]
+    assert rows[0]["_city_id"] == "1"
 
 
 async def test_table_csv_blob_columns(ds_client):

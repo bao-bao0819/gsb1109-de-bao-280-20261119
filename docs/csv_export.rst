@@ -68,7 +68,10 @@ alongside TSV and CSV, and these options apply to them as well:
   will cause the export to gain additional ``COLUMN_NAME_label`` columns with a
   label for each foreign key derived from the linked table. `In this example
   <https://latest.datasette.io/fixtures/facetable.csv?_labels=on&_size=max>`_
-  the ``city_id`` column is accompanied by a ``city_id_label`` column.
+  the ``city_id`` column is accompanied by a ``city_id_label`` column. If the
+  table already has a column with that name, a numeric suffix is added instead -
+  ``city_id_label_2``, ``city_id_label_3`` and so on - so every heading in the
+  file is unique.
 
 * **include all rows** - by default TSV and CSV exports only contain the first
   :ref:`setting_max_returned_rows` records. This option will cause Datasette to

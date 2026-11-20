@@ -251,6 +251,7 @@ class Dialect(PGDialect_psycopg2):
     supports_comments = has_comment_support()
     supports_sane_rowcount = False
     supports_server_side_cursors = False
+    supports_native_decimal = True
     div_is_floordiv = False  # TODO: tweak this to be based on DuckDB version
     inspector = DuckDBInspector
     colspecs = util.update_copy(

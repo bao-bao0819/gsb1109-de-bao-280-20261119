@@ -3,6 +3,7 @@ import os
 import re
 import zlib
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Generic, Optional, TypeVar, cast
 
@@ -16,10 +17,12 @@ from pytest import LogCaptureFixture, fixture, importorskip, mark, raises
 from sqlalchemy import (
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     Interval,
     MetaData,
+    Numeric,
     Sequence,
     String,
     Table,
@@ -659,6 +662,123 @@ def test_reflection(engine: Engine) -> None:
     with engine.connect() as conn:
         conn.execute(text("CREATE TABLE tbl(col1 INTEGER)"))
     metadata.reflect(engine)
+
+
+def test_native_decimal(engine: Engine) -> None:
+    amounts = [
+        Decimal("999999999999999999.999999999999"),
+        Decimal("123456789012345678.000000000001"),
+        Decimal("0.000000000001"),
+    ]
+    rows = [
+        {"grp": 1, "amount": amounts[0]},
+        {"grp": 1, "amount": amounts[1]},
+        {"grp": 2, "amount": amounts[2]},
+        {"grp": 3, "amount": None},
+        {"grp": 3, "amount": None},
+    ]
+    add = Decimal("0.000000000001")
+
+    metadata = MetaData()
+    financial = Table(
+        "financial",
+        metadata,
+        Column("grp", Integer),
+        Column("amount", Numeric(30, 12)),
+    )
+    metadata.create_all(engine)
+
+    native = duckdb.connect(":memory:")
+    native.execute("CREATE TABLE financial (grp INTEGER, amount DECIMAL(30,12))")
+    native.executemany(
+        "INSERT INTO financial VALUES (?, ?)",
+        [(row["grp"], row["amount"]) for row in rows],
+    )
+    native_rows = native.execute(
+        """
+        SELECT amount, amount + ?, sum(amount), CAST(amount AS FLOAT)
+        FROM financial
+        GROUP BY amount
+        ORDER BY amount
+        """,
+        [add],
+    ).fetchall()
+
+    with engine.connect() as conn:
+        conn.execute(financial.insert(), rows)
+
+        query = (
+            select(
+                financial.c.amount,
+                financial.c.amount + add,
+                func.sum(financial.c.amount),
+                sqlalchemy.cast(financial.c.amount, Float),
+            )
+            .group_by(financial.c.amount)
+            .order_by(financial.c.amount)
+        )
+        sa_rows = [tuple(row) for row in conn.execute(query)]
+        assert sa_rows == [tuple(row) for row in native_rows]
+        for amount, added, total, floated in sa_rows:
+            if amount is None:
+                assert (added, total, floated) == (None, None, None)
+            else:
+                assert isinstance(amount, Decimal)
+                assert isinstance(added, Decimal)
+                assert isinstance(total, Decimal)
+                assert isinstance(floated, float)
+
+        # SUM widens past the column's own precision and must not be
+        # truncated back down to DECIMAL(30, 12)
+        sum_query = (
+            select(func.sum(financial.c.amount))
+            .group_by(financial.c.grp)
+            .order_by(financial.c.grp)
+        )
+        assert [tuple(row) for row in conn.execute(sum_query)] == [
+            (Decimal("1123456789012345678.000000000000"),),
+            (Decimal("0.000000000001"),),
+            (None,),
+        ]
+
+    # fresh entry point: reflect the table on a new connection and
+    # build the equivalent query from the reflected metadata
+    reflected_metadata = MetaData()
+    with engine.connect() as conn:
+        reflected = Table("financial", reflected_metadata, autoload_with=conn)
+        assert isinstance(reflected.c.amount.type, Numeric)
+        assert reflected.c.amount.type.precision == 30
+        assert reflected.c.amount.type.scale == 12
+
+        reflected_query = (
+            select(
+                reflected.c.amount,
+                reflected.c.amount + add,
+                func.sum(reflected.c.amount),
+                sqlalchemy.cast(reflected.c.amount, Float),
+            )
+            .group_by(reflected.c.amount)
+            .order_by(reflected.c.amount)
+        )
+        assert [tuple(row) for row in conn.execute(reflected_query)] == sa_rows
+
+
+def test_plain_numeric_and_non_decimal(engine: Engine) -> None:
+    metadata = MetaData()
+    tbl = Table(
+        "plain_numeric",
+        metadata,
+        Column("id", Integer),
+        Column("val", Numeric),
+    )
+    metadata.create_all(engine)
+    with engine.connect() as conn:
+        conn.execute(tbl.insert(), [{"id": 1, "val": Decimal("1.5")}])
+        identifier, val = conn.execute(select(tbl.c.id, tbl.c.val)).one()
+        assert identifier == 1
+        assert isinstance(identifier, int)
+        assert val == Decimal("1.500")
+        assert isinstance(val, Decimal)
 
 
 def test_upsert(session: Session) -> None:

@@ -1959,6 +1959,9 @@ async def table_view_traced(datasette, request):
     )
 
     start = time.perf_counter()
+    # Labels resolved across the pages of this one response. It is scoped to
+    # this request so labels and permissions from another download never leak in.
+    label_cache = {}
     view_data = await table_view_data(
         datasette,
         request,
@@ -1968,6 +1971,7 @@ async def table_view_traced(datasette, request):
         default_labels=default_labels,
         renderer_extras=datasette._renderer_extras.get(format_),
         stream=stream,
+        label_cache=label_cache,
     )
     if isinstance(view_data, Response):
         return view_data
@@ -1991,6 +1995,7 @@ async def table_view_traced(datasette, request):
                 _next=next_token,
                 rows_only=True,
                 stream=stream,
+                label_cache=label_cache,
             )
             next_token = page_data["next"]
             return page_rows
@@ -2348,6 +2353,7 @@ async def table_view_data(
     renderer_extras=None,
     rows_only=False,
     stream=False,
+    label_cache=None,
 ):
     extra_extras = extra_extras or set()
     # We have a table or view
@@ -2538,7 +2544,7 @@ async def table_view_data(
         columns_to_expand = [fk["column"] for fk, _ in expandable_columns]
 
     if columns_to_expand:
-        expanded_labels = {}
+        columns_values = []
         for fk, _ in expandable_columns:
             column = fk["column"]
             if column not in columns_to_expand:
@@ -2548,13 +2554,18 @@ async def table_view_data(
             expanded_columns.append(column)
             # Gather the values
             column_index = columns.index(column)
-            values = [row[column_index] for row in rows]
-            # Expand them
-            expanded_labels.update(
-                await datasette.expand_foreign_keys(
-                    request.actor, database_name, table_name, column, values
-                )
-            )
+            columns_values.append((column, [row[column_index] for row in rows]))
+        # Expand them, sharing one lookup for columns with the same target
+        expanded_by_column = await datasette.expand_foreign_keys_for_columns(
+            request.actor,
+            database_name,
+            table_name,
+            columns_values,
+            label_cache=label_cache,
+        )
+        expanded_labels = {}
+        for labels in expanded_by_column.values():
+            expanded_labels.update(labels)
         if expanded_labels:
             # Rewrite the rows
             new_rows = []

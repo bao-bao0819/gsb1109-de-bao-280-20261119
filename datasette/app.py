@@ -2343,73 +2343,128 @@ ORDER BY allowed.parent, allowed.child
             log_sql_errors=log_sql_errors,
         )
 
-    async def expand_foreign_keys(self, actor, database, table, column, values):
-        """Returns dict mapping (column, value) -> label"""
-        labeled_fks = {}
+    async def expand_foreign_keys(
+        self, actor, database, table, column, values, label_cache=None
+    ):
+        """Returns dict mapping (column, value) -> label
+
+        label_cache can be shared between calls - for example by every page of
+        a streaming export - so labels for the same target column are only
+        looked up once. It should never be shared between requests.
+        """
+        expanded = await self.expand_foreign_keys_for_columns(
+            actor, database, table, [(column, values)], label_cache=label_cache
+        )
+        return expanded.get(column, {})
+
+    async def expand_foreign_keys_for_columns(
+        self, actor, database, table, columns_values, label_cache=None
+    ):
+        """Expand several foreign key columns in one pass.
+
+        columns_values is a list of (column, values) pairs. Columns that point
+        at the same target key and label column share a single lookup, as do
+        values already resolved earlier through label_cache.
+        """
         db = self.databases[database]
         foreign_keys = await db.foreign_keys_for_table(table)
-        # Find the foreign_key for this column
-        fk = next(
-            (
-                foreign_key
-                for foreign_key in foreign_keys
-                if foreign_key["column"] == column
-            ),
-            None,
-        )
-        if fk is None:
-            return {}
-        # Ensure user has permission to view the referenced table
-        from datasette.resources import TableResource
-
-        other_table = fk["other_table"]
-        # Foreign key declarations can spell the target with different casing.
-        target_table = (
-            await db.execute(
-                "select name from sqlite_master where type='table' and name=? collate nocase",
-                [other_table],
+        # cache_key -> list of (fk_column, values)
+        targets = {}
+        expanded = {}
+        for column, values in columns_values:
+            fk = next(
+                (
+                    foreign_key
+                    for foreign_key in foreign_keys
+                    if foreign_key["column"] == column
+                ),
+                None,
             )
-        ).first()
-        if target_table is None:
-            # SQLite accepts a foreign key to a table that does not exist, and
-            # linking to it would only lead to a 404
-            return {}
-        other_table = target_table[0]
-        other_column = fk["other_column"]
-        if other_column is None:
-            other_pks = await db.primary_keys(other_table)
-            if len(other_pks) != 1:
-                return {}
-            other_column = other_pks[0]
-        visible, _ = await self.check_visibility(
-            actor,
-            action="view-table",
-            resource=TableResource(database=database, table=other_table),
-        )
-        if not visible:
-            return {}
-        label_column = await db.label_column_for_table(other_table)
-        if not label_column:
-            return {(fk["column"], value): str(value) for value in values}
-        labeled_fks = {}
-        sql = """
-            select {other_column}, {label_column}
-            from {other_table}
-            where {other_column} in ({placeholders})
-        """.format(
-            other_column=escape_sqlite(other_column),
-            label_column=escape_sqlite(label_column),
-            other_table=escape_sqlite(other_table),
-            placeholders=", ".join(["?"] * len(set(values))),
-        )
-        try:
-            results = await self.execute(database, sql, list(set(values)))
-        except QueryInterrupted:
-            pass
-        else:
-            for id, value in results:
-                labeled_fks[(fk["column"], id)] = value
-        return labeled_fks
+            if fk is None:
+                continue
+            # Ensure user has permission to view the referenced table
+            from datasette.resources import TableResource
+
+            other_table = fk["other_table"]
+            # Foreign key declarations can spell the target with different casing.
+            target_table = (
+                await db.execute(
+                    "select name from sqlite_master where type='table' and name=? collate nocase",
+                    [other_table],
+                )
+            ).first()
+            if target_table is None:
+                # SQLite accepts a foreign key to a table that does not exist,
+                # and linking to it would only lead to a 404
+                continue
+            other_table = target_table[0]
+            other_column = fk["other_column"]
+            if other_column is None:
+                other_pks = await db.primary_keys(other_table)
+                if len(other_pks) != 1:
+                    continue
+                other_column = other_pks[0]
+            visible, _ = await self.check_visibility(
+                actor,
+                action="view-table",
+                resource=TableResource(database=database, table=other_table),
+            )
+            if not visible:
+                continue
+            label_column = await db.label_column_for_table(other_table)
+            if not label_column:
+                expanded[column] = {(column, value): str(value) for value in values}
+                continue
+            # Key the cache on the real target, not on the source column.
+            cache_key = (database, other_table, other_column, label_column)
+            targets.setdefault(cache_key, []).append((column, values))
+        for cache_key, column_values in targets.items():
+            cache = None
+            if label_cache is not None:
+                cache = label_cache.setdefault(cache_key, {"labels": {}, "queried": set()})
+                cached_labels = cache["labels"]
+                already_queried = cache["queried"]
+            else:
+                cached_labels = {}
+                already_queried = set()
+            values_to_query = list(
+                {
+                    value
+                    for _, values in column_values
+                    for value in values
+                    if value not in already_queried
+                }
+            )
+            if values_to_query:
+                _, other_table, other_column, label_column = cache_key
+                sql = """
+                    select {other_column}, {label_column}
+                    from {other_table}
+                    where {other_column} in ({placeholders})
+                """.format(
+                    other_column=escape_sqlite(other_column),
+                    label_column=escape_sqlite(label_column),
+                    other_table=escape_sqlite(other_table),
+                    placeholders=", ".join(["?"] * len(values_to_query)),
+                )
+                try:
+                    results = await self.execute(database, sql, values_to_query)
+                except QueryInterrupted:
+                    # A timeout must not be remembered as "this key has no
+                    # label": later pages get another chance to look it up.
+                    pass
+                else:
+                    for id, value in results:
+                        cached_labels[id] = value
+                    if cache is not None:
+                        cache["queried"].update(values_to_query)
+            for column, values in column_values:
+                expanded[column] = {
+                    (column, value): cached_labels[value]
+                    for value in set(values)
+                    if value in cached_labels
+                }
+        return expanded
 
     def absolute_url(self, request, path):
         url = urllib.parse.urljoin(request.url, path)

@@ -6,7 +6,7 @@ import typing
 
 from decimal import Decimal
 from functools import lru_cache as cache
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from beancount import loader
 from beancount import parser
@@ -26,6 +26,8 @@ from beanquery import types
 from beanquery import query_compile
 from beanquery import query_render
 from beanquery import hashable
+from beanquery import references
+from beanquery.errors import ProgrammingError
 from beanquery.query_env import ColumnsRegistry
 
 
@@ -41,12 +43,24 @@ hashable.register(data.Transaction, lambda t: (t.date, t.flag, t.narration))
 _TABLES = []
 
 
-def attach(context, dsn, *, entries=None, errors=None, options=None):
-    filename = urlparse(dsn).path
+def attach(context, dsn, *, entries=None, errors=None, options=None,
+           institution_field=None, transaction_field=None, leg_field=None):
+    parts = urlparse(dsn)
+    filename = parts.path
     if filename:
         entries, errors, options = loader.load_file(filename)
+    params = dict(parse_qsl(parts.query))
+    reference_fields = references.fields_from_params(
+        params,
+        institution_field=institution_field,
+        transaction_field=transaction_field,
+        leg_field=leg_field,
+    )
     for table in _TABLES:
         context.tables[table.name] = table(entries, options)
+    postings = context.tables.get('postings')
+    if postings is not None:
+        postings.set_reference_fields(reference_fields)
     context.options.update(options)
     context.errors.extend(errors)
     # Set the default table. This eventually will have to be removed.
@@ -251,6 +265,8 @@ class _BeancountTable(tables.Table):
         self.open = open
         self.close = close
         self.clear = clear
+        self.reference_fields = references.ReferenceFields()
+        self._reference_index = None
 
     def evolve(self, **kwargs):
         table = copy.copy(self)
@@ -391,6 +407,9 @@ class _PostingsTableRow:
         # The current posting being evaluated.
         self.posting = None
 
+        # The table that owns the declared reference fields.
+        self.table = None
+
     def __hash__(self):
         # The context hash is used in caching column accessor functions.
         # Instead than hashing the row context content, use the rowid as
@@ -398,14 +417,63 @@ class _PostingsTableRow:
         return self.rowid
 
 
+def _reference_info(context):
+    if context.table is None:
+        return references.ReferenceInfo(None, None, None, None, None)
+    return context.table.reference_index.info(context.entry, context.posting)
+
+
+class ReferenceDeclaration(query_compile.EvalFunction):
+    """Declare the ledger fields used to build posting references.
+
+    ``posting_reference(institution_field, transaction_field, leg_field)``
+    returns the posting's reference and records the declaration on the
+    postings table, so the ``reference`` columns can be used in the same
+    query regardless of the order of the targets.  The field names must be
+    literal strings; declare them on the data source to use the same
+    fields across several queries.
+    """
+
+    __intypes__ = [str, str, str]
+    pure = False
+
+    def __init__(self, context, operands):
+        super().__init__(context, operands, str)
+        names = []
+        for operand in operands:
+            try:
+                names.append(operand.value)
+            except AttributeError:
+                raise ProgrammingError(
+                    'posting_reference() field names must be literal strings') from None
+        table = context.tables.get('postings')
+        table.set_reference_fields(references.ReferenceFields(*names))
+
+    def __call__(self, row):
+        return _reference_info(row).reference
+
+
 class PostingsTable(_BeancountTable):
     name = 'postings'
     columns = ColumnsRegistry()
     wildcard_columns = 'date flag payee narration position'.split()
 
+    @property
+    def reference_index(self):
+        if self._reference_index is None or self._reference_index.fields != self.reference_fields:
+            self._reference_index = references.PostingReferenceIndex(
+                self.entries, self.reference_fields)
+        return self._reference_index
+
+    def set_reference_fields(self, fields):
+        # A new declaration changes what every row resolves to.
+        self.reference_fields = fields
+        self._reference_index = None
+
     def __iter__(self):
         entries = self.prepare()
         context = _PostingsTableRow()
+        context.table = self
         for entry in entries:
             if isinstance(entry, data.Transaction):
                 context.entry = entry
@@ -504,6 +572,39 @@ class PostingsTable(_BeancountTable):
         return context.entry.links
 
     @columns.register(str)
+    def reference(context):
+        """Stable reference from the declared institution, transaction, and leg fields.
+
+        Returns None when the source identifiers are absent or ambiguous.
+        """
+        return _reference_info(context).reference
+
+    @columns.register(str)
+    def reference_status(context):
+        """Why a reference is available: "ok", "missing", or the conflicting level."""
+        return references.status(_reference_info(context))
+
+    @columns.register(str)
+    def reference_institution(context):
+        """The declared institution component of the posting reference."""
+        return _reference_info(context).institution
+
+    @columns.register(str)
+    def reference_transaction(context):
+        """The declared external transaction number component of the reference."""
+        return _reference_info(context).transaction
+
+    @columns.register(str)
+    def reference_leg(context):
+        """The declared leg number component of the reference."""
+        return _reference_info(context).leg
+
+    @columns.register(str)
+    def reference_conflict(context):
+        """The level at which declared identifiers are ambiguous, if any."""
+        return _reference_info(context).conflict
+
+    @columns.register(str)
     def posting_flag(context):
         """The flag of the posting itself."""
         return context.posting.flag
@@ -593,3 +694,6 @@ class PostingsTable(_BeancountTable):
         return {p.account for p in context.entry.postings}
 
 _TABLES.append(PostingsTable)
+
+# Make the query-scoped reference declaration available to BQL.
+query_compile.FUNCTIONS['posting_reference'].append(ReferenceDeclaration)

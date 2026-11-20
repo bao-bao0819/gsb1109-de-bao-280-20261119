@@ -1,6 +1,19 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- Stable posting references are available from the ``postings`` table.
+  The institution, external transaction number, and leg number are read
+  from ledger metadata fields declared on the ``beancount`` data source
+  (``institution_field``, ``transaction_field``, ``leg_field`` as
+  keyword arguments or DSN query parameters) or in a query with
+  ``posting_reference(institution_field, transaction_field, leg_field)``.
+  The ``reference`` column identifies a posting independently of its
+  account, amount, posting order, and file location.  Ambiguous
+  transaction numbers and duplicate leg numbers yield a NULL reference
+  and are reported at their conflict level by ``reference_status`` and
+  ``reference_conflict``; a posting without a leg number never receives
+  a fabricated reference.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

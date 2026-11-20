@@ -35,6 +35,12 @@ class CT2(TestModel):
     data = JSONField()  # Diff of json?
 
 
+class CT3(TestModel):
+    raw = TextField()
+    parsed = JSONField()
+    skipped = JSONField(null=True)
+
+
 changelog = ChangeLog(database)
 CL = changelog.model
 
@@ -180,3 +186,37 @@ class TestChangeLog(ModelTestCase):
         ca.delete_instance()
         self.assertChanges([
             ('DELETE', 'ct2', {'data': [{'k1': 'v1-x'}, None]})])
+
+    @requires_models(CT3)
+    def test_changelog_text_and_json_scalars(self):
+        changelog.install(CT3, skip_fields=['skipped'])
+
+        # Text values that look like JSON are recorded verbatim, while JSON
+        # column scalars retain their types (true vs 1 vs "1").
+        c = CT3.create(raw='12', parsed=True, skipped={'k': 'v'})
+        self.assertChanges([
+            ('INSERT', 'ct3', {'raw': [None, '12'],
+                               'parsed': [None, True]})])
+
+        c.raw = 'true'
+        c.parsed = 1
+        c.save()
+        self.assertChanges([
+            ('UPDATE', 'ct3', {'raw': ['12', 'true'],
+                               'parsed': [True, 1]})])
+
+        c.raw = '{"key": "value"}'
+        c.parsed = '1'
+        c.save()
+        self.assertChanges([
+            ('UPDATE', 'ct3', {'raw': ['true', '{"key": "value"}'],
+                               'parsed': [1, '1']})])
+
+        c.skipped = {'k2': 'v2'}
+        c.save()  # Only the skipped field changed: no changes recorded.
+        self.assertChanges([('UPDATE', 'ct3', {})])
+
+        c.delete_instance()
+        self.assertChanges([
+            ('DELETE', 'ct3', {'raw': ['{"key": "value"}', None],
+                               'parsed': ['1', None]})])

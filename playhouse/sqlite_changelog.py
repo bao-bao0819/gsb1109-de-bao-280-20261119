@@ -1,5 +1,9 @@
 from peewee import *
+from peewee import JSONField as BaseJSONField
 from playhouse.sqlite_ext import JSONField
+
+
+_json_field_types = (JSONField, BaseJSONField)
 
 
 class BaseChangeLog(Model):
@@ -33,17 +37,21 @@ class ChangeLog(object):
             SELECT json_group_object(
                 col,
                 json_array(
-                    case when json_valid("oldval") then json("oldval")
+                    case when "is_json" then json("oldjson")
                         else "oldval" end,
-                    case when json_valid("newval") then json("newval")
+                    case when "is_json" then json("newjson")
                         else "newval" end)
                 ) AS "changes"
             FROM (
                 SELECT json_extract(value, '$[0]') as "col",
                        json_extract(value, '$[1]') as "oldval",
-                       json_extract(value, '$[2]') as "newval"
+                       json_extract(value, '$[2]') as "newval",
+                       value -> '$[1]' as "oldjson",
+                       value -> '$[2]' as "newjson",
+                       json_extract(value, '$[3]') as "is_json"
                 FROM json_each(json_array(%(column_array)s))
-                WHERE "oldval" IS NOT "newval"
+                WHERE ("is_json" AND "oldjson" IS NOT "newjson")
+                    OR (NOT "is_json" AND "oldval" IS NOT "newval")
             )
         );
     END;"""
@@ -71,13 +79,20 @@ class ChangeLog(object):
             new = 'NULL' if not use_new else 'NEW."%s"' % column
             old = 'NULL' if not use_old else 'OLD."%s"' % column
 
-            if isinstance(field, JSONField):
+            if isinstance(field, _json_field_types):
                 # Ensure that values are cast to JSON so that the serialization
-                # is preserved when calculating the old / new.
+                # is preserved when calculating the old / new. The JSON value
+                # is embedded into the column array as JSON, and the trigger
+                # compares and records its JSON representation so that scalar
+                # types (e.g. true vs 1 vs "1") remain distinguishable.
                 if use_old: old = 'json(%s)' % old
                 if use_new: new = 'json(%s)' % new
+                is_json = '1'
+            else:
+                is_json = '0'
 
-            col_array.append("json_array('%s', %s, %s)" % (column, old, new))
+            col_array.append("json_array('%s', %s, %s, %s)" % (
+                column, old, new, is_json))
 
         return ', '.join(col_array)
 

@@ -47,7 +47,42 @@ def _load_json_value(value):
         return value
 
 
-def convert_specific_columns_to_json(rows, columns, json_cols):
+def _raw_json_pair(value):
+    """
+    Build the {"raw": ..., "parsed": ..., "error": ...} object returned for
+    each ?_json_raw= column. "parsed" is always derived from the raw value,
+    so a SQL NULL, a stored JSON null and invalid JSON can be told apart.
+    """
+    if isinstance(value, str):
+        try:
+            return {"raw": value, "parsed": json.loads(value), "error": None}
+        except ValueError as ex:
+            return {"raw": value, "parsed": None, "error": str(ex)}
+    return {"raw": value, "parsed": value, "error": None}
+
+
+def json_raw_columns_from_args(args, json_cols):
+    """
+    The columns to return as {"raw": ..., "parsed": ..., "error": ...}
+    objects. ?_json_raw=1 selects every ?_json= column, while
+    ?_json_raw=COLUMN selects columns by name.
+    """
+    if "_json_raw" not in args:
+        return []
+    values = args.getlist("_json_raw")
+    named = [
+        value
+        for value in values
+        if value.lower() not in ("on", "off", "true", "false", "1", "0")
+    ]
+    if named:
+        return named
+    if values and value_as_boolean(values[-1]):
+        return list(json_cols)
+    return []
+
+
+def convert_specific_columns_to_json(rows, columns, json_cols, raw_rows=None):
     if not rows:
         return rows
     if columns is None:
@@ -57,15 +92,30 @@ def convert_specific_columns_to_json(rows, columns, json_cols):
     json_cols = set(json_cols)
     if not json_cols.intersection(columns):
         return rows
+    columns = list(columns)
     new_rows = []
-    for row in rows:
+    for index, row in enumerate(rows):
+        raw_row = None
+        if raw_rows is not None:
+            raw_row = raw_rows[index]
+            if not isinstance(raw_row, dict):
+                raw_row = dict(zip(columns, raw_row))
         if isinstance(row, dict):
             new_row = dict(row)
             for column in json_cols.intersection(row):
-                new_row[column] = _load_json_value(row[column])
+                if raw_row is not None:
+                    new_row[column] = _raw_json_pair(raw_row.get(column))
+                else:
+                    new_row[column] = _load_json_value(row[column])
         else:
             new_row = [
-                _load_json_value(value) if column in json_cols else value
+                (
+                    _raw_json_pair(raw_row.get(column))
+                    if raw_row is not None
+                    else _load_json_value(value)
+                )
+                if column in json_cols
+                else value
                 for value, column in zip(row, columns)
             ]
         new_rows.append(new_row)
@@ -106,6 +156,18 @@ async def json_renderer(
     args = request.args
     status_code = 200
 
+    # Handle the _json= and _json_raw= parameters which may modify the rows
+    json_cols = []
+    if "_json" in args:
+        json_cols = args.getlist("_json")
+    json_raw_cols = json_raw_columns_from_args(args, json_cols)
+    if json_raw_cols:
+        # ?_json_raw= reports the exact stored text, so keep the rows from
+        # before any column type transforms are applied
+        untransformed_rows = rows
+    else:
+        untransformed_rows = None
+
     if view_name == "table" and table and not error:
         # Table pages apply transform_value() from any column types
         rows = await apply_column_type_transforms(datasette, database, table, rows)
@@ -113,26 +175,31 @@ async def json_renderer(
     # Everything other than the rows comes from the page dictionary
     data = {"ok": True, **page, "rows": rows}
 
-    # Handle the _json= parameter which may modify data["rows"]
-    json_cols = []
-    if "_json" in args:
-        json_cols = args.getlist("_json")
     object_keys = None
     pks = data.get("primary_keys")
     if (
         not error
         and args.get("_shape") == "object"
         and pks
-        and any(pk in json_cols for pk in pks)
+        and any(pk in json_cols or pk in json_raw_cols for pk in pks)
     ):
         object_keys = []
-        for row in data["rows"]:
+        # Keys come from the untransformed rows when available, so they
+        # always use the primary key values stored in the database
+        key_rows = (
+            untransformed_rows if untransformed_rows is not None else data["rows"]
+        )
+        for row in key_rows:
             if columns and not isinstance(row, dict):
                 row = dict(zip(columns, row))
             object_keys.append(path_from_row_pks(row, pks, False))
     if json_cols:
         data["rows"] = convert_specific_columns_to_json(
             data["rows"], columns, json_cols
+        )
+    if json_raw_cols:
+        data["rows"] = convert_specific_columns_to_json(
+            data["rows"], columns, json_raw_cols, raw_rows=untransformed_rows
         )
 
     # unless _json_infinity=1 requested, replace infinity with None

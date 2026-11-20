@@ -9,6 +9,8 @@ Changelog
 Unreleased
 ----------
 
+- New ``?_json_raw=1`` query string argument for use with :ref:`?_json=COLUMN <json_api_special>`: selected columns are returned as ``{"raw": ..., "parsed": ..., "error": ...}`` objects, preserving the exact text stored in the database alongside the parsed JSON and any parse error, so SQL ``NULL`` values, stored JSON ``null`` values and invalid JSON can be told apart.
+
 - **Backwards incompatible:** the homepage JSON at ``/.json`` now returns the same searchable catalog of tables, views and stored queries as the :ref:`HTML homepage <IndexView>`, and accepts the same ``?q=``, ``?database=`` and ``?page=`` parameters. It previously returned up to five tables for each database in a format left over from the old homepage design, ignored those parameters and could take several seconds for instances with thousands of tables. Each database in ``databases`` now has ``name``, ``private``, ``tables``, ``views``, ``url`` and ``size`` keys - ``url`` replaces ``path`` - and tables and views are listed in a new ``items`` key, paginated using ``next_url``. This endpoint is still marked as unstable. (:issue:`1674`)
 - **Backwards incompatible:** optional arguments to many of the :ref:`documented internal methods <internals>` are now keyword-only, so they can no longer be passed positionally. (:issue:`1822`) The affected signatures are:
 

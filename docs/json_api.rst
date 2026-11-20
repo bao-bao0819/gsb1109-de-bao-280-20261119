@@ -330,6 +330,31 @@ query string arguments:
 
     Compare `this query without the argument <https://latest.datasette.io/fixtures/-/query.json?sql=select+%27%7B%22this+is%22%3A+%22a+json+object%22%7D%27+as+d&_shape=array>`_ to `this query using the argument <https://latest.datasette.io/fixtures/-/query.json?sql=select+%27%7B%22this+is%22%3A+%22a+json+object%22%7D%27+as+d&_shape=array&_json=d>`_
 
+``?_json_raw=1``
+    Modifies ``?_json=COLUMN`` so that instead of replacing each value with
+    the parsed JSON, every selected column is returned as an object with
+    three keys:
+
+    - ``raw`` - the exact text stored in the database, or ``null`` if the
+      SQL value is ``NULL``
+    - ``parsed`` - the result of parsing that text as JSON, or ``null`` if
+      the text is not valid JSON
+    - ``error`` - the JSON parser error message, or ``null`` if the text
+      parsed successfully
+
+    This means a SQL ``NULL``, a stored JSON ``null``, a valid JSON value
+    and invalid JSON can all be told apart, and the stored text is preserved
+    exactly as it appears in the database. The parsed value is always
+    derived from the stored text, even if a
+    :ref:`column type <table_configuration_column_types>` with a value
+    transform is assigned to the column. Parse errors are reported in the
+    row that caused them and do not prevent the remaining rows from being
+    exported.
+
+    Columns can also be selected directly using ``?_json_raw=COLUMN``
+    without ``?_json=``. With ``_shape=object`` the object keys continue to
+    use the primary-key values stored in the database.
+
 ``?_json_infinity=on``
     If your data contains infinity or -infinity values, Datasette will replace
     them with None when returning them as JSON. If you pass ``_json_infinity=1``

@@ -960,6 +960,144 @@ async def test_json_columns(ds_client, extra_args, expected):
     assert response.json() == expected
 
 
+JSON_RAW_TEST_ROWS = [
+    (1, '{ "a": 1 }', "keep"),
+    (2, "null", "keep"),
+    (3, None, "keep"),
+    (4, "[1, 2]", "keep"),
+    (5, '{"a": 1', "keep"),
+]
+
+
+async def make_json_raw_ds():
+    ds = Datasette()
+    db = ds.add_memory_database("json_raw")
+    await db.execute_write(
+        "CREATE TABLE t (id integer primary key, payload text, other text)"
+    )
+    await db.execute_write_many(
+        "INSERT INTO t (id, payload, other) VALUES (?, ?, ?)", JSON_RAW_TEST_ROWS
+    )
+    return ds
+
+
+@pytest.mark.parametrize("argument", ["_json=payload&_json_raw=1", "_json_raw=payload"])
+async def test_json_raw_columns(argument):
+    ds = await make_json_raw_ds()
+    try:
+        response = await ds.client.get(f"/json_raw/t.json?{argument}")
+        assert response.status_code == 200
+        rows = response.json()["rows"]
+        # Valid object is returned with its exact stored text and parsed form
+        assert rows[0] == {
+            "id": 1,
+            "payload": {"raw": '{ "a": 1 }', "parsed": {"a": 1}, "error": None},
+            "other": "keep",
+        }
+        # A stored JSON null is distinct from a SQL NULL
+        assert rows[1]["payload"] == {"raw": "null", "parsed": None, "error": None}
+        assert rows[2]["payload"] == {"raw": None, "parsed": None, "error": None}
+        # Valid array
+        assert rows[3]["payload"] == {
+            "raw": "[1, 2]",
+            "parsed": [1, 2],
+            "error": None,
+        }
+        # Invalid JSON reports the error without aborting the export
+        assert rows[4]["payload"]["raw"] == '{"a": 1'
+        assert rows[4]["payload"]["parsed"] is None
+        assert rows[4]["payload"]["error"]
+    finally:
+        ds.close()
+
+
+async def test_json_raw_columns_off_matches_current_output():
+    ds = await make_json_raw_ds()
+    try:
+        # Without _json_raw the _json= output is unchanged
+        response = await ds.client.get("/json_raw/t.json?_json=payload")
+        assert [row["payload"] for row in response.json()["rows"]] == [
+            {"a": 1},
+            None,
+            None,
+            [1, 2],
+            '{"a": 1',
+        ]
+        # And the default output is unchanged too
+        response = await ds.client.get("/json_raw/t.json")
+        assert response.json()["rows"][0] == {
+            "id": 1,
+            "payload": '{ "a": 1 }',
+            "other": "keep",
+        }
+    finally:
+        ds.close()
+
+
+async def test_json_raw_columns_pagination():
+    ds = await make_json_raw_ds()
+    try:
+        seen = []
+        path = "/json_raw/t.json?_json=payload&_json_raw=1&_size=2"
+        while path:
+            response = await ds.client.get(path)
+            assert response.status_code == 200
+            data = response.json()
+            seen.extend(data["rows"])
+            next_url = data["next_url"]
+            path = next_url.replace("http://localhost", "") if next_url else None
+        # Every row was exported, including the one with invalid JSON
+        assert [row["id"] for row in seen] == [1, 2, 3, 4, 5]
+        assert seen[4]["payload"]["error"]
+    finally:
+        ds.close()
+
+
+@pytest.mark.parametrize("shape", ["objects", "arrays"])
+async def test_json_raw_columns_shapes(shape):
+    ds = await make_json_raw_ds()
+    try:
+        response = await ds.client.get(
+            f"/json_raw/t.json?_json=payload&_json_raw=1&_shape={shape}"
+        )
+        assert response.status_code == 200
+        row = response.json()["rows"][0]
+        expected_pair = {"raw": '{ "a": 1 }', "parsed": {"a": 1}, "error": None}
+        if shape == "objects":
+            assert row["payload"] == expected_pair
+        else:
+            # Column positions match the unshaped results
+            assert row == [1, expected_pair, "keep"]
+    finally:
+        ds.close()
+
+
+async def test_json_raw_columns_object_shape_uses_stored_primary_keys():
+    ds = Datasette()
+    db = ds.add_memory_database("json_raw_keys")
+    await db.execute_write("CREATE TABLE t (id text primary key, payload text)")
+    await db.execute_write("INSERT INTO t VALUES (?, ?)", ["[1, 2]", '{ "a": 1 }'])
+    await db.execute_write("INSERT INTO t VALUES (?, ?)", ['{"b": 2}', "null"])
+    try:
+        response = await ds.client.get(
+            "/json_raw_keys/t.json?_json=id&_json_raw=1&_shape=object"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        # Keys are the primary key values stored in the database
+        assert list(data.keys()) == [tilde_encode("[1, 2]"), tilde_encode('{"b": 2}')]
+        assert data[tilde_encode("[1, 2]")] == {
+            "id": {"raw": "[1, 2]", "parsed": [1, 2], "error": None},
+            "payload": '{ "a": 1 }',
+        }
+        # The rows can still be retrieved using those keys
+        for key in data:
+            detail = await ds.client.get(f"/json_raw_keys/t/{key}.json")
+            assert detail.status_code == 200
+    finally:
+        ds.close()
+
+
 async def test_config_cache_size():
     ds = await make_ds(settings={"cache_size_kb": 2500})
     response = await ds.client.get("/fixtures/pragma_cache_size.json")

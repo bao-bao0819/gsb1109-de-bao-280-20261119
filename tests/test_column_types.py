@@ -768,6 +768,62 @@ async def test_transform_value_in_json_output(tmp_path_factory):
         pm.unregister(plugin, name="test_transform_ct")
 
 
+async def test_json_raw_parses_stored_text_not_transformed_value(tmp_path_factory):
+    """?_json_raw= derives the parsed value from the stored text, even when
+    a column type transform_value() modifies the JSON output."""
+
+    class UpperColumnType(ColumnType):
+        name = "upper"
+        description = "Uppercase"
+
+        async def transform_value(self, value, datasette):
+            if isinstance(value, str):
+                return value.upper()
+            return value
+
+    class _Plugin:
+        @hookimpl
+        def register_column_types(self, datasette):
+            return [UpperColumnType]
+
+    plugin = _Plugin()
+    pm.register(plugin, name="test_json_raw_transform_ct")
+    try:
+        db_directory = tmp_path_factory.mktemp("dbs")
+        db_path = str(db_directory / "data.db")
+        db = sqlite3.connect(str(db_path))
+        db.execute("vacuum")
+        db.execute("create table t (id integer primary key, payload text)")
+        db.execute("insert into t values (1, '{ \"a\": 1 }')")
+        db.commit()
+        ds = Datasette(
+            [db_path],
+            config={
+                "databases": {
+                    "data": {"tables": {"t": {"column_types": {"payload": "upper"}}}}
+                }
+            },
+        )
+        await ds.invoke_startup()
+        # The transform is applied to the default output
+        response = await ds.client.get("/data/t.json")
+        assert response.json()["rows"][0]["payload"] == '{ "A": 1 }'
+        # But _json_raw reports the stored text and parses that instead
+        response = await ds.client.get("/data/t.json?_json=payload&_json_raw=1")
+        assert response.status_code == 200
+        assert response.json()["rows"][0]["payload"] == {
+            "raw": '{ "a": 1 }',
+            "parsed": {"a": 1},
+            "error": None,
+        }
+        db.close()
+        for database in ds.databases.values():
+            if not database.is_memory:
+                database.close()
+    finally:
+        pm.unregister(plugin, name="test_json_raw_transform_ct")
+
+
 # --- Column type priority over plugins ---
 
 

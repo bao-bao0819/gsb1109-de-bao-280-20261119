@@ -2,6 +2,16 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Added an optional, classified cell error report: `Table.iterdicts(report_errors=...)` and
+  `Table.read_rows(report_errors=True)` collect `CellError` objects distinguishing unparseable
+  lexical values (`CELL_ERROR_INVALID_VALUE`) from values that parse but violate datatype
+  constraints such as minimum/maximum (`CELL_ERROR_OUT_OF_RANGE`), including per-element errors
+  in list-valued columns. Reading semantics with and without the report are identical.
+
+
 Version 4.2.0
 -------------
 

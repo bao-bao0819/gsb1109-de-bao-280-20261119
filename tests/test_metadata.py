@@ -908,3 +908,220 @@ def test_CSVW():
     assert res.to_json()
     res = csvw.CSVW(FIXTURES / 'csv.txt-table-metadata.json')
     assert res.to_json()
+
+
+DATE_LIST_METADATA = {
+    "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+    "url": "dates.csv",
+    "tableSchema": {"columns": [
+        {"name": "id", "datatype": "string"},
+        {"name": "events",
+         "separator": ";",
+         "null": ["NA"],
+         "default": "2005-01-01",
+         "datatype": {"base": "date",
+                      "format": "yyyy-MM-dd",
+                      "minimum": "2000-01-01",
+                      "maximum": "2030-12-31"}},
+    ]},
+}
+
+# Row r1 spans two physical lines. Its list holds an unreadable string (which contains the
+# embedded newline), a readable but out-of-range date, a null marker and a valid date.
+DATE_LIST_DATA = {
+    'invalid_first': (
+        "id,events\r\n"
+        "r1,\"bad\r\ndate;1999-12-31;NA;2021-05-10\"\r\n"
+        "r2,2020-02-02;\r\n"
+    ),
+    # Same content, only the order of the two problematic dates is swapped.
+    'out_of_range_first': (
+        "id,events\r\n"
+        "r1,\"1999-12-31;bad\r\ndate;NA;2021-05-10\"\r\n"
+        "r2,2020-02-02;\r\n"
+    ),
+}
+
+
+def _date_list_table(tmp_path, data):
+    table = csvw.Table.fromvalue(DATE_LIST_METADATA)
+    data_path = tmp_path / 'dates.csv'
+    data_path.write_text(data, encoding='utf-8', newline='')
+    return table, data_path
+
+
+@pytest.mark.parametrize('variant', ['invalid_first', 'out_of_range_first'])
+def test_cell_error_report_classifies_list_dates(tmp_path, variant):
+    table, data_path = _date_list_table(tmp_path, DATE_LIST_DATA[variant])
+
+    with warnings.catch_warnings(record=True) as warnings_with_report:
+        warnings.simplefilter('always')
+        errors = []
+        rows = list(table.iterdicts(
+            fname=str(data_path), strict=False, report_errors=errors))
+
+    # The fully valid row is untouched: valid date plus the default for the empty item.
+    assert rows[1] == {
+        'id': 'r2',
+        'events': [datetime.datetime(2020, 2, 2), datetime.datetime(2005, 1, 1)],
+    }
+    # Null and default items must never be reported as bad formats.
+    assert rows[0]['events'][2] is None
+    assert all(e.element_number not in (3, 4) for e in errors)
+
+    # Both real problems are reported, pointing at the same source row and column,
+    # regardless of which bad item comes first.
+    assert len(errors) == 2
+    assert {e.lineno for e in errors} == {3}
+    assert {e.column_number for e in errors} == {2}
+    assert {e.column_name for e in errors} == {'events'}
+
+    by_element = {e.element_number: e for e in errors}
+    if variant == 'invalid_first':
+        invalid_element, range_element = 1, 2
+    else:
+        range_element, invalid_element = 1, 2
+
+    invalid_error = by_element[invalid_element]
+    range_error = by_element[range_element]
+
+    assert invalid_error.error_type == csvw.CELL_ERROR_INVALID_VALUE
+    assert invalid_error.value == 'bad\r\ndate'  # original value is preserved
+    assert invalid_error.parsed_value is None
+
+    assert range_error.error_type == csvw.CELL_ERROR_OUT_OF_RANGE
+    assert range_error.value == '1999-12-31'  # original value is preserved
+    assert range_error.parsed_value == datetime.datetime(1999, 12, 31)
+
+    # The pre-existing warning semantics are unchanged.
+    assert [str(w.message) for w in warnings_with_report] == [
+        'Invalid value for list element.']
+
+
+@pytest.mark.parametrize('variant', ['invalid_first', 'out_of_range_first'])
+def test_report_does_not_change_public_semantics(tmp_path, variant):
+    # Non-strict: rows and warnings are identical with and without the report.
+    table, data_path = _date_list_table(tmp_path, DATE_LIST_DATA[variant])
+    with warnings.catch_warnings(record=True) as w_off:
+        warnings.simplefilter('always')
+        rows_off = list(table.iterdicts(fname=str(data_path), strict=False))
+
+    table, data_path = _date_list_table(tmp_path, DATE_LIST_DATA[variant])
+    with warnings.catch_warnings(record=True) as w_on:
+        warnings.simplefilter('always')
+        rows_on = list(table.iterdicts(
+            fname=str(data_path), strict=False, report_errors=[]))
+
+    assert rows_on == rows_off
+    assert [str(w.message) for w in w_on] == [str(w.message) for w in w_off]
+
+    # Strict: both modes reject the row, with the same exception message.
+    table, data_path = _date_list_table(tmp_path, DATE_LIST_DATA[variant])
+    with pytest.raises(ValueError) as exc_off:
+        list(table.iterdicts(fname=str(data_path), strict=True))
+
+    table, data_path = _date_list_table(tmp_path, DATE_LIST_DATA[variant])
+    errors = []
+    with pytest.raises(ValueError) as exc_on:
+        list(table.iterdicts(
+            fname=str(data_path), strict=True, report_errors=errors))
+
+    assert str(exc_on.value) == str(exc_off.value)
+    # Even though strict mode rejects the row, all list elements were classified.
+    assert len(errors) == 2
+    assert {e.error_type for e in errors} == {
+        csvw.CELL_ERROR_INVALID_VALUE, csvw.CELL_ERROR_OUT_OF_RANGE}
+
+
+def test_read_rows_helper_and_scalar_classification(tmp_path):
+    table, data_path = _date_list_table(
+        tmp_path, DATE_LIST_DATA['invalid_first'])
+    rows, errors = table.read_rows(
+        fname=str(data_path), strict=False, report_errors=True)
+    assert len(rows) == 2
+    assert len(errors) == 2
+
+    # Without requesting a report the helper returns an empty error list.
+    table, data_path = _date_list_table(
+        tmp_path, DATE_LIST_DATA['invalid_first'])
+    rows, errors = table.read_rows(fname=str(data_path), strict=False)
+    assert len(rows) == 2
+    assert errors == []
+
+    # Scalar cells are classified too: unparseable vs. parseable but out of range.
+    metadata = {
+        "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+        "url": "scalar.csv",
+        "tableSchema": {"columns": [
+            {"name": "id", "datatype": "string"},
+            {"name": "d",
+             "datatype": {"base": "date", "format": "yyyy-MM-dd",
+                          "minimum": "2000-01-01"}},
+        ]},
+    }
+    table = csvw.Table.fromvalue(metadata)
+    scalar_path = tmp_path / 'scalar.csv'
+    scalar_path.write_text(
+        'id,d\na,nope\nb,1998-01-01\nc,2001-01-01\r\n', encoding='utf-8')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        rows, errors = table.read_rows(
+            fname=str(scalar_path), strict=False, report_errors=True)
+    assert len(rows) == 3
+    assert [e.error_type for e in errors] == [
+        csvw.CELL_ERROR_INVALID_VALUE, csvw.CELL_ERROR_OUT_OF_RANGE]
+    assert errors[0].element_number is None
+    assert errors[0].value == 'nope'
+    assert errors[1].value == '1998-01-01'
+    assert errors[1].parsed_value == datetime.datetime(1998, 1, 1)
+    assert {e.lineno for e in errors} == {2, 3}
+
+
+def test_column_read_without_report_keeps_first_error_behaviour():
+    col = csvw.Column.fromvalue({
+        'name': 'events',
+        'separator': ';',
+        'null': ['NA'],
+        'datatype': {'base': 'date', 'format': 'yyyy-MM-dd',
+                     'minimum': '2000-01-01'},
+    })
+    # Existing callers not passing a report still get the original ValueError, raised at
+    # the first bad list element.
+    with pytest.raises(ValueError, match='nope'):
+        col.read('nope;1999-12-31;NA;2021-05-10')
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        result = col.read('nope;1999-12-31;NA;2021-05-10', strict=False)
+    assert result == ['nope', '1999-12-31', None, '2021-05-10']
+    assert [str(w.message) for w in caught] == ['Invalid value for list element.']
+
+
+def test_required_missing_is_not_classified_as_bad_value(tmp_path):
+    metadata = {
+        "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+        "url": "req.csv",
+        "tableSchema": {"columns": [
+            {"name": "id", "required": True, "datatype": "string"},
+            {"name": "d", "datatype": {"base": "date", "minimum": "2000-01-01"}},
+        ]},
+    }
+    table = csvw.Table.fromvalue(metadata)
+    req_path = tmp_path / 'req.csv'
+    req_path.write_text('id,d\n,nope\n', encoding='utf-8')
+
+    # Strict mode still raises the expected ValueError for the missing required value.
+    with pytest.raises(ValueError, match='required column value is missing'):
+        list(table.iterdicts(fname=str(req_path), strict=True, report_errors=[]))
+
+    # Non-strict: the missing required value is not listed as a bad-format/range error;
+    # the genuinely unparseable date still is.
+    table = csvw.Table.fromvalue(metadata)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        rows, errors = table.read_rows(
+            fname=str(req_path), strict=False, report_errors=True)
+    assert len(rows) == 1
+    assert len(errors) == 1
+    assert errors[0].column_name == 'd'
+    assert errors[0].error_type == csvw.CELL_ERROR_INVALID_VALUE

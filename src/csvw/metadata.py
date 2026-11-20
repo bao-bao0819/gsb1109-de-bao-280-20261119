@@ -13,7 +13,7 @@ import json
 import shutil
 import decimal
 import pathlib
-from typing import Optional, Union, Any, Literal, TypeVar
+from typing import Optional, Union, Any, Literal, TypeVar, Callable
 import zipfile
 import datetime
 import operator
@@ -39,9 +39,16 @@ from .metadata_utils import DescriptionBase, dataclass_asdict, NAMESPACES, diale
 
 DEFAULT = object()
 
+#: Classification of a cell (or list element) value that cannot be parsed into the datatype.
+CELL_ERROR_INVALID_VALUE = 'invalid_value'
+#: Classification of a value that can be parsed, but violates a datatype constraint
+#: (e.g. a date outside the allowed minimum/maximum interval).
+CELL_ERROR_OUT_OF_RANGE = 'out_of_range'
+
 __all__ = [
     'TableGroup', 'Table', 'Column', 'ForeignKey', 'Link', 'NaturalLanguage', 'Datatype',
-    'is_url', 'CSVW',
+    'is_url', 'CSVW', 'CellError',
+    'CELL_ERROR_INVALID_VALUE', 'CELL_ERROR_OUT_OF_RANGE',
 ]
 
 is_url = utils.is_url
@@ -206,6 +213,28 @@ class NaturalLanguage(collections.OrderedDict):
     def getfirst(self, lang: Optional[str] = None) -> Optional[str]:
         """Return the first string specified for the given language tag."""
         return self.get(lang, [None])[0]
+
+
+class _ValueConstraintError(ValueError):
+    """
+    Raised when a lexical value could be parsed, but the parsed value violates a datatype
+    constraint (e.g. a date outside the allowed interval).
+
+    It is a `ValueError` subclass so strict-mode handling which catches `ValueError` keeps
+    working unchanged, while code collecting a classified error report can distinguish
+    constraint violations from unparseable lexical values.
+    """
+    def __init__(self, msg: str, parsed_value: Any):
+        super().__init__(msg)
+        self.parsed_value = parsed_value
+
+
+class _RequiredColumnError(ValueError):
+    """
+    Raised when a required column has no value. It is neither an unparseable lexical value
+    nor a constraint violation on a parsed value, so it is not part of the classified
+    cell error report (its existing warning/log handling is unchanged).
+    """
 
 
 @dataclasses.dataclass
@@ -377,17 +406,17 @@ class Datatype(DescriptionBase):  # pylint: disable=too-many-instance-attributes
             pass
         if self.basetype.minmax:
             if self.minimum is not None and v < self.minimum:
-                raise ValueError(f'value must be >= {self.minimum}')
+                raise _ValueConstraintError(f'value must be >= {self.minimum}', v)
             if self.minInclusive is not None and v < self.minInclusive:
-                raise ValueError(f'value must be >= {self.minInclusive}')
+                raise _ValueConstraintError(f'value must be >= {self.minInclusive}', v)
             if self.minExclusive is not None and v <= self.minExclusive:
-                raise ValueError(f'value must be > {self.minExclusive}')
+                raise _ValueConstraintError(f'value must be > {self.minExclusive}', v)
             if self.maximum is not None and v > self.maximum:
-                raise ValueError(f'value must be <= {self.maximum}')
+                raise _ValueConstraintError(f'value must be <= {self.maximum}', v)
             if self.maxInclusive is not None and v > self.maxInclusive:
-                raise ValueError(f'value must be <= {self.maxInclusive}')
+                raise _ValueConstraintError(f'value must be <= {self.maxInclusive}', v)
             if self.maxExclusive is not None and v >= self.maxExclusive:
-                raise ValueError(f'value must be < {self.maxExclusive}')
+                raise _ValueConstraintError(f'value must be < {self.maxExclusive}', v)
         return v
 
     def read(self, v: str) -> Any:
@@ -522,8 +551,15 @@ class Column(Description):
     def header(self) -> str:  # pylint: disable=missing-function-docstring
         return f'{self}'
 
-    def read(self, v: str, strict=True) -> Any:
-        """Convert a str to a Python object according to the spec for the column."""
+    def read(self, v: str, strict=True, report: Optional[Callable] = None) -> Any:
+        """Convert a str to a Python object according to the spec for the column.
+
+        :param report: Optional callable ``report(error_type, value, element_number, error)``
+            invoked for every problematic value during the actual processing. It is used to
+            collect a classified error report (see :class:`CellError`) without changing the
+            parsing result or strict-mode behaviour. When `None`, processing behaves exactly
+            as without reporting.
+        """
         required = self.inherit('required')
         null = self.inherit_null()
         default = self.inherit('default')
@@ -534,7 +570,7 @@ class Column(Description):
             v = default
 
         if required and (v in null):
-            raise ValueError('required column value is missing')
+            raise _RequiredColumnError('required column value is missing')
 
         if separator:  # A list-valued column.
             if not v:
@@ -549,15 +585,52 @@ class Column(Description):
 
         if datatype:  # Apply datatype conversion.
             if isinstance(v, list):
-                try:
-                    return [datatype.read(vv) for vv in v]
-                except ValueError:
-                    if not strict:
-                        warnings.warn('Invalid value for list element.')
-                        return v
-                    raise
+                return self._read_list(v, datatype, strict, report)
             return datatype.read(v)
         return v
+
+    @staticmethod
+    def _classify_error(error: ValueError) -> str:
+        if isinstance(error, _ValueConstraintError):
+            return CELL_ERROR_OUT_OF_RANGE
+        return CELL_ERROR_INVALID_VALUE
+
+    def _read_list(self, values: list, datatype, strict: bool,
+                   report: Optional[Callable]) -> list:
+        if report is None:
+            # Without a report request the original behaviour is preserved exactly:
+            # processing stops at the first bad list element.
+            try:
+                return [datatype.read(vv) for vv in values]
+            except ValueError:
+                if not strict:
+                    warnings.warn('Invalid value for list element.')
+                    return values
+                raise
+
+        # With a report request every element is processed so that a later problem is not
+        # hidden by an earlier bad one. Null elements are not considered bad values.
+        parsed = []
+        first_error = None
+        for element_number, value in enumerate(values, start=1):
+            if value is None:
+                parsed.append(None)
+                continue
+            try:
+                parsed.append(datatype.read(value))
+            except ValueError as e:
+                report(self._classify_error(e), value, element_number, e)
+                if first_error is None:
+                    first_error = e
+                parsed.append(value)
+        if first_error is not None:
+            if strict:
+                # Strict mode still rejects the row - with the same error it would have
+                # raised without reporting - after all elements have been classified.
+                raise first_error
+            warnings.warn('Invalid value for list element.')
+            return values
+        return parsed
 
     def write(self, v: Any) -> str:
         """Convert v to a string according to the specifications for the column."""
@@ -896,6 +969,42 @@ class CsvRow:
     row: list[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class CellError:
+    """
+    A problem encountered while processing a single cell value (or a single element of a
+    list-valued cell), classified based on the actual processing - not based on warning text.
+
+    :ivar error_type: One of :const:`CELL_ERROR_INVALID_VALUE` (the lexical value could not be
+        parsed) or :const:`CELL_ERROR_OUT_OF_RANGE` (the value parsed, but violated a datatype
+        constraint such as minimum/maximum).
+    :ivar column_name: Header of the column the cell belongs to.
+    :ivar column_number: 1-based position of the column in the table.
+    :ivar lineno: 1-based number of the text line of the row as reported by
+        :class:`csvw.dsv.UnicodeReaderWithLineNumber` (the last physical line of a
+        quoted multi-line row).
+    :ivar element_number: 1-based index of the problematic value within a list-valued cell,
+        or `None` for ordinary (single-valued) cells.
+    :ivar value: The original lexical value as read from the CSV.
+    :ivar parsed_value: The parsed Python value in case of an out-of-range error, else `None`.
+    :ivar message: Description of the underlying problem.
+    """
+    error_type: str
+    column_name: str
+    column_number: int
+    lineno: int
+    value: str
+    element_number: Optional[int] = None
+    parsed_value: Any = None
+    message: Optional[str] = None
+
+    def __str__(self):
+        location = f'{self.column_name}[{self.element_number}]' if self.element_number \
+            else self.column_name
+        return f'line {self.lineno}, column {self.column_number} ({location}): ' \
+               f'{self.error_type}: {self.message or self.value}'
+
+
 @dataclasses.dataclass
 class RowParseSpec:
     """A bag of attributes used when parsing a CSV row."""
@@ -903,11 +1012,17 @@ class RowParseSpec:
     log: Optional[logging.Logger]
     row_implementation: type = collections.OrderedDict
     error: bool = False
+    cell_errors: Optional[list[CellError]] = None
 
     def log_error(self, msg: str):
         """Log and record error."""
         utils.log_or_raise(msg, log=self.log)
         self.error = True
+
+    def record_cell_error(self, cell_error: CellError):
+        """Record a classified cell error, when an error report has been requested."""
+        if self.cell_errors is not None:
+            self.cell_errors.append(cell_error)
 
 
 @dataclasses.dataclass
@@ -1099,18 +1214,41 @@ class Table(TableLike):
     ) -> RowType:
         required = {h: j for j, h, c in header_cols if c and c.required}
         res = parse_spec.row_implementation()
+        reporting = parse_spec.cell_errors is not None
+
+        def report(error_type: str, value: str, element_number: Optional[int],
+                   error: ValueError):
+            parse_spec.record_cell_error(CellError(
+                error_type=error_type,
+                column_name=k,
+                column_number=j + 1,
+                lineno=row.lineno,
+                element_number=element_number,
+                value=value,
+                parsed_value=getattr(error, 'parsed_value', None),
+                message=str(error),
+            ))
 
         for (j, k, col), v in zip(header_cols, row.row):
             # see http://w3c.github.io/csvw/syntax/#parsing-cells
             if col:
                 try:
-                    res[col.header] = col.read(v, strict=parse_spec.strict)
+                    res[col.header] = col.read(
+                        v,
+                        strict=parse_spec.strict,
+                        report=report if reporting else None)
                 except ValueError as e:
                     if not parse_spec.strict:
                         warnings.warn(f'Invalid column value: {v} {col.datatype}; {e}')
                         res[col.header] = v
                     else:
                         parse_spec.log_error(f'{row.fname}:{row.lineno}:{j + 1} {k}: {e}')
+                    if reporting and not col.inherit('separator') and \
+                            not isinstance(e, _RequiredColumnError):
+                        # List element errors are recorded individually via `report`;
+                        # here only ordinary (single-valued) cell value errors are
+                        # recorded. Missing required values are not bad formats.
+                        report(Column._classify_error(e), v, None, e)
                 if k in required:
                     del required[k]
             else:
@@ -1176,6 +1314,7 @@ class Table(TableLike):
             fname=None,
             _Row: type = collections.OrderedDict,  # pylint: disable=invalid-name
             strict=True,
+            report_errors: Optional[list] = None,
     ) -> Generator[Union[dict[str, Any], tuple[str, int, dict[str, Any]]], None, None]:
         """Iterate over the rows of the table
 
@@ -1195,6 +1334,11 @@ class Table(TableLike):
         :param strict: Flag signaling whether data is read strictly - i.e. raising `ValueError` \
         when invalid data is encountered - or not - i.e. only issueing a warning and returning \
         invalid data as `str` as provided by the undelying DSV reader.
+        :param report_errors: Pass a list to switch on the classified error report. Every \
+        problematic cell (or list element) encountered during processing is appended to it as \
+        a :class:`CellError`. Passing `None` (the default) leaves all parsing behaviour \
+        unchanged; in particular the public semantics of yielded rows, strict-mode rejection \
+        and non-strict fall-back values are identical with or without reporting.
         :return: A generator of dicts or triples (fname, lineno, dict) if with_metadata
         """
         dialect = self._get_dialect()
@@ -1225,7 +1369,9 @@ class Table(TableLike):
                     if missing:
                         raise ValueError(f'{fname} is missing required columns {missing}')
 
-                parse_spec = RowParseSpec(strict=strict, log=log, row_implementation=_Row)
+                parse_spec = RowParseSpec(
+                    strict=strict, log=log, row_implementation=_Row,
+                    cell_errors=report_errors)
                 res = self._read_row(
                     CsvRow(fname=fname, lineno=lineno, row=row),
                     parse_spec,
@@ -1235,6 +1381,31 @@ class Table(TableLike):
                 if not parse_spec.error:
                     yield (fname, lineno, res) if with_metadata else res
         self._comments = reader.comments
+
+    def read_rows(
+            self,
+            strict: bool = True,
+            log: Optional[logging.Logger] = None,
+            fname=None,
+            report_errors: bool = False,
+    ) -> tuple[list[RowType], list]:
+        """Read all rows of the table, optionally with a classified cell error report.
+
+        :param report_errors: When `True`, a list of :class:`CellError` instances is returned
+            alongside the rows. The classification is derived from the actual processing
+            (unparseable lexical values vs. parsed values violating constraints), never from
+            matching warning messages.
+        :return: A pair ``(rows, cell_errors)``. With ``report_errors=False`` the second
+            element is always an empty list and reading behaves exactly as `iterdicts`.
+        """
+        errors: list[CellError] = []
+        rows = list(self.iterdicts(
+            log=log,
+            fname=fname,
+            strict=strict,
+            report_errors=errors if report_errors else None,
+        ))
+        return rows, errors
 
 
 @dataclasses.dataclass(frozen=True)

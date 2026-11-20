@@ -4,6 +4,7 @@ csvw - https://w3c.github.io/csvw/primer/
 
 from .metadata import (
     TableGroup, Table, Column, ForeignKey, Link, NaturalLanguage, Datatype, URITemplate, CSVW,
+    CellError, CELL_ERROR_INVALID_VALUE, CELL_ERROR_OUT_OF_RANGE,
     Dialect)
 
 from .dsv import (UnicodeWriter,
@@ -20,6 +21,8 @@ __all__ = [
     'UnicodeReader', 'UnicodeReaderWithLineNumber', 'UnicodeDictReader', 'NamedTupleReader',
     'iterrows', 'rewrite',
     'CSVW',
+    'CellError',
+    'CELL_ERROR_INVALID_VALUE', 'CELL_ERROR_OUT_OF_RANGE',
 ]
 
 __title__ = 'csvw'

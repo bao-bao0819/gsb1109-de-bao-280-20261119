@@ -59,6 +59,32 @@ such mechanisms. This part of the spec is implemented in :class:`csvw.CSVW`.
     :members:
 
 
+Classified cell error reports
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, reading data strictly raises a `ValueError` at the first problem while non-strict
+reading only warns and returns the original string. To route rejects to different teams based on
+the *kind* of problem, pass a list as `report_errors` to :meth:`csvw.Table.iterdicts` (or use
+:meth:`csvw.Table.read_rows`). Each problematic cell - and each problematic element of a
+list-valued cell - is then appended as a :class:`csvw.CellError` while the public semantics of
+the reading stay unchanged.
+
+The classification is derived from the actual processing, not from warning text:
+
+- `csvw.CELL_ERROR_INVALID_VALUE`: the lexical value could not be parsed.
+- `csvw.CELL_ERROR_OUT_OF_RANGE`: the value was parsed, but violates a datatype constraint
+  such as `minimum`/`maximum`; the parsed value is retained on the report.
+
+.. code-block:: python
+
+    >>> rows, errors = table.read_rows(strict=False, report_errors=True)
+    >>> [(e.column_name, e.element_number, e.error_type) for e in errors]
+    [('events', 1, 'invalid_value'), ('events', 2, 'out_of_range')]
+
+.. autoclass:: csvw.CellError
+    :members:
+
+
 Top-level descriptions
 ----------------------
 

@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import decimal
 import io
 import itertools
 import tokenize
@@ -37,7 +38,7 @@ POLYGON ((30 10, 40 40, 20 40, 10 20, 30 10))
 INVALID_WKT_FMT = 'Invalid WKT: `%s`'
 
 
-def dump(obj, dest_file):
+def dump(obj, dest_file, decimals=16, exact=False, use_float=None):
     """
     Dump GeoJSON-like `dict` to WKT and write it to the `dest_file`.
 
@@ -46,27 +47,75 @@ def dump(obj, dest_file):
         'coordinates'.
     :param dest_file:
         Open and writable file-like object.
+    :param bool exact:
+        Accepted for symmetry with :func:`loads`; coordinate formatting
+        already keeps integral values exact.
+    :param bool use_float:
+        Backwards-compatible alias for ``exact=not use_float``.
     """
-    dest_file.write(dumps(obj))
+    dest_file.write(dumps(
+        obj,
+        decimals=decimals,
+        exact=exact,
+        use_float=use_float,
+    ))
 
 
-def load(source_file):
+def load(source_file, exact=False, use_float=None):
     """
     Load a GeoJSON `dict` object from a ``source_file`` containing WKT.
 
     :param source_file:
         Open and readable file-like object.
+    :param bool exact:
+        If `True`, coordinates are parsed without losing digits.  Integral
+        values are returned as :class:`int` and other values as
+        :class:`decimal.Decimal`.  The default preserves the historical
+        `float` behaviour.
+    :param bool use_float:
+        Backwards-compatible alias for ``exact=not use_float``.
 
     :returns:
         A GeoJSON `dict` representing the geometry read from the file.
     """
-    return loads(source_file.read())
+    return loads(
+        source_file.read(),
+        exact=_exact_flag(exact, use_float),
+    )
 
 
-def dumps(obj, decimals=16):
+def load_exact(source_file):
+    """Load WKT from ``source_file`` without narrowing coordinates to float."""
+    return load(source_file, exact=True)
+
+
+def loads_exact(string):
+    """Parse WKT ``string`` without narrowing coordinates to float."""
+    return loads(string, exact=True)
+
+
+def dumps_exact(obj, decimals=16):
+    """
+    Dump a GeoJSON-like `dict` to WKT, keeping integer/decimal coordinates
+    exact at the requested number of places.
+    """
+    return dumps(obj, decimals=decimals, exact=True)
+
+
+def dumps(obj, decimals=16, exact=False, use_float=None):
     """
     Dump a GeoJSON-like `dict` to a WKT string.
+
+    :param int decimals:
+        Number of digits to display after the decimal point.
+    :param bool exact:
+        Accepted for symmetry with :func:`loads`; coordinate formatting
+        already keeps integral values exact.
+    :param bool use_float:
+        Backwards-compatible alias for ``exact=not use_float``.
     """
+    if use_float is not None:
+        exact = _exact_flag(exact, use_float)
     try:
         geom_type = obj['type']
         exporter = _dumps_registry.get(geom_type)
@@ -117,10 +166,21 @@ def _assert_next_token(sequence, expected):
         )
 
 
-def loads(string):
+def loads(string, exact=False, use_float=None):
     """
     Construct a GeoJSON `dict` from WKT (`string`).
+
+    :param bool exact:
+        If `True`, coordinates are parsed without losing digits.  Integral
+        values are returned as :class:`int` and other values as
+        :class:`decimal.Decimal`, so values beyond the precision of a
+        `float` keep their exact decimal representation.  The default
+        preserves the historical `float` behaviour.
+    :param bool use_float:
+        Backwards-compatible alias for ``exact=not use_float``; when it is
+        given it takes precedence over `exact`.
     """
+    exact = _exact_flag(exact, use_float)
     tokens = _tokenize_wkt(string)
     geom_type_or_srid = next(tokens)
     srid = None
@@ -150,7 +210,7 @@ def loads(string):
 
     # Put the peeked element back on the head of the token generator
     tokens = itertools.chain([peek], tokens)
-    result = importer(tokens, string)
+    result = importer(tokens, string, exact=exact)
     if srid is not None:
         result['meta'] = dict(srid=srid)
     return result
@@ -188,6 +248,13 @@ def _unsupported_geom_type(geom_type):
     raise ValueError("Unsupported geometry type '%s'" % geom_type)
 
 
+def _exact_flag(exact, use_float):
+    """Resolve the historical `use_float` alias against `exact`."""
+    if use_float is None:
+        return exact
+    return not use_float
+
+
 def _round_and_pad(value, decimals):
     """
     Round the input value to `decimals` places, and pad with 0's
@@ -200,14 +267,19 @@ def _round_and_pad(value, decimals):
     :return:
         str of the rounded value
     """
-    if isinstance(value, int) and decimals != 0:
-        # If the coordinate is an integer and decimals is non-zero,
-        # convert it to a float for padding.
-        value = float(value)
-
-    elif decimals == 0:
+    if decimals == 0:
         # if get a `decimals` value of 0, we want to return an int.
+        if isinstance(value, decimal.Decimal):
+            return repr(int(_quantize_decimal(value, decimals)))
         return repr(int(round(value, decimals)))
+
+    if isinstance(value, decimal.Decimal):
+        return _format_decimal(value, decimals)
+
+    if isinstance(value, int):
+        # Integers are formatted exactly instead of going through a float,
+        # which would collapse neighbours above 2**53.
+        return _format_decimal(decimal.Decimal(value), decimals)
 
     rounded = round(value, decimals)
 
@@ -217,6 +289,61 @@ def _round_and_pad(value, decimals):
         rounded = repr(rounded)
     rounded += '0' * (decimals - len(rounded.split('.')[1]))
     return rounded
+
+
+def _quantize_decimal(value, decimals):
+    """Round a Decimal to `decimals` places, half-even, without context loss.
+    """
+    with decimal.localcontext() as ctx:
+        digits = len(value.as_tuple().digits)
+        ctx.prec = max(ctx.prec, value.adjusted() + decimals + 2,
+                       digits + decimals + 2)
+        ctx.rounding = decimal.ROUND_HALF_EVEN
+        return value.quantize(decimal.Decimal(1).scaleb(-decimals))
+
+
+def _format_decimal(value, decimals):
+    """
+    Render a :class:`decimal.Decimal` with exactly `decimals` places.
+
+    The value is rounded using the current decimal context (half-even by
+    default), matching :func:`round` for floats.  Trailing zeros are kept so
+    that the output has the same shape as :func:`_round_and_pad`.
+    """
+    return format(_quantize_decimal(value, decimals),
+                  '.{}f'.format(decimals))
+
+
+def _parse_coordinate(token, exact):
+    """
+    Convert a WKT numeric token to a Python number.
+
+    With ``exact=True``, values whose fractional part is only padding zeros
+    (such as ``12.0000``) are returned as :class:`int`, so counts larger
+    than 2**53 survive.  Negative zero keeps its sign.  A value is narrowed
+    to a `float` only when the float's decimal form is the same number, so
+    ordinary coordinates keep the historical representation and its
+    rounding behaviour, while a large value with a non-zero fractional part
+    stays a :class:`decimal.Decimal` instead of being mistaken for a padded
+    integer.  With ``exact=False`` the historical ``float`` conversion is
+    used for every value.
+    """
+    if not exact:
+        return float(token)
+
+    value = decimal.Decimal(token)
+    if not value.is_finite():
+        return float(token)
+    if value.is_zero() and value.is_signed():
+        # Keep the sign of a negative zero; int() would discard it.
+        return -0.0
+    if value == value.to_integral_value():
+        return int(value)
+
+    as_float = float(token)
+    if decimal.Decimal(repr(as_float)) == value:
+        return as_float
+    return value
 
 
 def _dump_point(obj, decimals):
@@ -385,7 +512,7 @@ def _dump_geometrycollection(obj, decimals):
     return 'GEOMETRYCOLLECTION %s' % fmt
 
 
-def _load_point(tokens, string):
+def _load_point(tokens, string, exact=False):
     """
     :param tokens:
         A generator of string tokens for the input WKT, beginning just after
@@ -414,14 +541,14 @@ def _load_point(tokens, string):
             if t == ')':
                 break
             else:
-                coords.append(float(t))
+                coords.append(_parse_coordinate(t, exact))
     except tokenize.TokenError:
         raise ValueError(INVALID_WKT_FMT % string)
 
     return dict(type='Point', coordinates=coords)
 
 
-def _load_linestring(tokens, string):
+def _load_linestring(tokens, string, exact=False):
     """
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling LINESTRING geometry.
@@ -450,14 +577,14 @@ def _load_linestring(tokens, string):
                 coords.append(pt)
                 pt = []
             else:
-                pt.append(float(t))
+                pt.append(_parse_coordinate(t, exact))
     except tokenize.TokenError:
         raise ValueError(INVALID_WKT_FMT % string)
 
     return dict(type='LineString', coordinates=coords)
 
 
-def _load_polygon(tokens, string):
+def _load_polygon(tokens, string, exact=False):
     """
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling POLYGON geometry.
@@ -505,14 +632,14 @@ def _load_polygon(tokens, string):
                 # do nothing
                 pass
             else:
-                pt.append(float(t))
+                pt.append(_parse_coordinate(t, exact))
     except tokenize.TokenError:
         raise ValueError(INVALID_WKT_FMT % string)
 
     return dict(type='Polygon', coordinates=coords)
 
 
-def _load_multipoint(tokens, string):
+def _load_multipoint(tokens, string, exact=False):
     """
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling MULTIPOINT geometry.
@@ -544,7 +671,7 @@ def _load_multipoint(tokens, string):
                 coords.append(pt)
                 pt = []
             else:
-                pt.append(float(t))
+                pt.append(_parse_coordinate(t, exact))
     except tokenize.TokenError:
         raise ValueError(INVALID_WKT_FMT % string)
 
@@ -556,7 +683,7 @@ def _load_multipoint(tokens, string):
     return dict(type='MultiPoint', coordinates=coords)
 
 
-def _load_multipolygon(tokens, string):
+def _load_multipolygon(tokens, string, exact=False):
     """
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling MULTIPOLYGON geometry.
@@ -574,7 +701,7 @@ def _load_multipolygon(tokens, string):
     polygons = []
     while True:
         try:
-            poly = _load_polygon(tokens, string)
+            poly = _load_polygon(tokens, string, exact=exact)
             polygons.append(poly['coordinates'])
             t = next(tokens)
             if t == ')':
@@ -587,7 +714,7 @@ def _load_multipolygon(tokens, string):
     return dict(type='MultiPolygon', coordinates=polygons)
 
 
-def _load_multilinestring(tokens, string):
+def _load_multilinestring(tokens, string, exact=False):
     """
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling MULTILINESTRING geometry.
@@ -605,7 +732,7 @@ def _load_multilinestring(tokens, string):
     linestrs = []
     while True:
         try:
-            linestr = _load_linestring(tokens, string)
+            linestr = _load_linestring(tokens, string, exact=exact)
             linestrs.append(linestr['coordinates'])
             t = next(tokens)
             if t == ')':
@@ -618,7 +745,7 @@ def _load_multilinestring(tokens, string):
     return dict(type='MultiLineString', coordinates=linestrs)
 
 
-def _load_geometrycollection(tokens, string):
+def _load_geometrycollection(tokens, string, exact=False):
     """
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling GEOMETRYCOLLECTIONs.
@@ -649,7 +776,7 @@ def _load_geometrycollection(tokens, string):
             else:
                 geom_type = t
                 load_func = _loads_registry.get(geom_type)
-                geom = load_func(tokens, string)
+                geom = load_func(tokens, string, exact=exact)
                 geoms.append(geom)
         except (StopIteration, tokenize.TokenError):
             raise ValueError(INVALID_WKT_FMT % string)

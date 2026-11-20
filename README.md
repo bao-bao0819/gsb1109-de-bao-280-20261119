@@ -89,6 +89,29 @@ Converting 'Point' WKT to GeoJSON:
     >>> wkt.loads('POINT(10 20)')
     {'type': 'Point', 'coordinates': [10.0, 20.0]}
 
+By default WKT coordinates are read as `float`. For values that do not fit a
+binary float, such as the adjacent integer counts `9007199254740992` and
+`9007199254740993`, use the optional fidelity path. It returns coordinates
+with only padding zeros as `int`, negative zero as `-0.0`, and values whose
+fractional digits cannot be represented exactly as `decimal.Decimal`:
+
+    >>> wkt.dumps_exact(
+    ...     {'type': 'MultiPoint',
+    ...      'coordinates': [[9007199254740992, 1.23456],
+    ...                      [9007199254740993, 1.23456]]},
+    ...     decimals=4)
+    'MULTIPOINT ((9007199254740992.0000 1.2346), (9007199254740993.0000 1.2346))'
+    >>> wkt.dumps_exact(
+    ...     wkt.loads_exact(
+    ...         'MULTIPOINT ((9007199254740992.0000 1.2346), '
+    ...         '(9007199254740993.0000 1.2346))'),
+    ...     decimals=4)
+    'MULTIPOINT ((9007199254740992.0000 1.2346), (9007199254740993.0000 1.2346))'
+
+The same mode is available on the streaming helpers as `exact=True`
+(`load`/`loads`/`dump`/`dumps`), and `use_float=False` is accepted as an
+equivalent spelling. The default `wkt.loads`/`wkt.load` behaviour is unchanged.
+
 Converting 'GeometryCollection' WKT to GeoJSON:
 
     >>> wkt.loads('GEOMETRYCOLLECTION(POINT(10 20),POLYGON(((0 0), (10 30), (30 10), (0 0)))')

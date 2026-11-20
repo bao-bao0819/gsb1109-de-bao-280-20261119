@@ -1253,3 +1253,151 @@ class TestMisc(unittest.TestCase):
 
         expected = 'Expected "b" but found "a"'
         self.assertEqual(expected, str(ar.exception))
+
+
+class ExactCoordinateTestCase(unittest.TestCase):
+    """
+    The `exact` reading mode accepts the digit sequence written by `dumps`,
+    so values beyond the 53 bits of a float can be compared exactly.
+    """
+
+    def setUp(self):
+        self.counts = [
+            9007199254740992,
+            9007199254740993,
+            -9007199254740992,
+            -9007199254740993,
+        ]
+
+    def test_dumps_preserves_large_integer_counts(self):
+        expected = (
+            'MULTIPOINT ('
+            '(9007199254740992.0000 1.2346), '
+            '(9007199254740993.0000 1.2346), '
+            '(-9007199254740992.0000 1.2346), '
+            '(-9007199254740993.0000 1.2346))'
+        )
+        geom = dict(type='MultiPoint', coordinates=[
+            [count, 1.23456] for count in self.counts
+        ])
+        self.assertEqual(expected, wkt.dumps(geom, decimals=4))
+
+    def test_exact_round_trip_keeps_adjacent_counts(self):
+        geom = dict(type='MultiPoint', coordinates=[
+            [count, 1.23456] for count in self.counts
+        ])
+        text = wkt.dumps(geom, decimals=4)
+
+        # The receiving side only sees the WKT text.
+        loaded = wkt.loads(text, exact=True)
+        self.assertEqual(self.counts, [pt[0] for pt in loaded['coordinates']])
+
+        again = wkt.dumps(loaded, decimals=4)
+        self.assertEqual(text, again)
+
+    def test_exact_round_trip_keeps_negative_zero(self):
+        geom = dict(type='Point', coordinates=[-0.0, 0.0])
+        text = wkt.dumps(geom, decimals=4)
+        self.assertEqual('POINT (-0.0000 0.0000)', text)
+
+        loaded = wkt.loads(text, exact=True)
+        self.assertEqual(repr(-0.0), repr(loaded['coordinates'][0]))
+        self.assertEqual(text, wkt.dumps(loaded, decimals=4))
+
+    def test_exact_load_accepts_padded_integer(self):
+        loaded = wkt.loads('POINT (9007199254740993.0000 1.0000)',
+                           exact=True)
+        self.assertEqual([9007199254740993, 1], loaded['coordinates'])
+        self.assertEqual(
+            'POINT (9007199254740993.0000 1.0000)',
+            wkt.dumps(loaded, decimals=4),
+        )
+
+    def test_exact_load_keeps_fraction_of_large_value(self):
+        text = 'POINT (9007199254740993.0001 -0.0000)'
+        loaded = wkt.loads(text, exact=True)
+        self.assertEqual(
+            'POINT (9007199254740993.0001 -0.0000)',
+            wkt.dumps(loaded, decimals=4),
+        )
+
+    def test_exact_load_then_exact_dump(self):
+        text = (
+            'MULTIPOINT ((9007199254740992.0000 1.2346), '
+            '(9007199254740993.0000 1.2346), '
+            '(-9007199254740992.0000 1.2346), '
+            '(-9007199254740993.0000 1.2346))'
+        )
+        first = wkt.dumps_exact(wkt.loads_exact(text), decimals=4)
+        second = wkt.dumps_exact(wkt.loads_exact(first), decimals=4)
+        self.assertEqual(text, first)
+        self.assertEqual(text, second)
+
+    def test_exact_load_keeps_small_float_as_float(self):
+        loaded = wkt.loads('POINT (1.23456 10000.9999)', exact=True)
+        self.assertEqual([1.23456, 10000.9999], loaded['coordinates'])
+        self.assertIsInstance(loaded['coordinates'][0], float)
+
+    def test_exact_load_zero_decimals(self):
+        text = 'POINT (9007199254740993.0000 -0.0000)'
+        loaded = wkt.loads(text, exact=True)
+        # decimals=0 keeps the historical integer rendering, including the
+        # loss of a negative-zero sign.
+        self.assertEqual(
+            'POINT (9007199254740993 0)',
+            wkt.dumps(loaded, decimals=0),
+        )
+
+    def test_legacy_load_collapses_adjacent_counts(self):
+        text = wkt.dumps(dict(
+            type='MultiPoint',
+            coordinates=[[count, 1.0] for count in self.counts],
+        ), decimals=4)
+
+        legacy = wkt.loads(text)
+        self.assertEqual(
+            [9007199254740992.0, 9007199254740992.0,
+             -9007199254740992.0, -9007199254740992.0],
+            [pt[0] for pt in legacy['coordinates']],
+        )
+
+    def test_use_float_alias(self):
+        text = 'POINT (9007199254740993.0000 1.0000)'
+        self.assertEqual(
+            [9007199254740992.0, 1.0],
+            wkt.loads(text, use_float=True)['coordinates'],
+        )
+        self.assertEqual(
+            [9007199254740993, 1],
+            wkt.loads(text, use_float=False)['coordinates'],
+        )
+
+    def test_all_geometry_types_exact(self):
+        text = (
+            'GEOMETRYCOLLECTION ('
+            'LINESTRING (9007199254740993.0000 1.0000, '
+            '9007199254740992.0000 2.0000),'
+            'POLYGON ((9007199254740993.0000 1.0000, '
+            '9007199254740992.0000 2.0000, '
+            '9007199254740993.0000 1.0000)),'
+            'MULTILINESTRING ((9007199254740993.0000 1.0000, '
+            '9007199254740992.0000 2.0000)),'
+            'MULTIPOLYGON (((9007199254740993.0000 1.0000, '
+            '9007199254740992.0000 2.0000, '
+            '9007199254740993.0000 1.0000))))'
+        )
+        loaded = wkt.loads(text, exact=True)
+        self.assertEqual(
+            text,
+            wkt.dumps(loaded, decimals=4),
+        )
+
+    def test_exact_file_load(self):
+        fobj = StringIO.StringIO()
+        fobj.write('POINT (9007199254740993.0000 1.0000)')
+        fobj.seek(0)
+
+        self.assertEqual(
+            dict(type='Point', coordinates=[9007199254740993, 1]),
+            wkt.load(fobj, exact=True),
+        )

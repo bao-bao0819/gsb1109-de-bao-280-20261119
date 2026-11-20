@@ -16,6 +16,7 @@ import itertools
 import tokenize
 
 import geomet
+from geomet import crs
 from geomet import util
 
 """
@@ -37,7 +38,7 @@ POLYGON ((30 10, 40 40, 20 40, 10 20, 30 10))
 INVALID_WKT_FMT = 'Invalid WKT: `%s`'
 
 
-def dump(obj, dest_file):
+def dump(obj, dest_file, strict_srid=False):
     """
     Dump GeoJSON-like `dict` to WKT and write it to the `dest_file`.
 
@@ -46,8 +47,10 @@ def dump(obj, dest_file):
         'coordinates'.
     :param dest_file:
         Open and writable file-like object.
+    :param bool strict_srid:
+        See :func:`dumps`.
     """
-    dest_file.write(dumps(obj))
+    dest_file.write(dumps(obj, strict_srid=strict_srid))
 
 
 def load(source_file):
@@ -63,10 +66,20 @@ def load(source_file):
     return loads(source_file.read())
 
 
-def dumps(obj, decimals=16):
+def dumps(obj, decimals=16, strict_srid=False):
     """
     Dump a GeoJSON-like `dict` to a WKT string.
+
+    :param bool strict_srid:
+        If `True`, validate the CRS/SRID declarations at every level of
+        the geometry (including nested geometries of a collection) before
+        writing, and encode the resulting uniform SRID only once, at the
+        root. Raises :class:`geomet.crs.InvalidCRSException` if
+        declarations contradict each other or cannot be confirmed.
     """
+    if strict_srid:
+        srid = crs.validate_uniform_srid(obj)
+        obj = crs.root_srid_only(obj, srid)
     try:
         geom_type = obj['type']
         exporter = _dumps_registry.get(geom_type)

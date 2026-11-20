@@ -108,6 +108,26 @@ For example:
     >>> wkb.dumps({'type': 'Point', 'coordinates': [10.0, 20.0], 'meta': {'srid': '4326'}, 'crs': {'properties': {'name': 'EPSG4326'}, 'type': 'name'}})
     '\x00 \x00\x00\x01\x00\x00\x10\xe6@$\x00\x00\x00\x00\x00\x00@4\x00\x00\x00\x00\x00\x00'
 
+When merging geometries from different sources into a single
+`GeometryCollection`, `wkt.dumps` and `wkb.dumps` can be called with
+`strict_srid=True` to validate the CRS/SRID declarations at every level
+of the tree before writing. The write is rejected (with
+`geomet.crs.InvalidCRSException`) if a member declares a SRID that
+conflicts with the one it inherits, if a member's `meta.srid` and `crs`
+contradict each other, or if some members declare a SRID while the root
+does not. When validation passes, the uniform SRID is encoded exactly
+once, at the root:
+
+    >>> collection = {'type': 'GeometryCollection', 'meta': {'srid': 4326},
+    ...               'geometries': [{'type': 'Point', 'coordinates': [10.0, 20.0],
+    ...                               'crs': {'type': 'name', 'properties': {'name': 'EPSG4326'}}}]}
+    >>> wkt.dumps(collection, strict_srid=True)
+    'SRID=4326;GEOMETRYCOLLECTION (POINT (10.0000000000000000 20.0000000000000000))'
+
+`geomet.crs.validate_uniform_srid` can also be used on its own, for
+example to confirm that a geometry read back from WKT/WKB uses a single
+reference system throughout.
+
 GeoPackage binary supports encoding of SRID and envelope information. If your geopackage
 has an envelope specified, then it will be added into the resulting GeoJSON in a key 
 called `'bbox'`:

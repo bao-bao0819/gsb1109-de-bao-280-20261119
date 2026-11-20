@@ -14,6 +14,7 @@
 import binascii
 import struct
 
+from geomet import crs
 from geomet.util import block_splitter
 from geomet.util import take
 from geomet.util import as_bin_str
@@ -152,7 +153,7 @@ def _get_geom_type(type_bytes):
     return geom_type, type_bytes, has_srid
 
 
-def dump(obj, dest_file):
+def dump(obj, dest_file, big_endian=True, strict_srid=False):
     """
     Dump GeoJSON-like `dict` to WKB and write it to the `dest_file`.
 
@@ -161,8 +162,13 @@ def dump(obj, dest_file):
         'coordinates'.
     :param dest_file:
         Open and writable file-like object.
+    :param bool big_endian:
+        See :func:`dumps`.
+    :param bool strict_srid:
+        See :func:`dumps`.
     """
-    dest_file.write(dumps(obj))
+    dest_file.write(dumps(obj, big_endian=big_endian,
+                          strict_srid=strict_srid))
 
 
 def load(source_file):
@@ -179,7 +185,7 @@ def load(source_file):
     return loads(source_file.read())
 
 
-def dumps(obj, big_endian=True):
+def dumps(obj, big_endian=True, strict_srid=False):
     """
     Dump a GeoJSON-like `dict` to a WKB string.
 
@@ -217,10 +223,19 @@ def dumps(obj, big_endian=True):
     :param bool big_endian:
         Defaults to `True`. If `True`, data values in the generated WKB will
         be represented using big endian byte order. Else, little endian.
+    :param bool strict_srid:
+        If `True`, validate the CRS/SRID declarations at every level of
+        the geometry (including nested geometries of a collection) before
+        writing, and encode the resulting uniform SRID only once, in the
+        root header. Raises :class:`geomet.crs.InvalidCRSException` if
+        declarations contradict each other or cannot be confirmed.
 
     :returns:
         A WKB binary string representing of the ``obj``.
     """
+    if strict_srid:
+        srid = crs.validate_uniform_srid(obj)
+        obj = crs.root_srid_only(obj, srid)
     return _dumps(obj, big_endian)
 
 
@@ -874,7 +889,11 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
 def _check_dimensionality(geom, num_dims):
     def first_geom(gc):
         for g in gc['geometries']:
-            if not g['type'] == 'GeometryCollection':
+            if g['type'] == 'GeometryCollection':
+                found = first_geom(g)
+                if found is not None:
+                    return found
+            else:
                 return g
 
     first_vert = {

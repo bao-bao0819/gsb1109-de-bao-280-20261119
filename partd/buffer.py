@@ -67,8 +67,28 @@ class Buffer(Interface):
     def _delete(self, keys, lock=True):
         if lock: self.lock.acquire()
         try:
-            self.fast.delete(keys, lock=False)
+            # Deduplicate so a key repeated in the request is removed and
+            # charged exactly once.
+            keys = list(dict.fromkeys(keys))
+
+            # Remove on-disk pieces first.  The backing layers treat missing
+            # keys as a no-op, so absent keys (e.g. ``z``) are simply ignored.
+            # If this raises, neither the in-memory pieces nor the accounting
+            # have been touched: no data vanishes and no quota is charged, so
+            # retrying the same call is safe.
             self.slow.delete(keys, lock=False)
+
+            # The slow layer is settled; now drop the in-memory pieces and
+            # refund exactly the bytes they occupied.  Only keys tracked in
+            # ``lengths`` hold memory, so disk-only and missing keys contribute
+            # nothing, and the counter can never go negative.
+            self.fast.delete(keys, lock=False)
+            freed = 0
+            for key in keys:
+                if key in self.lengths:
+                    freed += self.lengths[key]
+                    del self.lengths[key]
+            self.memory_usage -= freed
         finally:
             if lock: self.lock.release()
 

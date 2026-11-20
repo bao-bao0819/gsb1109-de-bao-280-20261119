@@ -2,6 +2,10 @@
 
 _In development_
 
+- Add `rectify_tile` to apply attribute-only corrections (property replacement, addition and deletion) to an
+  already published MVT without reprocessing geometries. Geometry commands, feature ordering and dictionary
+  indices are preserved; a batch is rejected atomically when a feature id is missing, duplicated or ambiguous.
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

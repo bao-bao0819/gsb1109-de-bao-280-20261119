@@ -362,6 +362,39 @@ Here's how you might decode a tile from a file.
 The `decode` function has a `geojson` option which enforces a GeoJson RFC7946 compatible result. Its default value
 is `True`. To enforce the behaviour of versions <2.0.0, please use `geojson=False`.
 
+## Rectifying a published tile
+
+`rectify_tile` corrects the attributes of an already published MVT without reprocessing its validated geometries.
+It takes the tile bytes and a list of rectifications, each one naming a layer, the explicitly written feature `id`
+and the properties to replace (or add) and delete. Several property changes, features and layers can be part of a
+single call:
+
+```python
+  import mapbox_vector_tile
+
+  with open("tile.mvt", "rb") as f:
+      tile_bytes = f.read()
+
+  corrected = mapbox_vector_tile.rectify_tile(
+      tile_bytes,
+      [
+          {"layer": "road", "id": 7, "set_properties": {"name": "新名"}, "delete_properties": ["note"]},
+          {"layer": "road", "id": 0, "set_properties": {"kind": 4}},
+          {"layer": "sign", "id": 7, "set_properties": {"name": "新路标"}},
+      ],
+  )
+```
+
+The geometry commands, the feature order and the layer string dictionaries are left untouched: keys and values are
+only ever appended to, so deleting a property never removes a value still referenced by another feature, and
+unmodified properties keep their original type representation (for example `1`, `1.0`, `True` and `"1"` stay
+distinct). A feature whose `id` was never written is not matched by `id: 0`.
+
+The whole list is validated before anything is written. If an `id` matches several features in the same layer, a
+`mapbox_vector_tile.errors.DuplicateFeatureIdError` is raised naming the layer and the original zero-based feature
+positions, and the tile is returned unchanged instead of being partially rectified. Other validation errors
+(`LayerNotFoundError`, `FeatureNotFoundError`, `PropertyNotFoundError`) are likewise reported before any change.
+
 ## Use native protobuf library for performance
 
 The c++ implementation of the underlying protobuf library is more performant than the pure python one. Depending on your operating system, you might need to [compile the C++ library](https://github.com/google/protobuf/tree/master/python#c-implementation) or install it.

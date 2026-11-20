@@ -181,6 +181,42 @@ There are a number of builtin stateful transforms beyond
 :func:`center`; see :ref:`stateful transforms
 <stateful-transforms-list>` in the API reference for a complete list.
 
+Fitting with frequency weights
+------------------------------
+
+Sometimes each input row represents several identical observations rather
+than a single one. :func:`center` and :func:`standardize` accept an optional
+``weights`` keyword for exactly this situation, where each weight is a
+non-negative integer count of how many times that row is repeated::
+
+   x = [1.0, 2.0, 3.0]
+   weights = [1, 100, 4]
+
+The learned mean and standard deviation are then the statistics of the full
+set of repeated observations, as if the row with weight ``100`` had actually
+appeared one hundred times -- but that expanded data set is never built in
+memory, so very large counts cost nothing extra. Rows with weight zero are
+calibration rows that are still transformed, yet contribute nothing to the
+fitted statistics. The result does not depend on how the rows are split into
+chunks or on the order in which those chunks are seen, and a chunk made up
+entirely of zero-weight rows is simply ignored.
+
+Weights are a *fitting-only* concept. They tune the statistics learned from
+the training data, and are not part of the transformation applied to new
+data. So once a :class:`DesignInfo` has been fitted, prediction data needs no
+weight column at all, and the fixed training statistics are reused unchanged
+no matter how many times you call :func:`build_design_matrices`::
+
+   design_info = dmatrix("standardize(x, ddof=1, weights=w)",
+                         {"x": x, "w": weights}).design_info
+   # No 'w' column here; the learned mean/scale are simply reused:
+   build_design_matrices([design_info], {"x": [1.5, 2.5]})
+
+Passing weights that are negative, non-integer, or do not line up one-per-row
+is an input error. When rescaling, the total effective frequency (the sum of
+the weights) must be greater than ``ddof``; otherwise the scale is not
+defined and fitting raises an error rather than silently dividing by zero.
+
 .. _stateful-transform-protocol:
 
 Defining a stateful transform

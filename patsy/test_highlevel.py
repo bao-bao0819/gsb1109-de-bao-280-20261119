@@ -997,3 +997,150 @@ def test_NAActioon_pandas_string_index():
     dm2 = dmatrix(di, data2, 0, return_type="dataframe")
     assert np.allclose(dm2, [[1.0, 6.0, 4.0], [1.0, 7.0, 5.0]])
     assert list(dm2.columns) == ["Intercept", "x", "z"]
+
+
+def _weighted_design_info(formula, x, weights, slices):
+    def data_iter_maker():
+        for sl in slices:
+            yield {"x": x[sl], "w": weights[sl]}
+
+    return incr_dbuilder(formula, data_iter_maker)
+
+
+def _standardize_state(design_info):
+    factor_info = next(iter(design_info.factor_infos.values()))
+    state = factor_info.state
+    return state["transforms"][next(iter(state["transforms"]))]
+
+
+def test_weighted_standardize_chunk_order_and_expansion():
+    rng = np.random.default_rng(5)
+    # Multiple columns around a very large common baseline, small deltas.
+    x = 1e12 + rng.normal(scale=1e-4, size=(12, 2))
+    # Weights differing by several orders of magnitude, plus zero rows.
+    weights = np.array([1, 100000, 3, 0, 7, 2, 50000, 0, 1, 4, 2, 9], dtype=np.int64)
+
+    order_a = [slice(0, 4), slice(4, 8), slice(8, 12)]
+    order_b = [slice(8, 12), slice(0, 4), slice(4, 8)]
+    order_c = [slice(0, 12)]
+    formula = "standardize(x, ddof=1, weights=w)"
+    di_a = _weighted_design_info(formula, x, weights, order_a)
+    di_b = _weighted_design_info(formula, x, weights, order_b)
+    di_c = _weighted_design_info(formula, x, weights, order_c)
+
+    stats = [_standardize_state(di)._weighted_stats() for di in (di_a, di_b, di_c)]
+    for mean, M2, n in stats[1:]:
+        assert n == stats[0][2] == weights.sum()
+        # Different chunk orderings may pick a different shifted origin, so
+        # allow only floating-point roundoff between the learned statistics.
+        assert np.allclose(mean, stats[0][0], rtol=1e-10, atol=1e-9)
+        assert np.allclose(M2, stats[0][1], rtol=1e-10)
+
+    # Reference on a small reference batch, expanded by frequency.
+    ref = [0, 1, 2, 4]
+    expanded = np.repeat(x[ref], weights[ref], axis=0)
+    di_ref = _weighted_design_info(formula, x[ref], weights[ref], [slice(0, len(ref))])
+    mean, M2, n = _standardize_state(di_ref)._weighted_stats()
+    assert n == weights[ref].sum()
+    assert np.allclose(mean, expanded.mean(0))
+    assert np.allclose(M2 / (n - 1), expanded.var(0, ddof=1))
+
+
+def test_weighted_standardize_prediction_needs_no_weights():
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(10, 2))
+    weights = np.array([1, 100000, 3, 0, 7, 2, 50000, 0, 1, 9], dtype=np.int64)
+    design_info = _weighted_design_info(
+        "standardize(x, ddof=1, weights=w)",
+        x,
+        weights,
+        [slice(0, 5), slice(5, 10)],
+    )
+    state = _standardize_state(design_info)
+    mean, M2, n = state._weighted_stats()
+    expected_scale = np.sqrt(M2 / (n - 1))
+
+    # The stored evaluation code must not reference weights at all.
+    factor_state = next(iter(design_info.factor_infos.values())).state
+    assert "weights" not in factor_state["eval_code"]
+    assert any("weights" in code for code in factor_state["memorize_code"].values())
+
+    # Reuse the fitted DesignInfo repeatedly on prediction data that has no
+    # weight column. Statistics stay fixed and are never recomputed.
+    new_x = x[:4]
+    prediction_data = {"x": new_x}
+    assert "w" not in prediction_data
+    first = np.asarray(build_design_matrices([design_info], prediction_data)[0])
+    for _ in range(3):
+        again = np.asarray(build_design_matrices([design_info], {"x": new_x})[0])
+        assert np.array_equal(first, again)
+    expected = np.column_stack((np.ones(4), (new_x - mean) / expected_scale))
+    assert np.allclose(first, expected, rtol=1e-10)
+
+
+def test_weighted_center_prediction_needs_no_weights():
+    x = np.arange(10.0).reshape(5, 2)
+    weights = np.array([1, 1000, 0, 3, 2], dtype=np.int64)
+    design_info = _weighted_design_info(
+        "center(x, weights=w)", x, weights, [slice(0, 5)]
+    )
+    expanded = np.repeat(x, weights, axis=0)
+    centered = np.asarray(build_design_matrices([design_info], {"x": x[:2]})[0])
+    assert np.allclose(centered[:, 1:], x[:2] - expanded.mean(0))
+
+
+def test_weighted_zero_only_chunk_does_not_change_stats():
+    x = np.arange(12.0).reshape(6, 2)
+    weights = np.array([1, 2, 0, 3, 1, 4], dtype=np.int64)
+    # A chunk boundary placed so one chunk contains only zero-weight rows.
+    slices = [slice(0, 2), slice(2, 3), slice(3, 6)]
+    design_info = _weighted_design_info(
+        "standardize(x, ddof=1, weights=w)", x, weights, slices
+    )
+    mean, M2, n = _standardize_state(design_info)._weighted_stats()
+    expanded = np.repeat(x, weights, axis=0)
+    assert n == weights.sum()
+    assert np.allclose(mean, expanded.mean(0))
+    assert np.allclose(M2 / (n - 1), expanded.var(0, ddof=1))
+
+
+def test_weighted_standardize_invalid_weights_are_input_errors():
+    x = np.arange(8.0).reshape(4, 2)
+    bad_weights = [
+        np.array([1, -1, 0, 2]),
+        np.array([1.0, 2.0, 0.0, 2.0]),
+        np.array([1, 2, 0]),
+    ]
+    for weights in bad_weights:
+        with pytest.raises(PatsyError):
+            dmatrix("standardize(x, ddof=1, weights=w)", {"x": x, "w": weights})
+
+
+def test_weighted_standardize_undefined_scale_rejected():
+    x = np.arange(6.0).reshape(3, 2)
+    # These are memorize_finish() rejections. Like the stateful spline
+    # transforms, finish-stage ValueErrors propagate unwrapped, whereas
+    # memorize_chunk() input errors are wrapped as PatsyError (see the test
+    # above). Both clearly refuse the undefined scale.
+    # Total effective frequency (1) is not greater than ddof (1).
+    with pytest.raises(ValueError):
+        dmatrix(
+            "standardize(x, ddof=1, weights=w)",
+            {"x": x, "w": np.array([1, 0, 0])},
+        )
+    # Every weight zero.
+    with pytest.raises(ValueError):
+        dmatrix(
+            "standardize(x, ddof=1, weights=w)",
+            {"x": x, "w": np.zeros(3, dtype=int)},
+        )
+
+
+def test_unweighted_standardize_remains_default():
+    x = np.arange(12.0).reshape(6, 2)
+    mat = dmatrix("standardize(x, ddof=1)", {"x": x})
+    expected = (x - x.mean(0)) / x.std(0, ddof=1)
+    assert np.allclose(np.asarray(mat)[:, 1:], expected)
+    # No weight column is required for prediction either.
+    pred = np.asarray(build_design_matrices([mat.design_info], {"x": x[:2]})[0])
+    assert np.allclose(pred[:, 1:], (x[:2] - x.mean(0)) / x.std(0, ddof=1))

@@ -520,8 +520,7 @@ class EvalFactor(object):
                 return token
 
         # example eval_code: == "2 * _patsy_stobj0__center__.transform(x)"
-        eval_code = replace_bare_funcalls(self.code, new_name_maker)
-        state["eval_code"] = eval_code
+        full_eval_code = replace_bare_funcalls(self.code, new_name_maker)
         # paranoia: verify that none of our new names appeared anywhere in the
         # original code
         if has_bare_variable_reference(state["transforms"], self.code):
@@ -530,10 +529,15 @@ class EvalFactor(object):
                 token.origin,
             )
         # Pull out all the '_patsy_stobj0__center__.transform(x)' pieces
-        # to make '_patsy_stobj0__center__.memorize_chunk(x)' pieces
+        # to make '_patsy_stobj0__center__.memorize_chunk(x)' pieces.
+        # This uses the full code, so this object's own fitting-only
+        # 'weights=' keyword is still present and reaches memorize_chunk().
+        # Any 'weights=' belonging to a *nested* transform() call has to be
+        # removed here, though: a nested transform applies that object's fixed
+        # statistics and never accepts weights.
         state["memorize_code"] = {}
         for obj_name in state["transforms"]:
-            transform_calls = capture_obj_method_calls(obj_name, eval_code)
+            transform_calls = capture_obj_method_calls(obj_name, full_eval_code)
             assert len(transform_calls) == 1
             transform_call = transform_calls[0]
             transform_call_name, transform_call_code = transform_call
@@ -544,7 +548,13 @@ class EvalFactor(object):
                 + ".memorize_chunk"
                 + transform_call_code[len(transform_call_name) :]
             )
-            state["memorize_code"][obj_name] = memorize_code
+            state["memorize_code"][obj_name] = strip_transform_weights_kwarg(
+                memorize_code, only_transform=True
+            )
+        # 'weights=' is fitting-only information: it drives memorization but
+        # must never appear in the code that applies the learned transform, so
+        # prediction data is not required to carry a weight column.
+        state["eval_code"] = strip_transform_weights_kwarg(full_eval_code)
         # Then sort the codes into bins, so that every item in bin number i
         # depends only on items in bin (i-1) or less. (By 'depends', we mean
         # that in something like:
@@ -851,3 +861,177 @@ def test_capture_obj_method_calls():
     assert capture_obj_method_calls("bar", "foo[bar.baz(x(z[asdf])) ** 2]") == [
         ("bar.baz", "bar.baz(x(z[asdf]))")
     ]
+
+
+# The 'weights' keyword of stateful transforms carries fitting-only
+# information (integer observation frequencies). It must reach
+# memorize_chunk() but must not appear in the code used for transform(),
+# because transforms apply fixed, learned statistics and prediction data need
+# not contain a weight column. This removes 'weights=<value>' keyword
+# arguments from calls to a patsy stateful-transform object's methods. A
+# 'weights=' kwarg inside any other call (including a nested user function)
+# is left untouched.
+def _stateful_method_at_paren(tokens, idx):
+    # tokens[idx] is the '(' of a stateful call shaped like
+    #   <_patsy_stobj...>.<method>( ...
+    # Return <method>, or None if this is not such a call.
+    if idx < 3:
+        return None
+    name_tok = tokens[idx - 1]
+    dot_tok = tokens[idx - 2]
+    obj_tok = tokens[idx - 3]
+    if not (
+        name_tok[0] == tokenize.NAME
+        and name_tok[1] in ("transform", "memorize_chunk")
+        and dot_tok[0] == tokenize.OP
+        and dot_tok[1] == "."
+        and obj_tok[0] == tokenize.NAME
+        and obj_tok[1].startswith("_patsy_stobj")
+    ):
+        return None
+    return name_tok[1]
+
+
+def strip_transform_weights_kwarg(code, only_transform=False):
+    tokens = list(python_tokenize(code))
+    # One entry per open bracket; True only for a stateful transform call's
+    # own parentheses (and, when only_transform is set, only for .transform).
+    bracket_stack = []
+    dropped = set()
+    i = 0
+    n_tokens = len(tokens)
+    while i < n_tokens:
+        token_type, token = tokens[i][0], tokens[i][1]
+        if token in ("(", "[", "{"):
+            method = _stateful_method_at_paren(tokens, i)
+            is_target = method is not None and (
+                not only_transform or method == "transform"
+            )
+            bracket_stack.append(token == "(" and is_target)
+            i += 1
+            continue
+        if token in (")", "]", "}"):
+            bracket_stack.pop()
+            i += 1
+            continue
+        if (
+            token_type == tokenize.NAME
+            and token == "weights"
+            and i + 1 < n_tokens
+            and tokens[i + 1][1] == "="
+            and bracket_stack
+            and bracket_stack[-1]
+        ):
+            # Find the end of the keyword value: the next comma or closing
+            # bracket at the same nesting depth within this call.
+            j = i + 2
+            depth = 0
+            while j < n_tokens:
+                value_token = tokens[j][1]
+                if value_token in ("(", "[", "{"):
+                    depth += 1
+                elif value_token in (")", "]", "}"):
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif value_token == "," and depth == 0:
+                    break
+                j += 1
+            end_token = tokens[j][1]
+            if end_token == ",":
+                # Drop through and including the separating comma.
+                for k in range(i, j + 1):
+                    dropped.add(k)
+                i = j + 1
+            else:
+                # We hit the call's closing paren. If there was a preceding
+                # comma, drop it too so no dangling separator remains.
+                start = i
+                if i - 1 >= 0 and tokens[i - 1][1] == ",":
+                    start = i - 1
+                for k in range(start, j):
+                    dropped.add(k)
+                i = j
+            continue
+        i += 1
+    kept = [
+        (token_type, token)
+        for idx, (token_type, token, _origin) in enumerate(tokens)
+        if idx not in dropped
+    ]
+    return pretty_untokenize(kept)
+
+
+def test_strip_transform_weights_kwarg():
+    t = strip_transform_weights_kwarg
+    # weights in the middle, at the end, or as the only argument
+    assert (
+        t("_patsy_stobj0__standardize__.transform(x, weights=w, ddof=1)")
+        == "_patsy_stobj0__standardize__.transform(x, ddof=1)"
+    )
+    assert (
+        t("_patsy_stobj0__standardize__.transform(x, ddof=1, weights=w)")
+        == "_patsy_stobj0__standardize__.transform(x, ddof=1)"
+    )
+    assert (
+        t("_patsy_stobj0__standardize__.transform(x, weights=w)")
+        == "_patsy_stobj0__standardize__.transform(x)"
+    )
+    assert (
+        t("_patsy_stobj0__standardize__.transform(weights=w)")
+        == "_patsy_stobj0__standardize__.transform()"
+    )
+    # memorize_chunk calls are handled too
+    assert (
+        t("_patsy_stobj0__center__.memorize_chunk(np.sin(x), weights=w)")
+        == "_patsy_stobj0__center__.memorize_chunk(np.sin(x))"
+    )
+    # Values containing nested brackets/commas are consumed whole
+    assert (
+        t("_patsy_stobj0__standardize__.transform(x, weights=foo.bar[0, 1]) * 2")
+        == "_patsy_stobj0__standardize__.transform(x) * 2"
+    )
+    # A weights kwarg of a *nested, non-patsy* call is preserved
+    assert (
+        t("_patsy_stobj0__standardize__.transform(g(w, weights=z), ddof=1)")
+        == "_patsy_stobj0__standardize__.transform(g(w, weights=z), ddof=1)"
+    )
+    # An unrelated object's call is left completely untouched
+    unrelated = "foo.transform(x, weights=w)"
+    assert t(unrelated) == unrelated
+    # No weights kwarg at all
+    plain = "_patsy_stobj0__standardize__.transform(x, ddof=1)"
+    assert t(plain) == plain
+
+
+def test_strip_transform_weights_kwarg_only_transform():
+    # only_transform=True keeps a memorize_chunk's own weights but still
+    # strips weights from a nested transform() call.
+    def t(code):
+        return strip_transform_weights_kwarg(code, only_transform=True)
+
+    # The object's own memorize_chunk weights are retained ...
+    assert (
+        t("_patsy_stobj1__standardize__.memorize_chunk(x, ddof=1, weights=w)")
+        == "_patsy_stobj1__standardize__.memorize_chunk(x, ddof=1, weights=w)"
+    )
+    # ... but a nested transform's weights are removed (it applies fixed
+    # statistics and never takes weights).
+    assert (
+        t(
+            "_patsy_stobj1__standardize__.memorize_chunk("
+            "_patsy_stobj0__center__.transform(x, weights=w), ddof=1)"
+        )
+        == "_patsy_stobj1__standardize__.memorize_chunk("
+        "_patsy_stobj0__center__.transform(x), ddof=1)"
+    )
+    # Both an own memorize_chunk weight and a nested transform weight: keep
+    # the former, drop the latter.
+    assert (
+        t(
+            "_patsy_stobj1__standardize__.memorize_chunk("
+            "_patsy_stobj0__center__.transform(x, weights=w), weights=w2)"
+        )
+        == "_patsy_stobj1__standardize__.memorize_chunk("
+        "_patsy_stobj0__center__.transform(x), weights=w2)"
+    )

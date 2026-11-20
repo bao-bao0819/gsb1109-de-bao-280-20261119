@@ -8,6 +8,19 @@ All Patsy releases are archived at Zenodo:
 .. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.592075.svg
    :target: https://doi.org/10.5281/zenodo.592075
 
+v1.0.3+dev
+----------
+
+* :func:`center` and :func:`standardize` (and the R-compatibility alias
+  :func:`scale`) now accept an optional ``weights`` keyword. Each weight must
+  be a non-negative integer giving the number of times that row's
+  observation is repeated, so the learned mean and scale are computed over
+  the full set of frequencies without ever expanding the rows in memory.
+  Weights affect fitting only: the fixed, learned statistics are applied to
+  new data without any weight column. Invalid (negative, non-integer, or
+  misaligned) weights raise an error, and when the total effective frequency
+  is not greater than ``ddof`` the scale is rejected as undefined.
+
 v1.0.3
 ------
 

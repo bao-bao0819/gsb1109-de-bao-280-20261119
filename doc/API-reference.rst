@@ -168,7 +168,7 @@ Patsy comes with a number of :ref:`stateful transforms
 
 .. autofunction:: standardize
 
-.. function:: scale(x, center=True, rescale=True, ddof=0)
+.. function:: scale(x, center=True, rescale=True, ddof=0, weights=None)
 
    An alias for :func:`standardize`, for R compatibility.
 

@@ -6,18 +6,21 @@ from simple_history.template_utils import HistoricalRecordContextHelper
 from simple_history.tests.external.models import ExternalModelWithCustomUserIdField
 
 from .models import (
+    BillingGroup,
     Book,
     Choice,
     ConcreteExternal,
     Document,
     Employee,
     FileModel,
+    GroupQuota,
     Paper,
     Person,
     Place,
     Planet,
     Poll,
     PollWithManyToMany,
+    ReconciledConfig,
 )
 
 
@@ -80,3 +83,12 @@ admin.site.register(Employee, SimpleHistoryAdmin)
 admin.site.register(ExternalModelWithCustomUserIdField, SimpleHistoryAdmin)
 admin.site.register(Paper, SimpleHistoryAdmin)
 admin.site.register(Poll, SimpleHistoryAdmin)
+
+
+@admin.register(ReconciledConfig)
+class ReconciledConfigAdmin(SimpleHistoryAdmin):
+    recovery_identity_fields = {"tests.billinggroup": "code"}
+
+
+admin.site.register(BillingGroup, SimpleHistoryAdmin)
+admin.site.register(GroupQuota, SimpleHistoryAdmin)

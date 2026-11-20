@@ -6,6 +6,13 @@ Unreleased
 
 **New features:**
 
+- Added an admin recovery preview for ``SimpleHistoryAdmin`` that restores a
+  historical object together with its history-tracked reverse associations.
+  The preview verifies related objects through a stable business field so that
+  an object reusing a deleted object's primary key cannot inherit its
+  associations, offers an explicit full or partial recovery, and applies both
+  atomically (``simple_history.recovery``)
+
 
 **Breaking changes:**
 

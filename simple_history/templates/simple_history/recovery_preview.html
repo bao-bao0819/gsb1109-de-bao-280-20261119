@@ -1,0 +1,146 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+  <div class="breadcrumbs">
+    <a href="{% url "admin:index" %}">{% trans "Home" %}</a> &rsaquo;
+    <a href="{% url "admin:app_list" app_label %}">{{ app_label|capfirst|escape }}</a> &rsaquo;
+    <a href="{{ changelist_url }}">{{ opts.verbose_name_plural|capfirst }}</a> &rsaquo;
+    <a href="{{ change_url }}">{{ object|truncatewords:"18" }}</a> &rsaquo;
+    <a href="{{ history_url }}">{% trans "History" %}</a> &rsaquo;
+    {% trans "Recover" %}
+  </div>
+{% endblock %}
+
+{% block content %}
+  <div id="content-main">
+    <p>
+      {% blocktrans with history_date=preview.history_date %}
+        Preview of the recovery to the historical state recorded at {{ history_date }}.
+        Review the changes below, then explicitly choose whether to apply them.
+      {% endblocktrans %}
+    </p>
+
+    <div class="module">
+      <h2>{% trans "Configuration fields" %}</h2>
+      {% if preview.scalar_changes %}
+        <table id="recovery-scalar-changes">
+          <thead>
+            <tr>
+              <th scope="col">{% trans "Field" %}</th>
+              <th scope="col">{% trans "Current value" %}</th>
+              <th scope="col">{% trans "Historical value" %}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for change in preview.scalar_changes %}
+              <tr>
+                <th scope="row">{{ change.field }}</th>
+                <td>{{ change.current }}</td>
+                <td>{{ change.historical }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p>{% trans "The configuration fields already match the historical state." %}</p>
+      {% endif %}
+    </div>
+
+    <div class="module">
+      <h2>{% trans "Tracked associations" %}</h2>
+      <table id="recovery-related-items">
+        <thead>
+          <tr>
+            <th scope="col">{% trans "Association" %}</th>
+            <th scope="col">{% trans "Status" %}</th>
+            <th scope="col">{% trans "Changes" %}</th>
+            <th scope="col">{% trans "Identity check" %}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in preview.items %}
+            <tr>
+              <th scope="row">
+                {{ item.historical_label }}
+                <br />
+                <small>{{ item.related_model_label }} (pk={{ item.historical_pk }})</small>
+              </th>
+              <td>
+                {% if item.status == "recoverable" %}
+                  <span style="color: green;">{% trans "Recoverable" %}</span>
+                {% elif item.status == "current" %}
+                  <span>{% trans "Already up to date" %}</span>
+                {% else %}
+                  <span style="color: #ba2121;">{% trans "Cannot be recovered" %}</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if item.field_changes %}
+                  <ul>
+                    {% for change in item.field_changes %}
+                      <li>
+                        <strong>{{ change.field }}:</strong>
+                        {{ change.current }} &nbsp;&rarr;&nbsp; {{ change.historical }}
+                      </li>
+                    {% endfor %}
+                  </ul>
+                {% else %}
+                  {% trans "No changes" %}
+                {% endif %}
+              </td>
+              <td>
+                {% if item.status == "unrecoverable" %}
+                  {{ item.reason }}
+                {% elif item.identity_field %}
+                  {% blocktrans with field=item.identity_field old=item.historical_identity new=item.current_identity %}
+                    {{ field }}: {{ old }} (verified)
+                  {% endblocktrans %}
+                {% else %}
+                  {% trans "Verified by primary key" %}
+                {% endif %}
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="4">{% trans "No history-tracked associations existed at this point in time." %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if has_change_permission and not revert_disabled %}
+      <form method="post" action="{{ recovery_url }}">
+        {% csrf_token %}
+        <input type="hidden" name="recovery_token" value="{{ recovery_token }}" />
+        <div class="submit-row">
+          {% if full_recovery_available %}
+            <input type="submit"
+                   value="{% trans 'Recover everything' %}"
+                   class="default"
+                   name="_recover_full" />
+          {% else %}
+            <input type="submit"
+                   value="{% trans 'Recover everything' %}"
+                   class="default"
+                   name="_recover_full"
+                   disabled
+                   title="{% trans 'Unavailable because at least one association can no longer be recovered.' %}" />
+          {% endif %}
+          <input type="submit"
+                 value="{% trans 'Recover recognizable associations only' %}"
+                 name="_recover_partial" />
+          <a href="{{ history_url }}" class="closelink">{% trans "Close" %}</a>
+        </div>
+        {% if not full_recovery_available %}
+          <p class="help">
+            {% trans "A full recovery is unavailable because one or more historical associations cannot be recovered. A partial recovery will skip those associations and report them below." %}
+          </p>
+        {% endif %}
+      </form>
+    {% else %}
+      <a href="{{ history_url }}" class="closelink">{% trans "Close" %}</a>
+    {% endif %}
+  </div>
+{% endblock %}

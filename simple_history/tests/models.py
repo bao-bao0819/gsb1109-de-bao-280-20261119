@@ -1082,3 +1082,61 @@ class TestHistoricParticipantToHistoricOrganizationOneToOne(
         related_name="historic_participant",
     )
     history = HistoricalRecords()
+
+
+class ReconciledConfig(models.Model):
+    """A history-tracked configuration object with scalar settings."""
+
+    name = models.CharField(max_length=100)
+    status = models.CharField(max_length=50)
+
+    history = HistoricalRecords()
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class BillingGroup(models.Model):
+    """
+    A group identified by a stable business code.
+
+    The database primary key is not stable: a deleted group's primary key
+    may be reused by a different group, so identity must be verified through
+    ``code`` (and the group's own history).
+    """
+
+    code = models.CharField(max_length=50, unique=True)
+    name = models.CharField(max_length=100)
+
+    history = HistoricalRecords()
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class GroupQuota(models.Model):
+    """
+    A history-tracked association between a :class:`ReconciledConfig` and a
+    :class:`BillingGroup`, carrying a quota.
+
+    ``group`` uses ``SET_NULL`` so that deleting a group leaves the
+    association row (and its full history) behind instead of removing it.
+    """
+
+    config = models.ForeignKey(
+        ReconciledConfig,
+        on_delete=models.CASCADE,
+        related_name="group_quotas",
+    )
+    group = models.ForeignKey(
+        BillingGroup,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="group_quotas",
+    )
+    quota = models.PositiveIntegerField()
+
+    history = HistoricalRecords()
+
+    def __str__(self) -> str:
+        return f"{self.config} / {self.group} / {self.quota}"

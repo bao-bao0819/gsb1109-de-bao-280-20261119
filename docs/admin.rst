@@ -37,6 +37,58 @@ An example of admin integration for the ``Poll`` and ``Choice`` models:
 Changing a history-tracked model from the admin interface will automatically record the user who made the change (see :doc:`/user_tracking`).
 
 
+Previewing and confirming a recovery
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A historical version's admin form offers a **Preview recovery** action. The
+recovery preview page shows:
+
+* the scalar fields of the object that differ between the current state and
+  the historical state, and
+* every history-tracked reverse association (for example a group quota
+  attached to a configuration) that existed at the time of the historical
+  record, together with its current status:
+
+  - *Recoverable*: the association still exists, its related objects are the
+    same business entities, and its fields can be restored;
+  - *Already up to date*: nothing needs to change for this association;
+  - *Cannot be recovered*: the association or one of its related objects can no
+    longer be identified.
+
+Related objects are identified by their primary key, but their identity is
+additionally verified through a stable business field. This matters when a
+related object was deleted and a *different* object later reused the same
+database primary key: the new object must never inherit the historical
+association. By default the first unique, non-primary field of the related
+model is used as the identity field. You can configure explicit fields on the
+admin class with ``recovery_identity_fields``, which maps
+``app_label.model_name`` to a field name:
+
+.. code-block:: python
+
+    class ReconciledConfigAdmin(SimpleHistoryAdmin):
+        recovery_identity_fields = {"myapp.billinggroup": "code"}
+
+The preview itself never writes anything. Two explicit actions are offered:
+
+* **Recover everything** restores the object's scalars and *all* historical
+  associations. It is disabled (and rejected on the server side) when at least
+  one association cannot be recovered, or when the current data changed after
+  the preview was taken; in either case no data is modified.
+* **Recover recognizable associations only** restores the object's scalars and
+  only the associations that are still identifiable. Associations that cannot
+  be recovered are skipped and reported in the success message.
+
+Every recovery runs inside a single atomic transaction, so a failure while
+writing any scalar or association rolls back all changes. The returned result
+references the newly created historical versions, allowing the restored state
+to be re-queried through the normal history views.
+
+The feature can be disabled for an admin class by setting
+``recovery_enabled = False``. The regular history browsing and the existing
+revert form are unaffected.
+
+
 Displaying custom columns in the admin history list view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

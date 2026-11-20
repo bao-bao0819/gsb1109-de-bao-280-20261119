@@ -1,10 +1,11 @@
+import logging
 from collections.abc import Sequence
 from typing import Any
 
 from django import http
 from django.apps import apps as django_apps
 from django.conf import settings
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.contrib.admin import helpers
 from django.contrib.admin.utils import unquote
 from django.contrib.admin.views.main import PAGE_VAR
@@ -21,10 +22,20 @@ from django.utils.translation import gettext as _
 
 from .manager import HistoricalQuerySet, HistoryManager
 from .models import HistoricalChanges
+from .recovery import (
+    RECOVERY_MODE_FULL,
+    RECOVERY_MODE_PARTIAL,
+    RecoveryError,
+    RecoveryPreviewStore,
+    apply_recovery,
+    build_recovery_preview,
+)
 from .template_utils import HistoricalRecordContextHelper
 from .utils import get_history_manager_for_model, get_history_model_for_model
 
 SIMPLE_HISTORY_EDIT = getattr(settings, "SIMPLE_HISTORY_EDIT", False)
+
+logger = logging.getLogger(__name__)
 
 
 class SimpleHistoryAdmin(admin.ModelAdmin):
@@ -33,7 +44,16 @@ class SimpleHistoryAdmin(admin.ModelAdmin):
     object_history_template = "simple_history/object_history.html"
     object_history_list_template = "simple_history/object_history_list.html"
     object_history_form_template = "simple_history/object_history_form.html"
+    recovery_preview_template = "simple_history/recovery_preview.html"
     history_list_per_page = 100
+
+    # Set to ``False`` to hide the recovery preview entry point.
+    recovery_enabled = True
+    # Optional explicit mapping of ``app_label.model_name`` to the stable
+    # business field used to verify a related object's identity (e.g.
+    # ``{"tests.billinggroup": "code"}``). When unset, the first unique
+    # non-primary field is used automatically.
+    recovery_identity_fields = {}
 
     def get_urls(self):
         """Returns the additional urls used by the Reversion admin."""
@@ -46,7 +66,12 @@ class SimpleHistoryAdmin(admin.ModelAdmin):
                 "^([^/]+)/history/([^/]+)/$",
                 admin_site.admin_view(self.history_form_view),
                 name="%s_%s_simple_history" % info,
-            )
+            ),
+            re_path(
+                "^([^/]+)/history/([^/]+)/recover/$",
+                admin_site.admin_view(self.recovery_preview_view),
+                name="%s_%s_recovery" % info,
+            ),
         ]
         return history_urls + urls
 
@@ -262,6 +287,9 @@ class SimpleHistoryAdmin(admin.ModelAdmin):
 
         model_name = original_opts.model_name
         url_triplet = self.admin_site.name, original_opts.app_label, model_name
+        recovery_url = reverse(
+            "%s:%s_%s_recovery" % url_triplet, args=(object_id, version_id)
+        )
         context = {
             "title": self.history_form_view_title(request, obj),
             "adminform": admin_form,
@@ -275,6 +303,8 @@ class SimpleHistoryAdmin(admin.ModelAdmin):
             "changelist_url": reverse("%s:%s_%s_changelist" % url_triplet),
             "change_url": reverse("%s:%s_%s_change" % url_triplet, args=(obj.pk,)),
             "history_url": reverse("%s:%s_%s_history" % url_triplet, args=(obj.pk,)),
+            "recovery_url": recovery_url,
+            "recovery_enabled": self.recovery_enabled,
             "change_history": change_history,
             "revert_disabled": self.revert_disabled(request, obj),
             # Context variables copied from render_change_form
@@ -311,6 +341,179 @@ class SimpleHistoryAdmin(admin.ModelAdmin):
     def render_history_view(self, request, template, context, **kwargs):
         """Catch call to render, to allow overriding."""
         return render(request, template, context, **kwargs)
+
+    def get_recovery_identity_fields(self, request):
+        """
+        Return the mapping of ``app_label.model_name`` to the stable business
+        field used to verify related objects' identity during a recovery.
+        """
+        return self.recovery_identity_fields
+
+    def recovery_preview_view(
+        self, request, object_id, version_id, extra_context=None
+    ):
+        """Preview a recovery and, on POST, apply the confirmed recovery."""
+        if not self.recovery_enabled:
+            raise http.Http404
+
+        request.current_app = self.admin_site.name
+        opts = self.model._meta
+        history_model = getattr(
+            self.model, opts.simple_history_manager_attribute
+        ).model
+        history_record = get_object_or_404(
+            history_model,
+            **{
+                opts.pk.attname: unquote(object_id),
+                "history_id": unquote(version_id),
+            },
+        )
+        obj = history_record.instance
+        obj._state.adding = False
+
+        if not self.has_view_history_or_change_history_permission(request, obj):
+            raise PermissionDenied
+
+        if request.method == "POST":
+            return self._recovery_apply_view(
+                request, obj, object_id, version_id
+            )
+        return self._recovery_render_view(
+            request, history_record, obj, object_id, version_id, extra_context
+        )
+
+    def _recovery_apply_view(self, request, obj, object_id, version_id):
+        if not self.has_change_history_permission(request, obj):
+            raise PermissionDenied
+
+        opts = self.model._meta
+        url_triplet = self.admin_site.name, opts.app_label, opts.model_name
+        recovery_url = reverse(
+            "%s:%s_%s_recovery" % url_triplet, args=(object_id, version_id)
+        )
+        history_url = reverse(
+            "%s:%s_%s_history" % url_triplet, args=(object_id,)
+        )
+        store = RecoveryPreviewStore(request)
+        token = request.POST.get("recovery_token", "")
+        preview = store.get(token)
+        if (
+            preview is None
+            or str(preview.object_id) != str(unquote(object_id))
+            or str(preview.history_id) != str(unquote(version_id))
+        ):
+            self.message_user(
+                request,
+                _(
+                    "This recovery preview has expired. Review the updated "
+                    "preview and try again."
+                ),
+                messages.ERROR,
+            )
+            return http.HttpResponseRedirect(recovery_url)
+
+        mode = (
+            RECOVERY_MODE_FULL
+            if "_recover_full" in request.POST
+            else RECOVERY_MODE_PARTIAL
+        )
+        try:
+            result = apply_recovery(
+                preview,
+                mode,
+                history_user=request.user,
+                identity_fields=self.get_recovery_identity_fields(request),
+            )
+        except RecoveryError as error:
+            self.message_user(request, str(error), messages.ERROR)
+            return http.HttpResponseRedirect(recovery_url)
+        except Exception:
+            logger.exception("Recovery of %s failed", opts.label_lower)
+            self.message_user(
+                request,
+                _(
+                    "The recovery failed and all changes were rolled back; "
+                    "no data was modified."
+                ),
+                messages.ERROR,
+            )
+            return http.HttpResponseRedirect(recovery_url)
+
+        store.delete(token)
+        self.message_user(
+            request, self._recovery_success_message(result), messages.SUCCESS
+        )
+        return http.HttpResponseRedirect(history_url)
+
+    def _recovery_render_view(
+        self, request, history_record, obj, object_id, version_id, extra_context
+    ):
+        opts = self.model._meta
+        url_triplet = self.admin_site.name, opts.app_label, opts.model_name
+        recovery_url = reverse(
+            "%s:%s_%s_recovery" % url_triplet, args=(object_id, version_id)
+        )
+        history_url = reverse(
+            "%s:%s_%s_history" % url_triplet, args=(object_id,)
+        )
+        preview = build_recovery_preview(
+            history_record, self.get_recovery_identity_fields(request)
+        )
+        token = RecoveryPreviewStore(request).store(preview)
+        context = {
+            "title": _("Recover: %s") % force_str(obj),
+            "preview": preview,
+            "recovery_token": token,
+            "opts": opts,
+            "app_label": opts.app_label,
+            "object": obj,
+            "original": obj,
+            "object_id": object_id,
+            "history_id": version_id,
+            "history_url": history_url,
+            "change_url": reverse(
+                "%s:%s_%s_change" % url_triplet, args=(object_id,)
+            ),
+            "changelist_url": reverse(
+                "%s:%s_%s_changelist" % url_triplet
+            ),
+            "recovery_url": recovery_url,
+            "has_change_permission": self.has_change_history_permission(
+                request, obj
+            ),
+            "revert_disabled": self.revert_disabled(request, obj),
+            "full_recovery_available": not preview.unrecoverable_items,
+            "root_path": getattr(self.admin_site, "root_path", None),
+        }
+        context.update(self.admin_site.each_context(request))
+        context.update(extra_context or {})
+        return self.render_history_view(
+            request, self.recovery_preview_template, context
+        )
+
+    def _recovery_success_message(self, result):
+        restored = [change.field for change in result.scalar_changes]
+        lines = []
+        if restored:
+            lines.append(
+                _("Restored fields: %s") % ", ".join(restored)
+            )
+        for item in result.applied_items:
+            changes = ", ".join(
+                f"{change.field}: {change.current!r} -> {change.historical!r}"
+                for change in item.field_changes
+            )
+            lines.append(
+                _("Recovered %s (%s)") % (item.related_model_label, changes)
+            )
+        for item in result.skipped_items:
+            lines.append(
+                _("Could not recover %s: %s")
+                % (item.related_model_label, item.reason)
+            )
+        if not lines:
+            return _("The selected historical state already matches the current data.")
+        return " ".join(lines)
 
     def save_model(self, request, obj, form, change):
         """Set special model attribute to user for reference after save"""

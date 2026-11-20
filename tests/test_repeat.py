@@ -95,3 +95,72 @@ def test_thing():
     assert x == "Repeat.from_params(Expression('1'), 'u16', [7])"
     x = repr(r)
     assert x == "Repeat.from_params(Expression('1'), 'u16', [7])"
+
+
+class TestReusedPacketFormat:
+    """Regression tests for a decoder reusing one Format to read consecutive packets.
+
+    Packet layout: a header 'count' gives the number of blocks. Each block starts
+    with its own 'count' of samples, and an outer state list with the header
+    'count' length follows the blocks.
+    """
+
+    spec = ("packet: (count: u8, "
+            "repeat {count}: (count: u8, repeat {count}: (sample: u8)), "
+            "repeat {count}: (state: u8))")
+    # Header count 2; block counts 0 and 2; samples 10, 11; states 101, 102.
+    packet1 = Tibs("0x0200020a0b6566")
+    packet1_value = [2, [[0, []], [2, [[10], [11]]]], [[101], [102]]]
+    # Header count 1; one block with count 1; sample 20; state 201.
+    packet2 = Tibs("0x010114c9")
+    packet2_value = [1, [[1, [[20]]]], [[201]]]
+
+    def test_sequential_packets_with_nested_repeats(self):
+        f = Format(self.spec)
+        # First packet: empty and non-empty blocks each keep their own hierarchy,
+        # and the outer state list length comes only from the header count.
+        assert f.parse(self.packet1) == len(self.packet1)
+        assert f.value == self.packet1_value
+        assert f.value[1][0] == [0, []]  # Empty block keeps its (count, samples) structure.
+        assert f.value[1][1] == [2, [[10], [11]]]
+        assert len(f.value[2]) == 2  # Two states from the header count.
+        # The block-level 'count' fields are scoped to their block: once the
+        # blocks are done the outer (header) count is the one in effect.
+        assert f.vars["count"] == 2
+        assert f.to_tibs() == self.packet1
+
+        # A truncated input (cut before the second block is complete) only
+        # delivers its own bits and must fail.
+        truncated = self.packet1[:8 + 8 + 8 + 8]  # One of block two's two samples.
+        with pytest.raises(ValueError, match="sample"):
+            f.parse(truncated)
+
+        # The next packet is parsed cleanly: no counts or samples leak through.
+        assert f.parse(self.packet2) == len(self.packet2)
+        assert f.value == self.packet2_value
+        assert len(f.value[2]) == 1
+        assert f.vars["count"] == 1
+        assert f.to_tibs() == self.packet2
+
+    def test_repack_and_reread(self):
+        f = Format(self.spec)
+        for packet, value in [(self.packet1, self.packet1_value),
+                              (self.packet2, self.packet2_value)]:
+            assert f.unpack(packet) == value
+            # Packing the values back regenerates the exact declared bit string,
+            # and reading that again gives the same layout.
+            repacked = f.pack(value)
+            assert repacked == packet
+            assert f.unpack(repacked) == value
+
+    def test_truncation_failures_are_distinguishable(self):
+        f = Format(self.spec)
+        # Missing the header count.
+        with pytest.raises(ValueError, match="Field 'count: u8'"):
+            f.parse(Tibs())
+        # Missing a block's samples.
+        with pytest.raises(ValueError, match="Field 'sample: u8'"):
+            f.parse(self.packet1[:8 + 8 + 8])
+        # Missing the outer states.
+        with pytest.raises(ValueError, match="Field 'state: u8'"):
+            f.parse(self.packet1[:8 + 8 + 8 + 8 + 8])

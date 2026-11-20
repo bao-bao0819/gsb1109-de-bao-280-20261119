@@ -860,7 +860,6 @@ def test_format_with_expressions_in_if_condition():
     fmt.pack([3, 5, 42, 1000])
     assert fmt.to_tibs() == Tibs.from_string("0x03052A03E8")
 
-@pytest.mark.skip  # TODO
 def test_format_with_nested_repeat():
     """Test a format with nested repeat structures"""
     # A format representing a list of lists

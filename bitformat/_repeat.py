@@ -129,11 +129,18 @@ class Repeat(FieldType):
     def _parse(self, b: Tibs, startbit: int, kwargs: dict[str, Any]) -> int:
         self._bits_list = []
         pos = startbit
-        if self._concrete_count is None:
+        if self._concrete_count is None or not self._count.has_const_value:
             self._concrete_count = self._count.evaluate(**kwargs)
-        for i in range(self._concrete_count):
-            pos += self.field._parse(b, pos, kwargs)
-            self._bits_list.append(self.field.to_tibs())
+        # Names defined inside the repeated field are scoped to the Repeat, so
+        # restore any outer variables (such as a same-named count) afterwards.
+        outer_vars = dict(kwargs)
+        try:
+            for i in range(self._concrete_count):
+                pos += self.field._parse(b, pos, kwargs)
+                self._bits_list.append(self.field.to_tibs())
+        finally:
+            kwargs.clear()
+            kwargs.update(outer_vars)
         return pos - startbit
 
     @override
@@ -142,13 +149,18 @@ class Repeat(FieldType):
             raise TypeError(f"A Repeat field needs a Sequence to pack, but received '{value}' of type {type(value)}. "
                             f"To pack a single item, make a single item list instead.")
         self._bits_list = []
-        if self._concrete_count is None:
+        if self._concrete_count is None or not self._count.has_const_value:
             try:
                 self._concrete_count = self._count.evaluate(**kwargs)
             except ExpressionError as e:
                 raise ValueError(f"Cannot evaluate count for Repeat field: {e}")
 
-        self._set_value_with_kwargs(value, kwargs)
+        outer_kwargs = dict(kwargs)
+        try:
+            self._set_value_with_kwargs(value, kwargs)
+        finally:
+            kwargs.clear()
+            kwargs.update(outer_kwargs)
         return True
 
     @override
@@ -162,8 +174,12 @@ class Repeat(FieldType):
 
     @override
     def clear(self) -> None:
-        self._concrete_count = None
+        if self._count.has_const_value:
+            self._concrete_count = self._count.const_value
+        else:
+            self._concrete_count = None
         self._bits_list = []
+        self.field.clear()
 
     @override
     def has_dynamic_size(self) -> bool:
@@ -176,6 +192,10 @@ class Repeat(FieldType):
     @override
     def _get_value(self) -> list[Any] | None:
         if not self._bits_list:
+            # An empty list of bits is a valid value if the Repeat has been
+            # parsed or packed with a count of zero.
+            if self._concrete_count == 0:
+                return []
             return None
         values = [self.field.unpack(bits) for bits in self._bits_list]
         self.field.clear()
@@ -183,6 +203,9 @@ class Repeat(FieldType):
 
     @override
     def _set_value_with_kwargs(self, value: list[Any], kwargs: dict[str, Any]) -> None:
+        if self._concrete_count is None:
+            # The count isn't known, so set it from the number of values given.
+            self._concrete_count = len(value)
         value_iter = iter(value)
         for i in range(self._concrete_count):
             try:
@@ -231,5 +254,5 @@ class Repeat(FieldType):
             value = Expression.from_string(value)
         elif isinstance(value, int):
             value = Expression.from_int(value)
-        self.clear()
         self._count = value
+        self.clear()

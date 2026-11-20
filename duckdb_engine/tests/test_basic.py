@@ -350,6 +350,204 @@ def test_get_multi_columns(engine: Engine) -> None:
         )
 
 
+@fixture
+def attached_engines(tmp_path: Path) -> Any:
+    """An archive database with a supplier database attached as ``supplier``."""
+    archive_path = tmp_path / "archive.db"
+    supplier_path = tmp_path / "supplier.db"
+    engine = create_engine(f"duckdb:///{archive_path}")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE items(archive_id INTEGER)"))
+    with engine.begin() as conn:
+        conn.execute(text(f"ATTACH '{supplier_path}' AS supplier"))
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE supplier.main.items(supplier_id INTEGER)"))
+    return engine
+
+
+def _column_names(columns: Any) -> Any:
+    return [column_["name"] for column_ in columns]
+
+
+@mark.skipif(
+    supports_attach is False,
+    reason="ATTACH is not supported for DuckDB version < 0.7.0",
+)
+def test_temp_table_shadows_reflection_in_its_connection_only(
+    attached_engines: Engine,
+) -> None:
+    engine = attached_engines
+
+    connection_a = engine.connect()
+    connection_a.execute(text("CREATE TEMP TABLE items(scratch_id INTEGER)"))
+    inspector_a = inspect(connection_a)
+
+    # The unqualified name resolves to the temporary table, exactly like SQL.
+    assert _column_names(inspector_a.get_columns("items")) == ["scratch_id"]
+    assert list(connection_a.execute(text("select * from items limit 0")).keys()) == [
+        "scratch_id"
+    ]
+    assert inspector_a.has_table("items")
+
+    # Explicit database qualification always reaches the intended catalog.
+    assert _column_names(
+        inspector_a.get_columns("items", "archive.main")
+    ) == ["archive_id"]
+    assert _column_names(
+        inspector_a.get_columns("items", "supplier.main")
+    ) == ["supplier_id"]
+
+    # get_multi_columns follows the same resolution as get_columns.
+    dialect = cast(Dialect, engine.dialect)
+    unqualified = dict(
+        dialect.get_multi_columns(
+            connection_a, schema=None, filter_names={"items"}
+        )
+    )
+    assert _column_names(unqualified[(None, "items")]) == ["scratch_id"]
+    qualified = dict(
+        dialect.get_multi_columns(
+            connection_a, schema="archive.main", filter_names={"items"}
+        )
+    )
+    assert _column_names(qualified[("archive.main", "items")]) == ["archive_id"]
+    supplier = dict(
+        dialect.get_multi_columns(
+            connection_a, schema="supplier.main", filter_names={"items"}
+        )
+    )
+    assert _column_names(supplier[("supplier.main", "items")]) == ["supplier_id"]
+
+    # Connection B has no temporary table and therefore sees the archive table.
+    connection_b = engine.connect()
+    inspector_b = inspect(connection_b)
+    assert _column_names(inspector_b.get_columns("items")) == ["archive_id"]
+    assert inspector_b.has_table("items")
+    assert all(
+        column_["name"] != "scratch_id"
+        for column_ in inspector_b.get_columns("items")
+    )
+
+    # Removing the temp table and refreshing the cache switches the same
+    # inspector back to the persistent relation for the current catalog.
+    connection_a.execute(text("DROP TABLE items"))
+    inspector_a.info_cache.clear()
+    assert _column_names(inspector_a.get_columns("items")) == ["archive_id"]
+    assert _column_names(
+        inspector_a.get_columns("items", "archive.main")
+    ) == ["archive_id"]
+    assert _column_names(
+        inspector_a.get_columns("items", "supplier.main")
+    ) == ["supplier_id"]
+    assert list(connection_a.execute(text("select * from items limit 0")).keys()) == [
+        "archive_id"
+    ]
+
+    connection_a.close()
+    connection_b.close()
+
+
+@mark.skipif(
+    supports_attach is False,
+    reason="ATTACH is not supported for DuckDB version < 0.7.0",
+)
+def test_default_reflection_scope_follows_connection(attached_engines: Engine) -> None:
+    engine = attached_engines
+    connection = engine.connect()
+    inspector = inspect(connection)
+
+    assert _column_names(inspector.get_columns("items")) == ["archive_id"]
+
+    connection.execute(text("USE supplier"))
+    inspector.info_cache.clear()
+
+    assert _column_names(inspector.get_columns("items")) == ["supplier_id"]
+    assert list(connection.execute(text("select * from items limit 0")).keys()) == [
+        "supplier_id"
+    ]
+    assert inspector.has_table("items")
+
+    # A different connection keeps its own default database.
+    other = engine.connect()
+    assert _column_names(inspect(other).get_columns("items")) == ["archive_id"]
+
+    connection.close()
+    other.close()
+
+
+@mark.skipif(
+    supports_attach is False,
+    reason="ATTACH is not supported for DuckDB version < 0.7.0",
+)
+def test_unqualified_reflection_never_merges_catalogs(
+    attached_engines: Engine,
+) -> None:
+    engine = attached_engines
+    connection = engine.connect()
+    connection.execute(text("CREATE TEMP TABLE items(scratch_id INTEGER)"))
+    connection.execute(text("DROP TABLE items"))
+
+    inspector = inspect(connection)
+    columns = inspector.get_columns("items")
+    assert _column_names(columns) == ["archive_id"]
+
+    connection.close()
+
+
+@mark.skipif(
+    supports_attach is False,
+    reason="ATTACH is not supported for DuckDB version < 0.7.0",
+)
+def test_multi_columns_without_filters_excludes_internal_objects(
+    attached_engines: Engine,
+) -> None:
+    importorskip("sqlalchemy", "2.0.0-rc1")
+
+    engine = attached_engines
+    connection = engine.connect()
+    connection.execute(text("CREATE TEMP TABLE items(scratch_id INTEGER)"))
+
+    reflected = dict(
+        cast(Dialect, engine.dialect).get_multi_columns(
+            connection, schema=None, filter_names=None
+        )
+    )
+    assert {key[1] for key in reflected} == {"items"}
+    assert _column_names(reflected[(None, "items")]) == ["scratch_id"]
+
+    connection.close()
+
+
+@mark.skipif(
+    supports_attach is False,
+    reason="ATTACH is not supported for DuckDB version < 0.7.0",
+)
+def test_supplier_connection_does_not_see_archive_temp_table(
+    attached_engines: Engine, tmp_path: Path
+) -> None:
+    archive_engine = attached_engines
+    archive_connection = archive_engine.connect()
+    archive_connection.execute(text("CREATE TEMP TABLE items(scratch_id INTEGER)"))
+    assert _column_names(
+        inspect(archive_connection).get_columns("items")
+    ) == ["scratch_id"]
+
+    supplier_engine = create_engine(f"duckdb:///{tmp_path / 'supplier.db'}")
+    supplier_connection = supplier_engine.connect()
+    supplier_inspector = inspect(supplier_connection)
+
+    # The supplier database is this connection's own default catalog.
+    assert _column_names(supplier_inspector.get_columns("items")) == ["supplier_id"]
+    assert supplier_inspector.has_table("items")
+    assert _column_names(
+        supplier_inspector.get_columns("items", "supplier.main")
+    ) == ["supplier_id"]
+    assert not supplier_inspector.has_table("items", "archive.main")
+
+    archive_connection.close()
+    supplier_connection.close()
+
+
 def test_commit(session: Session, engine: Engine) -> None:
     importorskip("sqlalchemy", "1.4.0")
     session.execute(text("commit;"))

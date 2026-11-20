@@ -9,7 +9,6 @@ from typing import (
     Iterable,
     List,
     Optional,
-    Set,
     Tuple,
     Type,
 )
@@ -243,6 +242,86 @@ class DuckDBNullType(sqltypes.NullType):
             return super().result_processor(dialect, coltype)
 
 
+_RELATION_CATALOG = """
+    SELECT t.table_catalog AS database_name,
+           t.table_schema AS schema_name,
+           t.table_name AS relation_name,
+           t.table_type AS relation_kind,
+           MIN(c.oid) AS relation_oid
+    FROM information_schema.tables t
+    JOIN duckdb_schemas() s
+      ON s.database_name = t.table_catalog
+     AND s.schema_name = t.table_schema
+    JOIN pg_catalog.pg_class c
+      ON c.relnamespace = s.oid
+     AND c.relname = t.table_name
+     AND c.relkind IN ('r', 'v')
+    WHERE t.table_catalog <> 'system'
+      AND t.table_schema NOT LIKE 'pg\\_%' ESCAPE '\\'
+    GROUP BY t.table_catalog, t.table_schema, t.table_name, t.table_type
+"""
+
+_COLUMNS_BY_OID = """
+    SELECT a.attname AS name,
+           pg_catalog.format_type(a.atttypid, a.atttypmod) AS format_type,
+           (
+             SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+             FROM pg_catalog.pg_attrdef d
+             WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum
+             AND a.atthasdef
+           ) AS "default",
+           a.attnotnull AS not_null,
+           a.attrelid AS table_oid,
+           pgd.description AS comment
+    FROM pg_catalog.pg_attribute a
+    LEFT JOIN pg_catalog.pg_description pgd ON (
+        pgd.objoid = a.attrelid AND pgd.objsubid = a.attnum)
+    WHERE a.attrelid = :table_oid
+    AND a.attnum > 0 AND NOT a.attisdropped
+    ORDER BY a.attnum
+"""
+
+
+def _split_identifier_list(value: Optional[str], separator: str) -> List[str]:
+    """Split on ``separator`` while ignoring separators inside double quotes."""
+    parts: List[str] = []
+    buffer: List[str] = []
+    quoted = False
+    index = 0
+    while value is not None and index < len(value):
+        char = value[index]
+        if char == '"':
+            if quoted and index + 1 < len(value) and value[index + 1] == '"':
+                buffer.append('"')
+                index += 2
+                continue
+            quoted = not quoted
+            index += 1
+            continue
+        if char == separator and not quoted:
+            parts.append("".join(buffer).strip())
+            buffer = []
+            index += 1
+            continue
+        buffer.append(char)
+        index += 1
+    parts.append("".join(buffer).strip())
+    return [part for part in parts if part]
+
+
+def _result_mappings(result: Any) -> List[Dict[str, Any]]:
+    """Return mapping rows for both SQLAlchemy 1.3 and later result objects."""
+    if hasattr(result, "mappings"):
+        return [dict(row) for row in result.mappings()]
+    keys = list(result.keys())
+    return [dict(zip(keys, row)) for row in result.fetchall()]
+
+
+def _result_scalar(connection: "Connection", statement: str) -> Any:
+    result = connection.execute(text(statement))
+    return result.scalar() if hasattr(result, "scalar") else result.fetchone()[0]
+
+
 class Dialect(PGDialect_psycopg2):
     name = "duckdb"
     driver = "duckdb_engine"
@@ -456,6 +535,274 @@ class Dialect(PGDialect_psycopg2):
             ) in rs
         ]
 
+    def _split_schema_name(self, schema: str) -> Tuple[Optional[str], str]:
+        """Split a schema argument into ``(database, schema)``.
+
+        Handles the ``database.schema`` form as well as quoted identifiers,
+        without the ambiguity of a regular expression (identifiers may contain
+        dots when quoted).
+        """
+        parts = _split_identifier_list(schema, ".")
+        if len(parts) >= 2:
+            return parts[-2], parts[-1]
+        return None, parts[0]
+
+    def _relation_catalog(self, connection: "Connection") -> List[Dict[str, Any]]:
+        return _result_mappings(connection.execute(text(_RELATION_CATALOG)))
+
+    def _search_path_pairs(
+        self, connection: "Connection"
+    ) -> List[Tuple[str, str]]:
+        """Return the connection's default resolution pairs, in order.
+
+        DuckDB resolves an unqualified table name by looking in the temporary
+        schema first, then through the connection's live ``search_path``, and
+        finally in ``main`` of the connection's current database.  The
+        connection's current database is read here rather than captured when
+        the inspector was created, so it follows ``USE`` / another connection.
+        """
+        current_database = _result_scalar(connection, "SELECT current_database()")
+        raw = _result_scalar(connection, "SELECT current_setting('search_path')")
+
+        pairs: List[Tuple[str, str]] = [("temp", "main")]
+        for entry in _split_identifier_list(raw or "", ","):
+            database_name, schema_name = self._split_schema_name(entry)
+            pairs.append(
+                (
+                    database_name if database_name is not None else current_database,
+                    schema_name,
+                )
+            )
+        pairs.append((current_database, "main"))
+
+        deduplicated: List[Tuple[str, str]] = []
+        for pair in pairs:
+            if pair not in deduplicated:
+                deduplicated.append(pair)
+        return deduplicated
+
+    def _schema_pairs(
+        self, connection: "Connection", schema: str
+    ) -> List[Tuple[str, str]]:
+        """Return resolution pairs for a bare schema name.
+
+        DuckDB resolves ``schema.table`` against the temporary schema, then
+        any database on the search path that has that schema (in path order),
+        and finally the current database.
+        """
+        current_database = _result_scalar(connection, "SELECT current_database()")
+        raw = _result_scalar(connection, "SELECT current_setting('search_path')")
+
+        pairs: List[Tuple[str, str]] = [("temp", schema)]
+        for entry in _split_identifier_list(raw or "", ","):
+            database_name, schema_name = self._split_schema_name(entry)
+            if schema_name == schema:
+                pairs.append(
+                    (
+                        database_name
+                        if database_name is not None
+                        else current_database,
+                        schema,
+                    )
+                )
+        pairs.append((current_database, schema))
+
+        deduplicated: List[Tuple[str, str]] = []
+        for pair in pairs:
+            if pair not in deduplicated:
+                deduplicated.append(pair)
+        return deduplicated
+
+    def _resolve_relation(
+        self,
+        connection: "Connection",
+        table_name: str,
+        schema: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve ``table_name`` exactly as an unqualified/qualified query would.
+
+        ``schema=None`` follows the connection's temporary-schema and
+        ``search_path`` resolution.  ``database.schema`` restricts the lookup to
+        that database; a bare schema follows DuckDB's schema lookup, which
+        prefers the temporary schema and the current database.
+        """
+        catalog = self._relation_catalog(connection)
+
+        if schema is not None:
+            database_name, schema_name = self._split_schema_name(schema)
+            if database_name is not None:
+                pairs = [(database_name, schema_name)]
+            else:
+                pairs = self._schema_pairs(connection, schema_name)
+        else:
+            pairs = self._search_path_pairs(connection)
+
+        for pair in pairs:
+            for relation in catalog:
+                if (
+                    relation["database_name"],
+                    relation["schema_name"],
+                ) == pair and relation["relation_name"] == table_name:
+                    return relation
+
+        if schema is None:
+            # Preserve reflection of a unique relation that is not on the
+            # connection's search path, but never guess between same-named
+            # relations in different catalogs.
+            matches = [
+                relation
+                for relation in catalog
+                if relation["relation_name"] == table_name
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    def _load_columns_by_oid(
+        self, connection: "Connection", table_oid: int
+    ) -> List[Dict[str, Any]]:
+        return _result_mappings(
+            connection.execute(text(_COLUMNS_BY_OID), {"table_oid": table_oid})
+        )
+
+    def _column_domains_and_enums(
+        self, connection: "Connection"
+    ) -> Tuple[Dict[Any, Any], Dict[Any, Any]]:
+        enums = dict(
+            ((rec["name"],), rec)
+            if rec["visible"]
+            else ((rec["schema"], rec["name"]), rec)
+            for rec in self._load_enums(connection, schema="*")  # type: ignore[attr-defined]
+        )
+        # DuckDB has no pg_collation/pg_type domain catalog for SQLAlchemy's
+        # domain query, so domains are intentionally left empty (as before).
+        return {}, enums
+
+    def _columns_for_relation(
+        self,
+        connection: "Connection",
+        relation: Dict[str, Any],
+        table_name: str,
+        schema: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        rows = self._load_columns_by_oid(connection, relation["relation_oid"])
+        if not rows:
+            return []
+        domains, enums = self._column_domains_and_enums(connection)
+
+        if sqlalchemy_version >= "2.0":
+            reflection_rows = [
+                {
+                    "name": row["name"],
+                    "format_type": row["format_type"],
+                    "default": row["default"],
+                    "not_null": row["not_null"],
+                    "table_name": table_name,
+                    "comment": row["comment"],
+                    "generated": None,
+                    "identity_options": None,
+                    "collation": None,
+                }
+                for row in rows
+            ]
+            columns = self._get_columns_info(  # type: ignore[attr-defined]
+                reflection_rows, domains, enums, schema
+            )
+            return list(columns[(schema, table_name)])
+
+        return [
+            self._get_column_info(
+                row["name"],
+                row["format_type"],
+                row["default"],
+                row["not_null"],
+                domains,
+                enums,
+                schema,
+                row["comment"],
+                None,
+                None,
+            )
+            for row in rows
+        ]
+
+    @cache  # type: ignore[call-arg]
+    def get_columns(  # type: ignore[no-untyped-def]
+        self,
+        connection: "Connection",
+        table_name: str,
+        schema: "Optional[str]" = None,
+        **kw: "Any",
+    ):
+        if not supports_attach:
+            return super().get_columns(connection, table_name, schema, **kw)
+
+        relation = self._resolve_relation(connection, table_name, schema)
+        if relation is None:
+            raise NoSuchTableError(table_name)
+
+        return self._columns_for_relation(
+            connection, relation, table_name, schema
+        )
+
+    def get_multi_columns(  # type: ignore[no-untyped-def]
+        self,
+        connection: "Connection",
+        schema: "Optional[str]" = None,
+        filter_names: "Optional[Collection[str]]" = None,
+        scope: "Optional[str]" = None,
+        kind: "Optional[Tuple[str, ...]]" = None,
+        **kw: Any,
+    ) -> List:
+        """Reflect columns for several names through the same resolution."""
+        if not supports_attach:
+            return super().get_multi_columns(  # type: ignore[misc]
+                connection,
+                schema=schema,
+                filter_names=filter_names,
+                scope=scope,
+                kind=kind,
+                **kw,
+            )
+
+        catalog = self._relation_catalog(connection)
+        if filter_names:
+            names = list(filter_names)
+        else:
+            # No filter: the default scope is every relation visible through
+            # the connection's current resolution pairs.
+            if schema is not None:
+                database_name, schema_name = self._split_schema_name(schema)
+                if database_name is not None:
+                    pairs = [(database_name, schema_name)]
+                else:
+                    pairs = self._schema_pairs(connection, schema_name)
+            else:
+                pairs = self._search_path_pairs(connection)
+            names = []
+            for pair in pairs:
+                for relation in catalog:
+                    if (
+                        relation["database_name"],
+                        relation["schema_name"],
+                    ) == pair and relation["relation_name"] not in names:
+                        names.append(relation["relation_name"])
+
+        result = []
+        for name in names:
+            relation = self._resolve_relation(connection, name, schema)
+            if relation is None:
+                continue
+            result.append(
+                (
+                    (schema, name),
+                    self._columns_for_relation(
+                        connection, relation, name, schema
+                    ),
+                )
+            )
+        return result
+
     @cache  # type: ignore[call-arg]
     def get_table_oid(  # type: ignore[no-untyped-def]
         self,
@@ -464,27 +811,20 @@ class Dialect(PGDialect_psycopg2):
         schema: "Optional[str]" = None,
         **kw: "Any",
     ):
-        """Fetch the oid for (database.)schema.table_name.
-        The schema name can be formatted either as database.schema or just the schema name.
-        In the latter scenario the schema associated with the default database is used.
-        """
-        s = """
-            SELECT oid, table_name
-            FROM (
-                SELECT table_oid AS oid, table_name,              database_name, schema_name FROM duckdb_tables()
-                UNION ALL BY NAME
-                SELECT view_oid AS oid , view_name AS table_name, database_name, schema_name FROM duckdb_views()
-            )
-            WHERE schema_name NOT LIKE 'pg\\_%' ESCAPE '\\'
-            """
-        sql, params = self._build_query_where(table_name=table_name, schema_name=schema)
-        s += sql
+        """Fetch the oid for the relation the connection would actually use.
 
-        rs = connection.execute(text(s), params)
-        table_oid = rs.scalar()
-        if table_oid is None:
+        The schema name can be formatted either as database.schema or just the
+        schema name.  Without a schema, resolution follows the connection's
+        temporary schema and search path rather than picking an arbitrary
+        catalog entry.
+        """
+        if not supports_attach:
+            return super().get_table_oid(connection, table_name, schema, **kw)
+
+        relation = self._resolve_relation(connection, table_name, schema)
+        if relation is None:
             raise NoSuchTableError(table_name)
-        return table_oid
+        return relation["relation_oid"]
 
     def has_table(
         self,
@@ -563,73 +903,6 @@ class Dialect(PGDialect_psycopg2):
                     )
                 )
             return query
-
-    # FIXME: this method is a hack around the fact that we use a single cursor for all queries inside a connection,
-    #   and this is required to fix get_multi_columns
-    def get_multi_columns(
-        self,
-        connection: "Connection",
-        schema: Optional[str] = None,
-        filter_names: Optional[Set[str]] = None,
-        scope: Optional[str] = None,
-        kind: Optional[Tuple[str, ...]] = None,
-        **kw: Any,
-    ) -> List:
-        """
-        Copyright 2005-2023 SQLAlchemy authors and contributors <see AUTHORS file>.
-
-        Permission is hereby granted, free of charge, to any person obtaining a copy of
-        this software and associated documentation files (the "Software"), to deal in
-        the Software without restriction, including without limitation the rights to
-        use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-        of the Software, and to permit persons to whom the Software is furnished to do
-        so, subject to the following conditions:
-
-        The above copyright notice and this permission notice shall be included in all
-        copies or substantial portions of the Software.
-
-        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-        SOFTWARE.
-        """
-
-        has_filter_names, params = self._prepare_filter_names(filter_names)  # type: ignore[attr-defined]
-        query = self._columns_query(schema, has_filter_names, scope, kind)  # type: ignore[attr-defined]
-        rows = list(connection.execute(query, params).mappings())
-
-        # dictionary with (name, ) if default search path or (schema, name)
-        # as keys
-        domains: Dict[tuple, dict] = {}
-        """
-        TODO: fix these pg_collation errors in SQLA2
-        domains = {
-            ((d["schema"], d["name"]) if not d["visible"] else (d["name"],)): d
-            for d in self._load_domains(  # type: ignore[attr-defined]
-                connection, schema="*", info_cache=kw.get("info_cache")
-            )
-        }
-        """
-
-        # dictionary with (name, ) if default search path or (schema, name)
-        # as keys
-        enums = dict(
-            (
-                ((rec["name"],), rec)
-                if rec["visible"]
-                else ((rec["schema"], rec["name"]), rec)
-            )
-            for rec in self._load_enums(  # type: ignore[attr-defined]
-                connection, schema="*", info_cache=kw.get("info_cache")
-            )
-        )
-
-        columns = self._get_columns_info(rows, domains, enums, schema)  # type: ignore[attr-defined]
-
-        return columns.items()
 
     # fix for https://github.com/Mause/duckdb_engine/issues/1128
     # (Overrides sqlalchemy method)

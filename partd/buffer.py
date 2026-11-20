@@ -1,10 +1,9 @@
 from .core import Interface
 from threading import Lock
-from toolz import merge_with, topk, accumulate, pluck
+from toolz import topk, accumulate, pluck
 from operator import add
 from bisect import bisect
 from collections import defaultdict
-from queue import Queue, Empty
 
 
 def zero():
@@ -50,8 +49,10 @@ class Buffer(Interface):
     def _get(self, keys, lock=True, **kwargs):
         if lock: self.lock.acquire()
         try:
-            result = list(map(add, self.fast.get(keys, lock=False),
-                                   self.slow.get(keys, lock=False)))
+            # On-disk (slow) parts were appended before anything still held
+            # in memory (fast), so slow bytes come first in append order.
+            result = list(map(add, self.slow.get(keys, lock=False),
+                                   self.fast.get(keys, lock=False)))
         finally:
             if lock: self.lock.release()
         return result
@@ -92,14 +93,24 @@ class Buffer(Interface):
             Whether or not to block until all writing is complete
 
         If no keys are given then flush all keys
+
+        Each key is fully moved to the slow layer (appended there, removed
+        here) before the next one is touched.  A failure while flushing a key
+        therefore leaves that key entirely in the fast layer, while keys that
+        were already flushed stay complete on the slow layer.  The flush can
+        be retried without re-appending the completed keys.
         """
         if keys is None:
             keys = list(self.lengths)
 
-        self.slow.append(dict(zip(keys, self.fast.get(keys))))
-        self.fast.delete(keys)
-
         for key in keys:
+            values = self.fast.get([key])
+            # Move one key at a time so a failure is confined to this key:
+            # completed keys are not re-sent, the failed key is still fully
+            # readable from the fast layer and can be flushed again.
+            self.slow.append({key: values[0]})
+            self.fast.delete([key])
+
             self.memory_usage -= self.lengths[key]
             del self.lengths[key]
 

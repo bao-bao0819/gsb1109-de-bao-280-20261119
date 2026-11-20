@@ -9,6 +9,11 @@ from .core import Interface
 import locket
 
 
+CREATED = 'created'
+SAME = 'same'
+CONFLICT = 'conflict'
+
+
 class File(Interface):
     def __init__(self, path=None, dir=None):
         if not path:
@@ -44,6 +49,50 @@ class File(Interface):
                         os.fsync(f)
         finally:
             if lock: self.lock.release()
+
+    def create(self, key, value):
+        """ Create a key with the given value, only if it does not exist yet
+
+        This is atomic across threads and processes sharing the same
+        directory.  The key becomes visible to readers only once it holds
+        the complete value; a failure before publishing leaves nothing
+        behind that could be mistaken for an existing key.
+
+        Returns one of three distinguishable outcomes:
+
+        - ``CREATED``: the key was missing and now holds ``value``
+        - ``SAME``: the key already existed with exactly these bytes
+        - ``CONFLICT``: the key already existed with different bytes
+
+        An existing key holding zero bytes counts as existing, unlike a
+        missing key.  The comparison always reads the bytes currently on
+        disk, so reopening the directory with a new instance behaves the
+        same.  ``append``/``get`` are unaffected by this.
+        """
+        fn = self.filename(key)
+        dirname = os.path.dirname(fn)
+        if not os.path.exists(dirname):
+            with suppress(OSError):
+                os.makedirs(dirname)
+        fd, tmp = tempfile.mkstemp(prefix='.create-', dir=dirname)
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(value)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, fn)
+            except FileExistsError:
+                with open(fn, 'rb') as f:
+                    existing = f.read()
+                if existing == value:
+                    return SAME
+                else:
+                    return CONFLICT
+            return CREATED
+        finally:
+            with suppress(OSError):
+                os.remove(tmp)
 
     def _get(self, keys, lock=True, **kwargs):
         assert isinstance(keys, (list, tuple, set))

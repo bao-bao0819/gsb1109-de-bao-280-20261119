@@ -1,3 +1,4 @@
+import struct
 from numbers import Number
 
 from shapely.geometry import shape as shapely_shape
@@ -238,6 +239,22 @@ class VectorTile:
     def _can_handle_attr(cls, k, v):
         return cls._can_handle_key(k) and cls._can_handle_val(v)
 
+    @staticmethod
+    def _value_cache_key(v):
+        """Return a key identifying the encoded protobuf value for `v`.
+
+        Python equality treats ``True``, ``1`` and ``1.0`` as the same value, and ``0.0`` as equal to ``-0.0``. The
+        encoded protobuf fields are distinct, though, so the cache key has to include both the actual type and, for
+        floats, the sign bit. Note that ``bool`` must be checked before ``int``, since it is an ``int`` subclass.
+        """
+        if isinstance(v, bool):
+            return ("bool", v)
+        if isinstance(v, int):
+            return ("int", v)
+        if isinstance(v, float):
+            return ("float", struct.pack(">d", v))
+        return ("str", v)
+
     def _handle_attr(self, layer, feature, props):
         for k, v in props.items():
             if self._can_handle_attr(k, v):
@@ -249,8 +266,9 @@ class VectorTile:
                 feature.tags.append(self.seen_keys_idx[k])
 
                 values_idx = self.seen_values_bool_idx if isinstance(v, bool) else self.seen_values_idx
-                if v not in values_idx:
-                    values_idx[v] = self.val_idx
+                cache_key = self._value_cache_key(v)
+                if cache_key not in values_idx:
+                    values_idx[cache_key] = self.val_idx
                     self.val_idx += 1
 
                     val = layer.values.add()
@@ -263,4 +281,4 @@ class VectorTile:
                     elif isinstance(v, float):
                         val.double_value = v
 
-                feature.tags.append(values_idx[v])
+                feature.tags.append(values_idx[cache_key])

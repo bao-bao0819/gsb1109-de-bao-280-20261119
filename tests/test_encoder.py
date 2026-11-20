@@ -2,12 +2,14 @@
 Tests for vector_tile/encoder.py
 """
 
+import math
 import unittest
 
 from shapely import wkt
 
 import mapbox_vector_tile
 from mapbox_vector_tile import decode, encode
+from mapbox_vector_tile.Mapbox import vector_tile_pb2 as vector_tile
 from mapbox_vector_tile.utils import DEFAULT_ENCODE_OPTIONS, get_encode_options
 
 
@@ -441,7 +443,228 @@ class TestDifferentGeomFormats(BaseTestCase):
         self.assertFalse(isinstance(act_props["bar"], bool))
 
 
+class ValueDictionaryTestCase(unittest.TestCase):
+    """Values must be de-duplicated by their actual protobuf field, not by Python equality.
+
+    Python considers ``True``, ``1`` and ``1.0`` equal, and ``0.0`` equal to ``-0.0``, so ordinary value comparisons
+    cannot verify these properties. The assertions below inspect the raw protobuf values (including the float sign
+    bit) instead of comparing Python values.
+    """
+
+    MIXED = {
+        "bool_true": True,
+        "int_one": 1,
+        "float_one": 1.0,
+        "bool_false": False,
+        "int_zero": 0,
+        "float_zero": 0.0,
+        "float_negative_zero": -0.0,
+    }
+
+    EXTRA = {
+        "repeat_float_one": 1.0,
+        "repeat_int_one": 1,
+        "repeat_bool_true": True,
+        "string": "hello",
+        "normal_float": 2.5,
+        "normal_int": 7,
+    }
+
+    # Two layers with the same properties, so each layer repeats the values of the other one.
+    LAYERS = {"first": {1: MIXED, 2: EXTRA}, "second": {1: MIXED, 2: EXTRA}}
+
+    # Properties which are unsupported and must keep being ignored, regardless of the value dictionary handling.
+    UNSUPPORTED = {"none": None, "list": [1, 2, 3], "object": {"a": 1}}
+    # The empty string is a supported value and has to be preserved, as before.
+    SUPPORTED_EXTRA = {"empty_string": ""}
+
+    # Expected ``(protobuf field, native value, sign)`` for every accepted property.
+    EXPECTED = {
+        "bool_true": ("bool_value", True, None),
+        "bool_false": ("bool_value", False, None),
+        "repeat_bool_true": ("bool_value", True, None),
+        "int_one": ("int_value", 1, None),
+        "int_zero": ("int_value", 0, None),
+        "repeat_int_one": ("int_value", 1, None),
+        "normal_int": ("int_value", 7, None),
+        "float_one": ("double_value", 1.0, 1.0),
+        "float_zero": ("double_value", 0.0, 1.0),
+        "float_negative_zero": ("double_value", -0.0, -1.0),
+        "repeat_float_one": ("double_value", 1.0, 1.0),
+        "normal_float": ("double_value", 2.5, 1.0),
+        "string": ("string_value", "hello", None),
+        "empty_string": ("string_value", "", None),
+    }
+
+    VALUE_FIELDS = (
+        "string_value",
+        "float_value",
+        "double_value",
+        "int_value",
+        "uint_value",
+        "sint_value",
+        "bool_value",
+    )
+
+    @classmethod
+    def _parse(cls, pbf):
+        tile = vector_tile.tile()
+        tile.ParseFromString(pbf)
+        return tile
+
+    @classmethod
+    def _field(cls, value):
+        for name in cls.VALUE_FIELDS:
+            if value.HasField(name):
+                return name
+        raise AssertionError(f"{value} has no value field")
+
+    @classmethod
+    def _field_and_value(cls, value):
+        """Return ``(field name, native value)``, keeping signed zero distinct via ``copysign``."""
+        field = cls._field(value)
+        native = getattr(value, field)
+        if field in ("float_value", "double_value"):
+            native = (native, math.copysign(1.0, native))
+        return field, native
+
+    @classmethod
+    def _expected(cls, key):
+        field, native, sign = cls.EXPECTED[key]
+        return (field, (native, sign)) if sign is not None else (field, native)
+
+    @classmethod
+    def _expected_props(cls, props):
+        return {key: cls._expected(key) for key in props}
+
+    @classmethod
+    def _properties_by_id(cls, layer):
+        """Map each feature ID to the raw ``(field, value)`` tuple for every property."""
+        result = {}
+        for feature in layer.features:
+            tags = list(feature.tags)
+            assert len(tags) % 2 == 0, "Unexpected number of tags"
+            props = {}
+            for key_idx, val_idx in zip(tags[::2], tags[1::2]):
+                props[layer.keys[key_idx]] = cls._field_and_value(layer.values[val_idx])
+            result[feature.id] = props
+        return result
+
+    @classmethod
+    def _type_counts(cls, props_by_id):
+        """Count distinct value entries per actual protobuf field."""
+        values = {cls._expected(key) for props in props_by_id.values() for key in props}
+        counts = {}
+        for field, _ in values:
+            counts[field] = counts.get(field, 0) + 1
+        return counts
+
+    @classmethod
+    def _layer_type_counts(cls, layer):
+        counts = {}
+        for value in layer.values:
+            field = cls._field(value)
+            counts[field] = counts.get(field, 0) + 1
+        return counts
+
+    @staticmethod
+    def _features(props_by_id, reverse=False):
+        items = list(props_by_id.items())
+        if reverse:
+            items.reverse()
+        return [
+            {"id": fid, "geometry": "POINT(1 1)", "properties": props if not reverse else dict(reversed(props.items()))}
+            for fid, props in items
+        ]
+
+    def _encode(self, reverse=False):
+        layers = [{"name": name, "features": self._features(props, reverse)} for name, props in self.LAYERS.items()]
+        if reverse:
+            layers.reverse()
+        return encode(layers)
+
+    def test_mixed_types_in_one_layer_do_not_merge(self):
+        props = {**self.MIXED, **self.SUPPORTED_EXTRA, **self.UNSUPPORTED}
+        pbf = encode([{"name": "layer", "features": [{"id": 1, "geometry": "POINT(0 0)", "properties": props}]}])
+        layer = self._parse(pbf).layers[0]
+
+        # Only the supported values are encoded, with one entry per actual type and per zero sign.
+        self.assertEqual(8, len(layer.values))
+        self.assertEqual(
+            {"bool_value", "double_value", "int_value", "string_value"}, {self._field(v) for v in layer.values}
+        )
+        self.assertEqual(
+            self._expected_props({**self.MIXED, **self.SUPPORTED_EXTRA}), self._properties_by_id(layer)[1]
+        )
+
+    def test_same_type_and_representation_shares_one_index_in_layer(self):
+        pbf = encode(
+            [
+                {
+                    "name": "layer",
+                    "features": [
+                        {"id": 1, "geometry": "POINT(0 0)", "properties": {"a": 1.5, "b": 1.5}},
+                        {"id": 2, "geometry": "POINT(0 0)", "properties": {"a": 1.5}},
+                        {"id": 3, "geometry": "POINT(0 0)", "properties": {"a": 1, "b": 1.0}},
+                    ],
+                }
+            ]
+        )
+        layer = self._parse(pbf).layers[0]
+        # The repeated double 1.5 is shared; int 1 and double 1.0 must not share.
+        self.assertEqual(3, len(layer.values))
+        by_id = self._properties_by_id(layer)
+        self.assertEqual(("double_value", (1.5, 1.0)), by_id[1]["a"])
+        self.assertEqual(by_id[1]["a"], by_id[2]["a"])
+        self.assertEqual(("int_value", 1), by_id[3]["a"])
+        self.assertEqual(("double_value", (1.0, 1.0)), by_id[3]["b"])
+
+    def test_layers_keep_separate_value_dictionaries(self):
+        tile = self._parse(self._encode())
+        self.assertEqual(2, len(tile.layers))
+        for layer in tile.layers:
+            self.assertEqual(self._type_counts(self.LAYERS[layer.name]), self._layer_type_counts(layer))
+            tags = [tag for feature in layer.features for tag in feature.tags[1::2]]
+            self.assertTrue(all(0 <= tag < len(layer.values) for tag in tags))
+
+    def test_types_and_zero_signs_survive_swapped_order_and_reencode(self):
+        for reverse in (False, True):
+            source = self._encode(reverse=reverse)
+            self.assertEqual(self._expected_tile(), self._by_id(source))
+
+            # Re-encode from the decoded properties, swapping the property order again.
+            decoded = decode(source)
+            reencoded = encode(
+                [
+                    {
+                        "name": name,
+                        "features": self._features(
+                            {feature["id"]: feature["properties"] for feature in decoded[name]["features"]},
+                            reverse=not reverse,
+                        ),
+                    }
+                    for name in decoded
+                ]
+            )
+            self.assertEqual(self._expected_tile(), self._by_id(reencoded))
+            # Acceptance check: entries counted by their actual protobuf type after re-encoding.
+            for layer in self._parse(reencoded).layers:
+                self.assertEqual(self._type_counts(self.LAYERS[layer.name]), self._layer_type_counts(layer))
+
+    @classmethod
+    def _expected_tile(cls):
+        return {
+            name: {fid: cls._expected_props(props) for fid, props in props_by_id.items()}
+            for name, props_by_id in cls.LAYERS.items()
+        }
+
+    @classmethod
+    def _by_id(cls, pbf):
+        return {layer.name: cls._properties_by_id(layer) for layer in cls._parse(pbf).layers}
+
+
 class TestDictGeometries(BaseTestCase):
+
     def _test_encoder_dict(self, geometry):
         self.assertRoundTrip(input_geometry=geometry, expected_geometry=geometry)
 

@@ -22,6 +22,11 @@ __all__ = ["DesignInfo", "FactorInfo", "SubtermInfo", "DesignMatrix"]
 
 import warnings
 
+try:
+    from collections.abc import Mapping
+except ImportError:
+    from collections import Mapping
+
 import numpy as np
 
 from patsy import PatsyError
@@ -33,10 +38,14 @@ from patsy.util import (
     safe_issubdtype,
     no_pickling,
     assert_no_pickling,
+    have_pandas,
 )
-from patsy.constraint import linear_constraint
+from patsy.constraint import LinearConstraint, linear_constraint
 from patsy.contrasts import ContrastMatrix
 from patsy.desc import ModelDesc, Term
+
+if have_pandas:
+    import pandas
 
 
 class FactorInfo:
@@ -261,6 +270,49 @@ def test_SubtermInfo():
     pytest.raises(ValueError, SubtermInfo, ["a", "x"], {"z": cm}, 1)
     pytest.raises(ValueError, SubtermInfo, ["a", "x"], {"a": 1}, 1)
     pytest.raises(ValueError, SubtermInfo, ["a", "x"], {}, 1.5)
+
+
+def _term_samples_to_data(samples):
+    # Normalize the `samples` argument of
+    # DesignInfo.linear_constraint_from_term_samples into a (data, n_samples)
+    # pair, where `data` is a column-oriented mapping suitable for
+    # build_design_matrices.
+    if have_pandas and isinstance(samples, pandas.DataFrame):
+        return samples, samples.shape[0]
+    if isinstance(samples, Mapping):
+        # Column-oriented: {"region": ["A", "B"], "season": ["S", "W"]}
+        data = dict(samples)
+        lengths = set()
+        for column in data.values():
+            try:
+                lengths.add(len(column))
+            except TypeError:
+                raise ValueError(
+                    "sample columns must be array-like, not %r" % (column,)
+                )
+        if len(lengths) > 1:
+            raise ValueError("sample columns have inconsistent lengths")
+        n_samples = lengths.pop() if lengths else 0
+        return data, n_samples
+    # Row-oriented: [{"region": "A", "season": "S"}, ...]
+    samples = list(samples)
+    if not samples:
+        return {}, 0
+    for sample in samples:
+        if not isinstance(sample, Mapping):
+            raise ValueError(
+                "samples must be a mapping of columns, a pandas DataFrame, "
+                "or a sequence of row dicts; got %r" % (sample,)
+            )
+    keys = list(samples[0])
+    for sample in samples[1:]:
+        if set(sample) != set(keys):
+            raise ValueError(
+                "all sample dicts must have the same keys (got %r and %r)"
+                % (sorted(keys), sorted(sample))
+            )
+    data = {key: [sample[key] for sample in samples] for key in keys}
+    return data, len(samples)
 
 
 class DesignInfo(object):
@@ -553,6 +605,130 @@ class DesignInfo(object):
           di.linear_constraint("x1 = x2 = 3")
         """
         return linear_constraint(constraint_likes, self.column_names)
+
+    def linear_constraint_from_term_samples(self, term, samples, weights=None):
+        """Construct a linear constraint isolating one term's weighted
+        contribution at specific sample points.
+
+        This is useful when a modeling problem is described in terms of
+        business-level quantities -- "the contribution of the
+        ``region:season`` interaction, at these particular level
+        combinations, with these weights, must be zero" -- and you want
+        :class:`LinearConstraint` rows that exactly match the way this
+        design actually codes that term, without having to reason about
+        contrast codings or generated column names by hand.
+
+        For each sample, one constraint row is produced. The row has the
+        same width and column order as this design; it is zero everywhere
+        except in the columns belonging to `term`, where it contains the
+        term's design matrix row for that sample (i.e. the actual coded
+        values produced by this design's contrasts), multiplied by the
+        corresponding weight. Formally, if ``X_term[i]`` is the row of the
+        term's sub-design-matrix evaluated at sample ``i`` with weight
+        ``w_i``, then row ``i`` of the result constrains::
+
+          w_i * X_term[i] @ beta[term_slice] = 0
+
+        Note that this uses the design's actual contrast coding: it is
+        *not* equivalent to putting a 1 on every column whose name happens
+        to contain some substring, and columns belonging to other terms
+        whose names share a common prefix with `term` are never touched.
+
+        :arg term: The term to constrain, given either as its exact term
+          name (a string, as it appears in :attr:`term_names`) or as a
+          :class:`Term` object. Matching is exact; e.g. ``"C(a)"`` will
+          not match a term named ``"C(a, Treatment(reference='x'))"``.
+        :arg samples: The sample points at which the term's contribution
+          is taken. Only the variables used by `term` are needed. May be
+          given row-oriented (a list of dicts like ``{"region": "A",
+          "season": "S"}``), column-oriented (a single dict like
+          ``{"region": ["A", "B"], "season": ["S", "W"]}``), or as a
+          pandas DataFrame. Categorical levels must be ones seen when this
+          design was created.
+        :arg weights: The contribution weight for each sample. May be
+          omitted (all weights 1), a single scalar (broadcast to all
+          samples), or an array with one entry per sample.
+        :returns: A :class:`LinearConstraint` with one row per sample, in
+          this design's original column order, and all-zero constants.
+
+        Raises :class:`PatsyError` if the term is not present in this
+        design, or if the term is present but has no columns of its own
+        (e.g. it was fully redundant with other terms when the design was
+        built). Note that these are different from the case where the
+        weighted contribution genuinely evaluates to zero (e.g. a sample
+        sitting exactly on the reference levels under treatment coding):
+        that produces a valid all-zero constraint row and is not an error.
+
+        Example::
+
+          di = dmatrix("1 + C(a) + C(a):C(b)", data).design_info
+          di.linear_constraint_from_term_samples(
+              "C(a):C(b)",
+              [{"a": "a2", "b": "b1"}, {"a": "a1", "b": "b2"}],
+              [0.5, 2.0],
+          )
+        """
+        # Local import to avoid a circular import (patsy.build imports
+        # patsy.design_info).
+        from patsy.build import build_design_matrices
+
+        if self.term_slices is None:
+            raise PatsyError(
+                "linear_constraint_from_term_samples requires a DesignInfo "
+                "that was built from a formula, but this DesignInfo only "
+                "has plain column names"
+            )
+        if isinstance(term, Term):
+            if term not in self.term_slices:
+                raise PatsyError("unknown term %r" % (term,))
+            term_obj = term
+        else:
+            term_name_to_term = {}
+            for t in self.term_slices:
+                term_name_to_term[t.name()] = t
+            if term not in term_name_to_term:
+                raise PatsyError(
+                    "there is no term %r in this design (available terms: "
+                    "%s)" % (term, ", ".join(map(repr, self.term_names)))
+                )
+            term_obj = term_name_to_term[term]
+        term_slice = self.term_slices[term_obj]
+        if term_slice.start == term_slice.stop:
+            raise PatsyError(
+                "term %r has no columns of its own in this design (it was "
+                "redundant with the other terms when the design was "
+                "built), so its contribution cannot be constrained"
+                % (term_obj.name(),)
+            )
+
+        data, n_samples = _term_samples_to_data(samples)
+        if n_samples == 0:
+            raise ValueError("at least one sample is required")
+
+        if weights is None:
+            weights = np.ones(n_samples)
+        else:
+            weights = np.asarray(weights, dtype=float)
+            if weights.ndim == 0:
+                weights = np.full(n_samples, weights)
+            if weights.shape != (n_samples,):
+                raise ValueError(
+                    "weights must be a scalar or have exactly one entry per "
+                    "sample (got shape %r for %d samples)"
+                    % (weights.shape, n_samples)
+                )
+
+        sub_design_info = self.subset([term_obj])
+        term_matrix = build_design_matrices(
+            [sub_design_info], data, NA_action="raise"
+        )[0]
+        term_matrix = np.asarray(term_matrix, dtype=float)
+        assert term_matrix.shape == (n_samples, term_slice.stop - term_slice.start)
+
+        coefs = np.zeros((n_samples, len(self.column_names)))
+        coefs[:, term_slice] = term_matrix * weights[:, np.newaxis]
+        return LinearConstraint(self.column_names, coefs, np.zeros(n_samples))
+
 
     def describe(self):
         """Returns a human-readable string describing this design info.
@@ -1036,6 +1212,170 @@ def test_DesignInfo_linear_constraint():
     assert con.variable_names == ["a1", "a2", "a3", "b"]
     assert np.all(con.coefs == [[2, 0, 0, -1], [0, 0, 1, 0]])
     assert np.all(con.constants == [[1], [0]])
+
+
+def test_DesignInfo_linear_constraint_from_term_samples():
+    import pytest
+    from patsy import dmatrix, build_design_matrices
+
+    # Business-style design: a region main effect with an explicit
+    # reference level, a region:season interaction, and other terms that
+    # share the "region" prefix only nominally (a plain numeric column
+    # "region_extra", plus generated columns whose names start with the
+    # main-effect term's name). "market" has a single level, so with an
+    # intercept its term gets no columns of its own.
+    data = {
+        "region": ["A", "B", "C", "A", "B", "C", "A", "B"],
+        "season": ["S", "S", "S", "W", "W", "W", "S", "W"],
+        "region_extra": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        "market": ["M"] * 8,
+    }
+    region_main = "C(region, Treatment(reference='A'))"
+    formula1 = "1 + %s + %s:C(season) + region_extra + C(market)" % (
+        region_main,
+        region_main,
+    )
+    # A second, genuinely different coding of the same terms.
+    formula2 = "0 + C(region, Sum) + C(region, Sum):C(season) + region_extra"
+    X1 = dmatrix(formula1, data)
+    X2 = dmatrix(formula2, data)
+    di1 = X1.design_info
+    di2 = X2.design_info
+
+    # The "business configuration": exact term name, some existing level
+    # combinations, and contribution weights.
+    samples = [
+        {"region": "B", "season": "S"},
+        {"region": "A", "season": "W"},
+        {"region": "C", "season": "W"},
+    ]
+    weights = [0.5, -1.5, 2.0]
+
+    def check_against_design(di, term_name):
+        con = di.linear_constraint_from_term_samples(term_name, samples, weights)
+        assert con.variable_names == di.column_names
+        assert con.coefs.shape == (len(samples), len(di.column_names))
+        assert np.all(con.constants == 0)
+        term_slice = di.term_name_slices[term_name]
+        # Only the target term's columns may be nonzero; in particular the
+        # prefix-sharing main effect and "region_extra" columns are not
+        # touched.
+        for name, slice_ in di.term_name_slices.items():
+            if name != term_name:
+                assert np.all(con.coefs[:, slice_] == 0), name
+        # Compare against the term's legal columns in the full design
+        # matrix, evaluated at the same samples, on some arbitrary
+        # coefficients.
+        beta = np.linspace(-1.7, 2.3, len(di.column_names))
+        full_data = {
+            "region": [s["region"] for s in samples],
+            "season": [s["season"] for s in samples],
+            "region_extra": [0.0] * len(samples),
+            "market": ["M"] * len(samples),
+        }
+        X_full = build_design_matrices([di], full_data)[0]
+        expected = np.asarray(weights) * (
+            np.asarray(X_full)[:, term_slice] @ beta[term_slice]
+        )
+        assert np.allclose(con.coefs @ beta, expected)
+        # And against the term's own sub-design matrix.
+        sub = di.subset([term_name])
+        X_sub = build_design_matrices([sub], full_data)[0]
+        assert np.allclose(
+            con.coefs[:, term_slice], np.asarray(X_sub) * np.asarray(weights)[:, None]
+        )
+        return con
+
+    con1 = check_against_design(di1, "%s:C(season)" % (region_main,))
+    con2 = check_against_design(di2, "C(region, Sum):C(season)")
+
+    # Under treatment coding with reference levels A/S, the sample
+    # (region=B, season=S) sits on the interaction's reference cells, so
+    # its row is legitimately all zeros -- this is a valid constraint, not
+    # an error. The naive "put 1 on every column whose name contains the
+    # string" approach could never produce this.
+    assert np.all(con1.coefs[0] == 0)
+    # The rows track each design's actual coding: for (region=A, season=W)
+    # the treatment-coded design touches only the [A] column, while the
+    # Sum-coded design spreads the contribution over its [mean] and [S.A]
+    # columns.
+    assert np.allclose(con1.coefs[1, 3:6], [-1.5, 0, 0])
+    assert np.allclose(con2.coefs[1, 3:6], [-1.5, -1.5, 0])
+    # Row coefficients may differ between codings...
+    assert not np.allclose(con1.coefs[2, 1:6], con2.coefs[2, 1:6])
+    # ...but each constraint applied to its own design's direct target
+    # columns reproduces the weighted contribution consistently (checked
+    # inside check_against_design for both).
+
+    # A purely reference-level sample gives an all-zero row even on its
+    # own, and that is fine.
+    con_ref = di1.linear_constraint_from_term_samples(
+        "%s:C(season)" % (region_main,), [{"region": "A", "season": "S"}], [3.0]
+    )
+    assert con_ref.coefs.shape == (1, len(di1.column_names))
+    assert np.all(con_ref.coefs == 0)
+
+    # Column-oriented samples give the same result as row-oriented ones.
+    con_cols = di1.linear_constraint_from_term_samples(
+        "%s:C(season)" % (region_main,),
+        {"region": ["B", "A", "C"], "season": ["S", "W", "W"]},
+        weights,
+    )
+    assert np.allclose(con_cols.coefs, con1.coefs)
+
+    # A Term object works too, and weights default to 1 / broadcast.
+    term_obj = [t for t in di1.terms if t.name() == "%s:C(season)" % (region_main,)][0]
+    con_term = di1.linear_constraint_from_term_samples(term_obj, samples)
+    assert np.allclose(con_term.coefs, con1.coefs / np.asarray(weights)[:, None])
+    con_scalar = di1.linear_constraint_from_term_samples(
+        "%s:C(season)" % (region_main,), samples, 2.0
+    )
+    assert np.allclose(con_scalar.coefs, 2.0 * con_term.coefs)
+
+    # A term that is simply not in the design: exact matching means the
+    # prefix "C(region)" does not match "C(region, Treatment(...))".
+    with pytest.raises(PatsyError) as excinfo:
+        di1.linear_constraint_from_term_samples("C(region)", samples, weights)
+    assert "no term" in str(excinfo.value)
+    with pytest.raises(PatsyError):
+        di1.linear_constraint_from_term_samples("season", samples, weights)
+
+    # A term that *is* in the design but has no independent columns is a
+    # different, explicitly reported situation.
+    market_slice = di1.term_name_slices["C(market)"]
+    assert market_slice.start == market_slice.stop
+    with pytest.raises(PatsyError) as excinfo:
+        di1.linear_constraint_from_term_samples("C(market)", [{"market": "M"}])
+    assert "no columns" in str(excinfo.value)
+
+    # A DesignInfo without term information cannot do this at all.
+    with pytest.raises(PatsyError):
+        DesignInfo(["a", "b"]).linear_constraint_from_term_samples("a", [{"a": 1}])
+
+    # Bad weights / empty samples
+    with pytest.raises(ValueError):
+        di1.linear_constraint_from_term_samples(
+            "%s:C(season)" % (region_main,), samples, [1.0, 2.0]
+        )
+    with pytest.raises(ValueError):
+        di1.linear_constraint_from_term_samples(
+            "%s:C(season)" % (region_main,), [], []
+        )
+
+    # Unknown categorical levels are rejected rather than silently coded.
+    with pytest.raises(PatsyError):
+        di1.linear_constraint_from_term_samples(
+            "%s:C(season)" % (region_main,), [{"region": "ZZZ", "season": "S"}]
+        )
+
+    # The plain column-name/expression form of linear_constraint is
+    # unaffected by all of the above.
+    con_plain = di1.linear_constraint("region_extra = 0")
+    assert np.all(
+        con_plain.coefs
+        == [[float(name == "region_extra") for name in di1.column_names]]
+    )
+
 
 
 def test_DesignInfo_deprecated_attributes():

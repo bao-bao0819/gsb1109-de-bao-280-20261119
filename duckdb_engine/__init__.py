@@ -1,5 +1,6 @@
 import re
 import warnings
+from enum import Enum
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -16,7 +17,7 @@ from typing import (
 
 import duckdb
 import sqlalchemy
-from sqlalchemy import pool, select, sql, text, util
+from sqlalchemy import event, pool, select, sql, text, util
 from sqlalchemy import types as sqltypes
 from sqlalchemy.dialects.postgresql import UUID, insert
 from sqlalchemy.dialects.postgresql.base import (
@@ -59,8 +60,203 @@ __all__ = [
     "CursorWrapper",
     "DBAPI",
     "DuckDBEngineWarning",
+    "RegistrationScope",
+    "register_dataframe",
+    "register",
     "insert",  # reexport of sqlalchemy.dialects.postgresql.insert
 ]
+
+
+def _duckdb_compatible(dataframe: Any) -> Any:
+    """Avoid DuckDB refusing pandas 3's nullable ``str`` extension dtype.
+
+    The data is unchanged; only string columns are viewed as ``object`` so
+    DuckDB's pandas conversion sees a familiar dtype.  Anything else is
+    returned untouched.
+    """
+    dtypes = getattr(dataframe, "dtypes", None)
+    if dtypes is None:
+        return dataframe
+    try:
+        string_columns = [
+            name
+            for name, dtype in dtypes.items()
+            if type(dtype).__name__ == "StringDtype"
+        ]
+        if not string_columns:
+            return dataframe
+        converted = dataframe.copy()
+        for name in string_columns:
+            converted[name] = converted[name].astype(object)
+        return converted
+    except Exception:
+        return dataframe
+
+
+class RegistrationScope(str, Enum):
+    """Controls how long a registered DataFrame remains visible.
+
+    ``CONNECTION`` (the default) keeps the registration on the physical
+    DuckDB connection and shares it with every borrow of the pool.  This is
+    the historical behaviour of ``register``.
+
+    ``BORROW`` keeps the registration only until the current SQLAlchemy
+    connection is returned to the pool.  Returning the connection (whether
+    normally or because of an exception) restores any shared registration
+    that was shadowed and removes the temporary one.
+    """
+
+    BORROW = "borrow"
+    CONNECTION = "connection"
+    SHARED = "connection"
+
+
+_BORROW_SCOPE_NAMES = {
+    "borrow",
+    "borrow_scoped",
+    "call",
+    "checkout",
+    "ephemeral",
+    "local",
+    "per_borrow",
+    "per_checkout",
+    "session",
+    "temp",
+    "temporary",
+    "transaction",
+    "transient",
+}
+_SHARED_SCOPE_NAMES = {
+    "connection",
+    "connection_scoped",
+    "default",
+    "global",
+    "keep",
+    "per_connection",
+    "persistent",
+    "physical",
+    "physical_connection",
+    "pool",
+    "retain",
+    "shared",
+}
+_SCOPE_OPTION_NAMES = (
+    "duckdb_register_scope",
+    "duckdb_registration_scope",
+    "duckdb_dataframe_scope",
+    "duckdb_input_scope",
+    "duckdb_scope",
+    "duckdb.register_scope",
+    "duckdb.registration_scope",
+    "register_scope",
+    "registration_scope",
+)
+_register_statement = re.compile(
+    r"^\s*register\s*(?:\(\s*(?:\?|\$\d+)(?:\s*,\s*(?:\?|\$\d+))*\s*\))?\s*$",
+    re.IGNORECASE,
+)
+_unregister_statement = re.compile(
+    r"^\s*unregister\s*(?:\(\s*(?:\?|\$\d+)\s*\))?\s*$", re.IGNORECASE
+)
+
+
+def _normalize_registration_scope(scope: Any) -> RegistrationScope:
+    if scope is None:
+        return RegistrationScope.CONNECTION
+    if isinstance(scope, RegistrationScope):
+        return scope
+    if isinstance(scope, bool):
+        return RegistrationScope.CONNECTION if scope else RegistrationScope.BORROW
+
+    name = str(scope).strip().lower().replace("-", "_").replace(" ", "_")
+    if name in _BORROW_SCOPE_NAMES:
+        return RegistrationScope.BORROW
+    if name in _SHARED_SCOPE_NAMES:
+        return RegistrationScope.CONNECTION
+    raise ValueError(
+        "unknown DuckDB registration scope {!r}; expected 'borrow' or "
+        "'connection'".format(scope)
+    )
+
+
+def _registration_scope_from_kwargs(scope: Any, kwargs: Dict[str, Any]) -> Any:
+    if "scope" in kwargs:
+        scope = kwargs.pop("scope")
+    if "registration_scope" in kwargs:
+        scope = kwargs.pop("registration_scope")
+    if "shared" in kwargs:
+        scope = kwargs.pop("shared")
+    if "persist" in kwargs:
+        scope = RegistrationScope.CONNECTION if kwargs.pop("persist") else scope
+    if "borrowed" in kwargs:
+        scope = RegistrationScope.BORROW if kwargs.pop("borrowed") else scope
+    if kwargs:
+        raise TypeError(
+            "unexpected keyword argument(s): {}".format(", ".join(sorted(kwargs)))
+        )
+    return scope
+
+
+def _scope_from_execution_context(context: Any) -> Optional[RegistrationScope]:
+    if context is None:
+        return None
+    options = getattr(context, "execution_options", None) or {}
+    for name in _SCOPE_OPTION_NAMES:
+        if name in options:
+            return _normalize_registration_scope(options[name])
+
+    root_connection = getattr(context, "root_connection", None)
+    if root_connection is not None:
+        get_options = getattr(root_connection, "get_execution_options", None)
+        if get_options is not None:
+            options = get_options() or {}
+            for name in _SCOPE_OPTION_NAMES:
+                if name in options:
+                    return _normalize_registration_scope(options[name])
+    return None
+
+
+def _register_arguments(
+    parameters: Any, context: Any
+) -> Tuple[Any, Any, RegistrationScope]:
+    scope = _scope_from_execution_context(context)
+
+    if isinstance(parameters, dict):
+        view_name = parameters.get("name", parameters.get("view_name"))
+        dataframe = parameters.get("df", parameters.get("dataframe"))
+        for name in ("scope", "shared", "borrowed") + _SCOPE_OPTION_NAMES:
+            if name in parameters:
+                parameter_scope = parameters[name]
+                if name == "borrowed":
+                    parameter_scope = not parameter_scope
+                scope = _normalize_registration_scope(parameter_scope)
+                break
+        return view_name, dataframe, scope or RegistrationScope.CONNECTION
+
+    values = list(parameters or ())
+    if len(values) == 2:
+        view_name, dataframe = values
+    elif len(values) == 3:
+        view_name, dataframe, parameter_scope = values
+        scope = _normalize_registration_scope(parameter_scope)
+    else:
+        raise TypeError(
+            "register requires (view_name, dataframe) or (view_name, dataframe, scope)"
+        )
+
+    compiled = getattr(context, "compiled", None)
+    compiled_parameters = getattr(compiled, "params", None) or {}
+    for name in ("scope", "shared", "borrowed") + _SCOPE_OPTION_NAMES:
+        if name in compiled_parameters:
+            parameter_scope = compiled_parameters[name]
+            if name == "borrowed":
+                parameter_scope = not parameter_scope
+            scope = _normalize_registration_scope(parameter_scope)
+            break
+
+    return view_name, dataframe, scope or RegistrationScope.CONNECTION
+
+    return view_name, dataframe, scope or RegistrationScope.CONNECTION
 
 
 class DBAPI:
@@ -97,6 +293,87 @@ class ConnectionWrapper:
     def __init__(self, c: duckdb.DuckDBPyConnection) -> None:
         self.__c = c
         self.notices = list()
+        # Shared registrations are on the physical connection and are known
+        # here so that a borrow-scoped registration can shadow and later
+        # restore them.  Borrow-scoped names are cleared whenever the
+        # SQLAlchemy pool returns this connection.
+        self._shared_registrations: Dict[str, Any] = {}
+        self._borrow_registrations: Set[str] = set()
+
+    def _register(
+        self, view_name: str, dataframe: Any, scope: RegistrationScope
+    ) -> None:
+        # DuckDB replaces a registered view in place and does not expose the
+        # previous Python object.  Keep shared objects here so a borrowed
+        # override can be undone when the pool returns this connection.
+        if scope is RegistrationScope.CONNECTION:
+            self._shared_registrations[view_name] = dataframe
+            self._borrow_registrations.discard(view_name)
+        else:
+            self._borrow_registrations.add(view_name)
+        self.__c.register(view_name, _duckdb_compatible(dataframe))
+
+    def register(
+        self,
+        view_name: str,
+        dataframe: Any,
+        scope: Any = RegistrationScope.CONNECTION,
+        **kwargs: Any,
+    ) -> "ConnectionWrapper":
+        """Register a DataFrame, optionally only for the current borrow."""
+        scope = _registration_scope_from_kwargs(scope, kwargs)
+        self._register(view_name, dataframe, _normalize_registration_scope(scope))
+        return self
+
+    def unregister(self, view_name: str, scope: Any = None) -> "ConnectionWrapper":
+        """Remove a DataFrame registration from this connection."""
+        normalized_scope = (
+            _normalize_registration_scope(scope) if scope is not None else None
+        )
+        self._unregister(view_name, normalized_scope)
+        return self
+
+    def _unregister(
+        self, view_name: str, scope: Optional[RegistrationScope] = None
+    ) -> None:
+        if scope is RegistrationScope.BORROW:
+            # Only drop a borrowed override; a shared registration remains.
+            if view_name not in self._borrow_registrations:
+                return
+            self.__c.unregister(view_name)
+            self._borrow_registrations.discard(view_name)
+            self._restore_shared(view_name)
+            return
+
+        self.__c.unregister(view_name)
+        self._borrow_registrations.discard(view_name)
+        self._shared_registrations.pop(view_name, None)
+
+    def _restore_shared(self, view_name: str) -> None:
+        shared = self._shared_registrations.get(view_name)
+        if shared is None:
+            return
+        try:
+            self.__c.register(view_name, _duckdb_compatible(shared))
+        except Exception:
+            # The physical connection may already be unusable; checkin must
+            # still complete so the pool is not left in a bad state.
+            pass
+
+    def _drop_registration(self, view_name: str) -> None:
+        try:
+            self.__c.unregister(view_name)
+        except Exception:
+            # Cleanup only: the view may already be gone or the connection
+            # may be closing.  Do not mask the caller's real outcome.
+            self._borrow_registrations.discard(view_name)
+            return
+        self._borrow_registrations.discard(view_name)
+        self._restore_shared(view_name)
+
+    def _clear_borrow_registrations(self) -> None:
+        for view_name in list(self._borrow_registrations):
+            self._drop_registration(view_name)
 
     def cursor(self) -> "CursorWrapper":
         return CursorWrapper(self.__c, self)
@@ -105,6 +382,7 @@ class ConnectionWrapper:
         return getattr(self.__c, name)
 
     def close(self) -> None:
+        self._clear_borrow_registrations()
         self.__c.close()
         self.closed = True
 
@@ -136,14 +414,14 @@ class CursorWrapper:
         try:
             if statement.lower() == "commit":  # this is largely for ipython-sql
                 self.__c.commit()
-            elif statement.lower() in (
-                "register",
-                "register(?, ?)",
-                "register($1, $2)",
-            ):
-                assert parameters and len(parameters) == 2, parameters
-                view_name, df = parameters
-                self.__c.register(view_name, df)
+            elif _register_statement.match(statement):
+                view_name, df, scope = _register_arguments(parameters, context)
+                assert view_name is not None and df is not None, parameters
+                self.__connection_wrapper._register(view_name, df, scope)
+            elif _unregister_statement.match(statement):
+                assert parameters and len(parameters) == 1, parameters
+                scope = _scope_from_execution_context(context)
+                self.__connection_wrapper._unregister(parameters[0], scope)
             elif parameters is None:
                 self.__c.execute(statement)
             else:
@@ -174,6 +452,105 @@ class CursorWrapper:
             return self.__c.fetchmany()
         else:
             return self.__c.fetchmany(size)
+
+
+def _clear_borrow_registrations_on_checkin(
+    dbapi_connection: Any, connection_record: Any
+) -> None:
+    if isinstance(dbapi_connection, ConnectionWrapper):
+        dbapi_connection._clear_borrow_registrations()
+
+
+def _listen_for_registration_cleanup(connection_pool: Any) -> None:
+    if getattr(connection_pool, "_duckdb_engine_register_cleanup", False):
+        return
+    event.listen(
+        connection_pool,
+        "checkin",
+        _clear_borrow_registrations_on_checkin,
+    )
+    connection_pool._duckdb_engine_register_cleanup = True
+
+
+def register_dataframe(
+    connection: Any,
+    view_name: str,
+    dataframe: Any,
+    scope: Any = RegistrationScope.CONNECTION,
+    **kwargs: Any,
+) -> None:
+    """Register ``dataframe`` under ``view_name`` with an explicit lifetime.
+
+    ``scope="connection"`` (or ``shared=True``) keeps the registration on the
+    physical DuckDB connection so later borrows of that connection can read
+    it.  ``scope="borrow"`` (or ``shared=False``) removes it automatically
+    when the SQLAlchemy connection is returned to the pool, whether normally
+    or after an exception.
+    """
+    scope = _registration_scope_from_kwargs(scope, kwargs)
+
+    normalized_scope = _normalize_registration_scope(scope)
+
+    if isinstance(connection, ConnectionWrapper):
+        connection._register(view_name, dataframe, normalized_scope)
+        return
+
+    if isinstance(connection, CursorWrapper):
+        connection.execute(
+            "register(?, ?, ?)",
+            (view_name, dataframe, normalized_scope.value),
+        )
+        return
+
+    exec_driver_sql = getattr(connection, "exec_driver_sql", None)
+    if exec_driver_sql is not None:
+        exec_driver_sql(
+            "register",
+            (view_name, dataframe, normalized_scope.value),
+        )
+        return
+
+    dbapi_connection = getattr(connection, "dbapi_connection", connection)
+    underlying = getattr(dbapi_connection, "connection", None)
+    if isinstance(underlying, ConnectionWrapper):
+        underlying._register(view_name, dataframe, normalized_scope)
+        return
+
+    raise TypeError("cannot register a DataFrame on {!r}".format(connection))
+
+
+def unregister_dataframe(connection: Any, view_name: str, scope: Any = None) -> None:
+    """Remove a DataFrame registration from a SQLAlchemy connection."""
+    normalized_scope = (
+        _normalize_registration_scope(scope) if scope is not None else None
+    )
+    if isinstance(connection, ConnectionWrapper):
+        connection._unregister(view_name, normalized_scope)
+        return
+
+    exec_driver_sql = getattr(connection, "exec_driver_sql", None)
+    if exec_driver_sql is not None:
+        options = {}
+        if normalized_scope is not None:
+            options["duckdb_register_scope"] = normalized_scope.value
+        exec_driver_sql("unregister", (view_name,), execution_options=options)
+        return
+
+    execute = getattr(connection, "execute", None)
+    if execute is not None:
+        execute("unregister(?)", (view_name,))
+        return
+
+    dbapi_connection = getattr(connection, "dbapi_connection", connection)
+    underlying = getattr(dbapi_connection, "connection", None)
+    if isinstance(underlying, ConnectionWrapper):
+        underlying._unregister(view_name, normalized_scope)
+        return
+
+    raise TypeError("cannot unregister a DataFrame on {!r}".format(connection))
+
+
+register = register_dataframe
 
 
 class DuckDBEngineWarning(Warning):
@@ -312,6 +689,20 @@ class Dialect(PGDialect_psycopg2):
 
     def on_connect(self) -> None:
         pass
+
+    @classmethod
+    def engine_created(cls, engine: Any) -> None:
+        _listen_for_registration_cleanup(engine.pool)
+
+        def _reattach(disposed_engine: Any) -> None:
+            _listen_for_registration_cleanup(disposed_engine.pool)
+
+        # engine_disposed exists since SQLAlchemy 1.4; older releases still
+        # get cleanup from the ConnectionWrapper.close() fallback.
+        try:
+            event.listen(engine, "engine_disposed", _reattach)
+        except Exception:
+            pass
 
     @classmethod
     def get_pool_class(cls, url: URL) -> Type[pool.Pool]:
@@ -540,6 +931,22 @@ class Dialect(PGDialect_psycopg2):
         return DefaultDialect.do_executemany(
             self, cursor, statement, parameters, context
         )
+
+    def do_execute(
+        self,
+        cursor: Any,
+        statement: Any,
+        parameters: Any,
+        context: Optional[Any] = None,
+    ) -> None:
+        # Forward the execution context so scoped registrations can see
+        # execution options such as ``duckdb_register_scope``.
+        cursor.execute(statement, parameters, context)
+
+    def do_execute_no_params(
+        self, cursor: Any, statement: Any, context: Optional[Any] = None
+    ) -> None:
+        cursor.execute(statement, None, context)
 
     def _pg_class_filter_scope_schema(
         self,

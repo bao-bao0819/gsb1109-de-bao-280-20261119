@@ -99,6 +99,50 @@ conn.execute(text("register(:name, :df)"), {"name": "test_df", "df": df})
 conn.execute("select * from dataframe_name")
 ```
 
+Registrations made this way are shared by every borrow of the physical DuckDB
+connection from the pool, so a shared input registered once stays queryable on
+later connections.
+
+### Scoping a registration to one borrow
+
+To keep a registration only for the current checkout, pass `scope="borrow"`.
+Returning the connection to the pool (normally or because of an exception)
+removes that registration and restores any shared registration it shadowed.
+
+```python
+from duckdb_engine import register_dataframe
+
+# Shared: visible to every borrow of this physical connection
+register_dataframe(conn, "rates", admin_rates, scope="connection")
+
+with engine.connect() as conn:
+    # Temporary override for this report only
+    register_dataframe(conn, "rates", report_rates, scope="borrow")
+    register_dataframe(conn, "scratch", scratch_df, scope="borrow")
+    conn.execute(text("select * from rates"))
+# "rates" again returns the shared dataframe; "scratch" no longer exists
+```
+
+The scope can also be supplied as an execution option, which is convenient
+for the SQL forms:
+
+```python
+conn.exec_driver_sql(
+    "register",
+    ("scratch", scratch_df),
+    execution_options={"duckdb_register_scope": "borrow"},
+)
+
+conn.execution_options(duckdb_register_scope="borrow").execute(
+    text("register(:name, :df)"), {"name": "scratch", "df": scratch_df}
+)
+```
+
+`scope="connection"` (the default) keeps the historical behaviour, so existing
+callers need no changes. `RegistrationScope.BORROW` and
+`RegistrationScope.CONNECTION` are available for programmatic use, and
+`unregister_dataframe` removes a registration explicitly.
+
 ## Things to keep in mind
 Duckdb's SQL parser is based on the PostgreSQL parser, but not all features in PostgreSQL are supported in duckdb. Because the `duckdb_engine` dialect is derived from the `postgresql` dialect, `SQLAlchemy` may try to use PostgreSQL-only features. Below are some caveats to look out for.
 

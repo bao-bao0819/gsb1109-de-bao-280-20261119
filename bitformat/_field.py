@@ -3,7 +3,7 @@ from __future__ import annotations
 from ._bits import Tibs
 from ._dtypes import Dtype, DtypeSingle, DtypeTuple
 from ast import literal_eval
-from ._common import override, Indenter, Colour, DtypeKind, validate_name, ExpressionError
+from ._common import override, Indenter, Colour, DtypeKind, validate_name, ExpressionError, TruncationError
 from typing import Any, Iterable, Self
 from ._fieldtype import FieldType
 from ._options import Options
@@ -116,8 +116,15 @@ class Field(FieldType):
     @override
     def to_tibs(self) -> Tibs:
         if self._dtype._is_padding():
-            # Return zeroed bits for padding.
-            return Tibs.from_zeros(self._dtype.bit_length)
+            # Padding written by the caller is zero, but padding read from a
+            # frame keeps the bits that were actually received so that an
+            # untouched frame round-trips exactly.
+            if self._bits is not None:
+                return self._bits
+            dtype = self._concrete_dtype if self._concrete_dtype is not None else self._dtype
+            if dtype.bit_length is None:
+                raise ValueError(f"Padding field '{self}' has no concrete length, so can't be converted to bits.")
+            return Tibs.from_zeros(dtype.bit_length)
         if self._bits is None:
             raise ValueError(f"Field '{self}' has no value, so can't be converted to bits.")
         return self._bits
@@ -159,7 +166,11 @@ class Field(FieldType):
             except ExpressionError:
                 raise ValueError(f"Can't parse Field '{self}' as the dtype cannot be evaluated with kwargs {vars_}")
             if self._concrete_dtype.bit_length is not None and len(b) - startbit < self._concrete_dtype.bit_length:
-                raise ValueError(f"Field '{str(self)}' needs {self._concrete_dtype.bit_length} bits to parse, but {len(b) - startbit} were available.")
+                raise TruncationError(
+                    f"Field '{str(self)}' needs {self._concrete_dtype.bit_length} bits to parse, "
+                    f"but {len(b) - startbit} were available.",
+                    field=self.name, needed=self._concrete_dtype.bit_length,
+                    available=len(b) - startbit, position=startbit)
             # Deal with a stretchy dtype
             dtype_length = self._dtype.evaluate(**vars_).bit_length
             self._bits = b[startbit : startbit + dtype_length] if dtype_length is not None else b[startbit:]
@@ -172,6 +183,15 @@ class Field(FieldType):
 
     @override
     def _pack(self, value: Any, kwargs: dict[str, Any]) -> bool:
+        if self._dtype._is_padding():
+            # Padding is recalculated for every pack: its length may depend on
+            # the current count, and bits kept from an earlier parse belong to
+            # the old frame rather than this one.
+            try:
+                self._concrete_dtype = self._dtype.evaluate(**kwargs)
+            except ExpressionError as e:
+                raise ValueError(f"Can't evaluate the length of padding field '{self}': {e}") from None
+            self._bits = None
         self._set_value_with_kwargs(value, kwargs)
         if self.name:
             kwargs[self.name] = self.value

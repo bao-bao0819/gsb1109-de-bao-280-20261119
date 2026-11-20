@@ -16,6 +16,7 @@ The concrete field-type classes are:
 * :class:`Repeat`: Used to repeat another :class:`FieldType` a number of times.
 * :class:`Let`: Creates or modifies a variable.
 * :class:`Pass`: An empty :class:`FieldType` object, used as a placeholder.
+* :class:`Checksum`: A checksum over a bit range of the containing frame.  See :doc:`checksum`.
 
 
 ----
@@ -76,6 +77,16 @@ The concrete field-type classes are:
 .. _let:
 
 .. autoclass:: bitformat.Let
+   :members:
+   :undoc-members:
+   :member-order: groupwise
+   :show-inheritance:
+
+----
+
+.. _checksum:
+
+.. autoclass:: bitformat.Checksum
    :members:
    :undoc-members:
    :member-order: groupwise

@@ -5,7 +5,7 @@ import sys
 from ._bits import Tibs
 from ._dtypes import DtypeTransformer
 from ._bits import TibsLike
-from ._common import final, Indenter, field_parser
+from ._common import final, Indenter, field_parser, FrameError, TruncationError
 from typing import Any, Sequence, TextIO
 from ._options import Options
 from lark import UnexpectedInput
@@ -98,6 +98,10 @@ class FieldType(abc.ABC):
         self.clear()
         try:
             return self._parse(b, 0, kwargs)
+        except TruncationError:
+            raise
+        except FrameError:
+            raise
         except ValueError as e:
             raise ValueError(f"Error parsing field {self}: {str(e)}")
 

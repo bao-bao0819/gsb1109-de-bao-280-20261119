@@ -1,5 +1,15 @@
 # Release Notes
 
+### Unreleased
+
+* Added the `Checksum` field type for one or more independent checksum layers whose coverage follows the
+  actual frame, including repeated regions and padding. Checksums can be recalculated and written back when
+  a reading is corrected.
+* `Format.parse` accepts a `valid_bit_length` (and `Format.parse_frame` takes the archived length directly),
+  so a short frame is reported as truncated rather than completed from the following frame. `TruncationError`
+  and `ChecksumFailure` describe the missing field and the individual layer results.
+* Padding read from a frame is preserved when the frame is rebuilt.
+
 ### November 2025; version 0.9.
 
 * Allowing upper-case 0B, 0X and 0O prefixes as they are allowable in Python.

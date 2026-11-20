@@ -1,7 +1,7 @@
 from __future__ import annotations
 import sys
 import ast
-from typing import Any
+from typing import Any, Sequence
 from types import CodeType
 from ._options import Options
 import os
@@ -106,6 +106,163 @@ class Indenter:
 class ExpressionError(ValueError):
     """Exception raised when failing to create or parse an Expression."""
     pass
+
+
+class FrameError(ValueError):
+    """Base class for errors raised while working with a structured frame."""
+    pass
+
+
+class TruncationError(FrameError):
+    """Raised when the input ends before the current frame has been fully read.
+
+    ``field``, ``needed``, ``available`` and ``position`` describe the first
+    missing piece of input.  ``path`` names the containing fields, innermost
+    last, so nested repeats can say which part ran out.  A truncation error
+    never asks for bits from a following frame: only the bits actually supplied
+    to the current parse are considered.
+    """
+
+    def __init__(self, message: str, field: str = "", needed: int = 0,
+                 available: int = 0, position: int = 0) -> None:
+        super().__init__(message)
+        self.base_message = message
+        self.field = field
+        self.needed = needed
+        self.available = available
+        self.position = position
+        self.path: list[str] = []
+
+    @property
+    def missing(self) -> int:
+        """The number of bits that were still needed, or zero when not known."""
+        return max(self.needed - self.available, 0)
+
+    @property
+    def missing_fields(self) -> list[str]:
+        """Names of the fields that could not be read, innermost first."""
+        names: list[str] = []
+        if self.field:
+            names.append(self.field)
+        for name in reversed(self.path):
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the diagnostic details as a plain dictionary."""
+        return {
+            "message": self.base_message,
+            "field": self.field,
+            "path": list(self.path),
+            "needed": self.needed,
+            "available": self.available,
+            "missing": self.missing,
+            "position": self.position,
+        }
+
+    def add_context(self, name: str) -> None:
+        """Prepend a containing field name to the error path."""
+        if name:
+            self.path.insert(0, name)
+
+    def __str__(self) -> str:
+        if self.path:
+            return f"{' -> '.join(self.path)}: {self.base_message}"
+        return self.base_message
+
+
+class ChecksumResult:
+    """The independent result of one checksum declaration.
+
+    ``layer`` is the caller-supplied layer label (normally ``'inner'`` or
+    ``'outer'``), ``field`` the checksum field name, and ``ok`` whether that
+    layer matched.  ``expected`` and ``actual`` are integers.  ``covered`` is
+    the half-open range of the checksum field itself, and ``error`` describes
+    a computation problem if one occurred.
+    """
+
+    __slots__ = ("layer", "field", "ok", "expected", "actual", "covered", "segments", "error")
+
+    def __init__(self, layer: str, field: str, ok: bool, expected: int | None,
+                 actual: int | None, covered: tuple[int, int] | None = None,
+                 error: str | None = None,
+                 segments: list[tuple[int, int]] | None = None) -> None:
+        self.layer = layer
+        self.field = field
+        self.ok = ok
+        self.expected = expected
+        self.actual = actual
+        self.covered = covered
+        self.error = error
+        self.segments = segments
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "layer": self.layer,
+            "field": self.field,
+            "ok": self.ok,
+            "expected": self.expected,
+            "actual": self.actual,
+            "covered": self.covered,
+            "segments": self.segments,
+            "error": self.error,
+        }
+
+    def __repr__(self) -> str:
+        return (f"ChecksumResult(layer={self.layer!r}, field={self.field!r}, ok={self.ok!r}, "
+                f"expected={self.expected!r}, actual={self.actual!r}, covered={self.covered!r})")
+
+    def __str__(self) -> str:
+        status = "ok" if self.ok else "FAILED"
+        field = f" '{self.field}'" if self.field else ""
+        covered = "" if self.covered is None else f" at bits {self.covered[0]}..{self.covered[1]}"
+        values = ""
+        if self.expected is not None or self.actual is not None:
+            values = f" (expected {self.expected}, actual {self.actual})"
+        error = "" if self.error is None else f": {self.error}"
+        return f"{self.layer} checksum{field} {status}{covered}{values}{error}"
+
+
+class ChecksumFailure(FrameError):
+    """Raised when one or more checksum declarations did not match.
+
+    ``results`` holds a :class:`ChecksumResult` for every checksum reached, in
+    declaration order, so the caller can distinguish the layers instead of
+    only seeing a pass/fail flag.
+    """
+
+    def __init__(self, results: Sequence[ChecksumResult] | None = None, message: str = "") -> None:
+        self.results = list(results or [])
+        self.message = message
+        super().__init__(self.__str__())
+
+    @property
+    def ok(self) -> bool:
+        """True only when every recorded layer passed."""
+        return all(result.ok for result in self.results)
+
+    @property
+    def failed(self) -> list[ChecksumResult]:
+        """The results for the layers that failed."""
+        return [result for result in self.results if not result.ok]
+
+    def by_layer(self) -> dict[str, ChecksumResult | list[ChecksumResult]]:
+        """Return results keyed by layer label."""
+        grouped: dict[str, ChecksumResult | list[ChecksumResult]] = {}
+        for result in self.results:
+            if result.layer not in grouped:
+                grouped[result.layer] = result
+            elif isinstance(grouped[result.layer], list):
+                grouped[result.layer].append(result)
+            else:
+                grouped[result.layer] = [grouped[result.layer], result]
+        return grouped
+
+    def __str__(self) -> str:
+        details = "; ".join(str(result) for result in self.results)
+        prefix = self.message or "Checksum validation failed"
+        return f"{prefix}: {details}" if details else prefix
 
 
 class ANSIColours:

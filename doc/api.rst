@@ -124,6 +124,7 @@ These classes build upon those above to provide richer and more complex data str
 * :ref:`Repeat <repeat>` -- Used to repeat another :class:`FieldType` a number of times.
 * :ref:`Let <let>` - Creates or modifies a variable using an :class:`Expression`.
 * :ref:`Pass <pass>` -- An empty :class:`FieldType` used as a placeholder.
+* :ref:`Checksum <checksum>` -- A checksum field covering a range of its containing frame.
 
 
 .. mermaid::
@@ -186,6 +187,7 @@ Other classes and enums are :ref:`listed here. <misc>` Some of the more importan
     array
     reader
     fieldtypes
+    checksum
     parser_ref
     quick_reference
     misc

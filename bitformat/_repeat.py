@@ -183,6 +183,7 @@ class Repeat(FieldType):
 
     @override
     def _set_value_with_kwargs(self, value: list[Any], kwargs: dict[str, Any]) -> None:
+        self._bits_list = []
         value_iter = iter(value)
         for i in range(self._concrete_count):
             try:

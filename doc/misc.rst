@@ -12,6 +12,10 @@ A collection of items that don't fit into any other category.
 * :class:`DtypeKind`: The kind of data type.
 * :class:`Endianness`: The endianness of the data type.
 * ``TibsLike``: A type alias for values that can be promoted to :class:`Tibs`.
+* :class:`ChecksumFailure`: Raised when one or more checksum layers do not match; carries each layer's result.
+* :class:`ChecksumResult`: The independent result of one checksum declaration.
+* :class:`FrameError`: Base class for errors found while parsing a structured frame.
+* :class:`TruncationError`: Raised when a frame ends before all of its input has been supplied.
 
 
 ----
@@ -31,6 +35,24 @@ A collection of items that don't fit into any other category.
    :members:
    :undoc-members:
    :member-order: groupwise
+
+----
+
+.. autoclass:: bitformat.ChecksumFailure
+   :members:
+   :undoc-members:
+
+----
+
+.. autoclass:: bitformat.ChecksumResult
+   :members:
+   :undoc-members:
+
+----
+
+.. autoclass:: bitformat.TruncationError
+   :members:
+   :undoc-members:
 
 ----
 

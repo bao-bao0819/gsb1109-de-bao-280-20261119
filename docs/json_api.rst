@@ -1501,7 +1501,7 @@ You can filter the data returned by the table based on column values using a que
     This is only available if the ``json1`` SQLite extension is enabled.
 
 ``?column__date=value``
-    Column is a datestamp occurring on the specified YYYY-MM-DD date, e.g. ``2018-01-02``.
+    Column is a datestamp occurring on the specified YYYY-MM-DD date, e.g. ``2018-01-02``. Combine with ``?_tz=`` to evaluate the date in an IANA timezone instead of UTC; ``?column__date=empty`` and ``?column__date=invalid`` select rows with no stored value and rows whose value cannot be parsed. See :ref:`facet_by_date_timezone`.
 
 ``?column__isnull=1``
     Matches rows where the column is null.
@@ -1541,6 +1541,9 @@ Special table arguments
 
 ``?_sort_desc=COLUMN``
     Sorts the results by the specified column in descending order.
+
+``?_tz=AREA/LOCATION``
+    Evaluate ``?column__date=`` filters and date facets in the specified IANA timezone instead of UTC. See :ref:`facet_by_date_timezone`.
 
 ``?_search=keywords``
     For SQLite tables that have been configured for

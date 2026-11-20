@@ -9,10 +9,25 @@ from datasette.utils import (
     escape_sqlite,
     sqlite3,
 )
+from datasette.utils.timezones import (
+    EMPTY_DATE,
+    INVALID_DATE,
+    resolve_column_timezone,
+    resolve_timezone,
+    timezone_state_argument,
+)
 
 # Suggesting facets for a page can take at most this many multiples of
 # the facet_suggest_time_limit_ms setting in total, see #862
 SUGGEST_TOTAL_TIME_LIMIT_MULTIPLE = 10
+
+
+def _merge_facet_params(params, extra):
+    if not params:
+        return dict(extra)
+    if isinstance(params, dict):
+        return {**params, **extra}
+    return dict(params) | extra
 
 
 def start_suggest_deadline(ds, facet_instances):
@@ -123,6 +138,9 @@ class Facet:
         # ?_foo=bar&_foo=2&empty= becomes:
         # [('_foo', 'bar'), ('_foo', '2'), ('empty', '')]
         return urllib.parse.parse_qsl(self.request.query_string, keep_blank_values=True)
+
+    def timezone(self):
+        return resolve_timezone(self.request, self.table_config)
 
     def get_facet_size(self):
         facet_size = self.ds.setting("default_facet_size")
@@ -504,6 +522,7 @@ class DateFacet(Facet):
         columns = await self.get_columns(self.sql, self.params)
         already_enabled = [c["config"]["simple"] for c in self.get_configs()]
         suggested_facets = []
+        timezone = self.timezone()
         for column in columns:
             if self.suggest_time_exceeded():
                 break
@@ -526,15 +545,19 @@ class DateFacet(Facet):
                 )
                 values = tuple(r[0] for r in results.rows)
                 if any(values):
+                    toggle_path = self.ds.urls.modify(
+                        self.request, add={"_facet_date": column}
+                    )
+                    if timezone:
+                        toggle_path = self.ds.urls.modify(
+                            toggle_path, add={"_tz": timezone}
+                        )
                     suggested_facets.append(
                         {
                             "name": column,
                             "type": "date",
                             "toggle_url": self.ds.absolute_url(
-                                self.request,
-                                self.ds.urls.modify(
-                                    self.request, add={"_facet_date": column}
-                                ),
+                                self.request, toggle_path
                             ),
                         }
                     )
@@ -547,23 +570,54 @@ class DateFacet(Facet):
         facets_timed_out = []
         args = dict(self.get_querystring_pairs())
         facet_size = self.get_facet_size()
+        request_timezone = self.timezone()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
             column = config.get("column") or config["simple"]
+            timezone = (
+                resolve_column_timezone(self.request, self.table_config, column)
+                or request_timezone
+            )
             # TODO: does this query break if inner sql produces value or count columns?
-            facet_sql = """
-                select date({col}) as value, count(*) as count from (
-                    {sql}
+            if timezone:
+                date_expression = (
+                    "datasette_date_in_timezone({col}, :datasette_timezone)"
+                ).format(col=escape_sqlite(column))
+                facet_sql = """
+                    select {date_expression} as value, count(*) as count from (
+                        {sql}
+                    )
+                    group by {date_expression}
+                    order by count desc, value limit {limit}
+                """.format(
+                    date_expression=date_expression,
+                    sql=self.sql,
+                    limit=facet_size + 1,
                 )
-                where date({col}) is not null
-                group by date({col}) order by count desc, value limit {limit}
-            """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
+                facet_params = _merge_facet_params(
+                    self.params, {"datasette_timezone": timezone}
+                )
+            else:
+                date_expression = "date({col})".format(col=escape_sqlite(column))
+                facet_sql = """
+                    select {date_expression} as value, count(*) as count from (
+                        {sql}
+                    )
+                    where {date_expression} is not null
+                    group by {date_expression}
+                    order by count desc, value limit {limit}
+                """.format(
+                    date_expression=date_expression,
+                    sql=self.sql,
+                    limit=facet_size + 1,
+                )
+                facet_params = self.params
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,
                     facet_sql,
-                    self.params,
+                    facet_params,
                     truncate=False,
                     custom_time_limit=self.ds.setting("facet_time_limit_ms"),
                 )
@@ -574,30 +628,36 @@ class DateFacet(Facet):
                         "type": self.type,
                         "results": facet_results_values,
                         "hideable": source != "metadata",
-                        "toggle_url": self.ds.urls.modify(
-                            self.request, remove={"_facet_date": column}
-                        ),
+                        "toggle_url": self._facet_toggle_url(column, timezone),
                         "truncated": len(facet_rows_results) > facet_size,
                     }
                 )
                 facet_rows = facet_rows_results.rows[:facet_size]
                 for row in facet_rows:
-                    selected = str(args.get(f"{column}__date")) == str(row["value"])
+                    value = row["value"]
+                    if timezone and value is None:
+                        value = EMPTY_DATE
+                    selected = str(args.get(f"{column}__date")) == str(value)
                     if selected:
                         toggle_path = self.ds.urls.modify(
                             self.request,
-                            remove=[(f"{column}__date", row["value"]), "_next"],
+                            remove=[(f"{column}__date", value), "_next"],
                         )
                     else:
+                        # Replace any other selected date for this column, so
+                        # switching candidates does not AND two dates together.
                         toggle_path = self.ds.urls.modify(
                             self.request,
-                            add={f"{column}__date": row["value"]},
+                            replace={f"{column}__date": value},
                             remove="_next",
                         )
+                    toggle_path = self._with_timezone_state(
+                        toggle_path, column, timezone
+                    )
                     facet_results_values.append(
                         {
-                            "value": row["value"],
-                            "label": row["value"],
+                            "value": value,
+                            "label": self._date_label(value),
                             "count": row["count"],
                             "toggle_url": self.ds.absolute_url(
                                 self.request, toggle_path
@@ -609,3 +669,36 @@ class DateFacet(Facet):
                 facets_timed_out.append(column)
 
         return facet_results, facets_timed_out
+
+    @staticmethod
+    def _date_label(value):
+        if value == EMPTY_DATE:
+            return "empty"
+        if value == INVALID_DATE:
+            return "unreadable"
+        return value
+
+    def _with_timezone_state(self, path, column, timezone):
+        if not timezone:
+            return path
+        argument = timezone_state_argument(
+            self.request, self.table_config, column=column
+        )
+        if not argument:
+            return path
+        # Do not duplicate a timezone argument that the current URL already has.
+        known = dict(
+            urllib.parse.parse_qsl(
+                urllib.parse.urlsplit(str(path)).query, keep_blank_values=True
+            )
+        )
+        if known.get(argument[0]) == argument[1]:
+            return path
+        return self.ds.urls.modify(path, add={argument[0]: argument[1]})
+
+    def _facet_toggle_url(self, column, timezone):
+        return self._with_timezone_state(
+            self.ds.urls.modify(self.request, remove={"_facet_date": column}),
+            column,
+            timezone,
+        )

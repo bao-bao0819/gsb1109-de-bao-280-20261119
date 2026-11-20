@@ -1043,6 +1043,20 @@ You can also specify :ref:`array <facet_by_json_array>` or :ref:`date <facet_by_
     - array: tags
     - date: created
 
+Set ``timezone`` to an IANA timezone such as ``America/New_York`` to evaluate date facets and ``__date`` filters in that timezone instead of UTC. A configured date facet can set its own timezone; an explicit ``?_tz=`` query string parameter takes precedence over both:
+
+.. code-block:: yaml
+
+    tables:
+      events:
+        timezone: America/New_York
+        facets:
+        - date:
+            column: happened
+            timezone: America/New_York
+
+See :ref:`facet_by_date_timezone` for more details.
+
 .. _table_configuration_fts:
 
 ``fts_table`` / ``fts_pk`` / ``searchmode``

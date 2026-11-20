@@ -11,6 +11,7 @@ from .utils import (
     detect_json1,
     escape_sqlite,
 )
+from .utils.timezones import INVALID_DATE
 
 
 @hookimpl(specname="filters_from_request")
@@ -310,6 +311,45 @@ class NotInFilter(InFilter):
         return f"{column} not in {json.dumps(self.split_value(value))}"
 
 
+_EMPTY_DATE_VALUES = frozenset(
+    {"empty", "isempty", "blank", "isblank", "null", "isnull"}
+)
+_INVALID_DATE_VALUES = frozenset(
+    {"invalid", "unreadable", "bad", "unparseable"}
+)
+
+_EMPTY_DATE_LABEL = "is empty"
+_INVALID_DATE_LABEL = "is unreadable"
+
+
+class DateFilter(Filter):
+    key = "date"
+    display = "date"
+
+    def __init__(self, timezone=None):
+        self.timezone = timezone
+
+    def where_clause(self, table, column, value, param_counter):
+        quoted = _quote_sqlite_identifier(column)
+        if not self.timezone:
+            return f"date({quoted}) = :p{param_counter}", value
+        expression = f"datasette_date_in_timezone({quoted}, :datasette_timezone)"
+        if value in _EMPTY_DATE_VALUES:
+            return f"{expression} is null", None
+        if value in _INVALID_DATE_VALUES:
+            return f"{expression} = '{INVALID_DATE}'", None
+        return f"{expression} = :p{param_counter}", value
+
+    def human_clause(self, column, value):
+        if not self.timezone:
+            return f'"{column}" is on date {value}'
+        if value in _EMPTY_DATE_VALUES:
+            return f'"{column}" has no date'
+        if value in _INVALID_DATE_VALUES:
+            return f'"{column}" has an unreadable date'
+        return f'"{column}" is on date {value} in {self.timezone}'
+
+
 class Filters:
     _filters = (
         [
@@ -389,7 +429,7 @@ class Filters:
             else []
         )
         + [
-            TemplatedFilter("date", "date", "date({c}) = :{p}", '"{c}" is on date {v}'),
+            DateFilter(),
             TemplatedFilter(
                 "isnull", "is null", "{c} is null", "{c} is null", no_argument=True
             ),
@@ -418,8 +458,15 @@ class Filters:
     )
     _filters_by_key: ClassVar[dict[str, Filter]] = {f.key: f for f in _filters}
 
-    def __init__(self, pairs):
+    def __init__(self, pairs, timezone=None):
         self.pairs = pairs
+        self.timezone = timezone
+        if timezone:
+            filters_by_key = dict(self._filters_by_key)
+            filters_by_key["date"] = DateFilter(timezone)
+            self._active_filters_by_key = filters_by_key
+        else:
+            self._active_filters_by_key = self._filters_by_key
 
     def lookups(self):
         """Yields (lookup, display, no_argument) pairs"""
@@ -431,7 +478,7 @@ class Filters:
         if extra:
             bits.extend(extra)
         for column, lookup, value in self.selections():
-            filter = self._filters_by_key.get(lookup, None)
+            filter = self._active_filters_by_key.get(lookup, None)
             if filter:
                 bits.append(filter.human_clause(column, value))
         # Comma separated, with an ' and ' at the end
@@ -463,8 +510,12 @@ class Filters:
         sql_bits = []
         params = {}
         i = 0
+        if self.timezone and any(
+            lookup == "date" for _, lookup, _ in self.selections()
+        ):
+            params["datasette_timezone"] = self.timezone
         for column, lookup, value in self.selections():
-            filter = self._filters_by_key.get(lookup, None)
+            filter = self._active_filters_by_key.get(lookup, None)
             if filter:
                 sql_bit, param = filter.where_clause(table, column, value, i)
                 sql_bits.append(sql_bit)

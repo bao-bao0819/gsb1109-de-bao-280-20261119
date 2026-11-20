@@ -58,6 +58,13 @@ from datasette.utils.asgi import (
     Response,
 )
 from datasette.utils.sqlite import check_structured_write_table
+from datasette.utils.timezones import (
+    resolve_column_timezone,
+    resolve_timezone,
+    timezone_argument,
+    timezone_cursor_argument,
+    timezone_state_argument,
+)
 
 from . import Context, from_extra
 from .base import (
@@ -2300,14 +2307,36 @@ async def _table_filters(datasette, request, database_name, table_name):
     # Arguments that start with _ and don't contain a __ are
     # special - things like ?_search= - and should not be
     # treated as filters.
+    table_metadata = await datasette.table_config(database_name, table_name)
+    timezone = resolve_timezone(request, table_metadata)
+    if timezone is None:
+        # A timezone configured on a single date facet must also apply to the
+        # __date filter that facet links use.
+        for key in request.args:
+            if not key.endswith("__date"):
+                continue
+            column = key[: -len("__date")]
+            column_timezone = resolve_column_timezone(
+                request, table_metadata, column
+            )
+            if column_timezone:
+                timezone = column_timezone
+                break
+    timezone_key = None
+    if timezone:
+        timezone_key = timezone_argument(request)
+        if timezone_key:
+            timezone_key = timezone_key[0]
     filter_args = []
     for key in request.args:
+        if key == timezone_key:
+            continue
         if not (key.startswith("_") and "__" not in key):
             for v in request.args.getlist(key):
                 filter_args.append((key, v))
 
     # Build where clauses from query string arguments
-    filters = Filters(sorted(filter_args))
+    filters = Filters(sorted(filter_args), timezone=timezone)
     where_clauses, params = filters.build_where_clauses(table_name)
 
     # Execute filters_from_request plugin hooks - including the default
@@ -2450,6 +2479,15 @@ async def table_view_data(
 
     # Handle pagination driven by ?_next=
     _next = _next or request.args.get("_next")
+    cursor_timezone = timezone_cursor_argument(request, table_metadata)
+    if _next and cursor_timezone:
+        cursor_state = request.args.get("_tz_cursor")
+        if cursor_state is not None and cursor_state != cursor_timezone:
+            # The cursor was created under a different business-day definition,
+            # so continuing from it could skip or repeat rows.
+            _next = None
+    elif _next and request.args.get("_tz_cursor"):
+        _next = None
 
     offset = ""
     if _next:
@@ -2587,6 +2625,7 @@ async def table_view_data(
         sort_desc,
         page_size,
         is_view,
+        timezone=timezone_cursor_argument(request, table_metadata),
     )
     rows = rows[:page_size]
 
@@ -2710,6 +2749,22 @@ async def table_view_data(
             if filter_keys
             else None
         )
+        timezone_state = timezone_state_argument(request, table_metadata)
+        if data["clear_filters_url"] and timezone_state:
+            key, value = timezone_state
+            existing = dict(
+                urllib.parse.parse_qsl(
+                    urllib.parse.urlsplit(data["clear_filters_url"]).query,
+                    keep_blank_values=True,
+                )
+            )
+            if existing.get(key) != value:
+                # Removing column filters should not silently change the
+                # business timezone that the remaining date facet is using.
+                data["clear_filters_url"] = datasette.urls.modify(
+                    data["clear_filters_url"],
+                    add={key: value},
+                )
         url_labels_extra = {}
         if data.get("expandable_columns"):
             url_labels_extra = {"_labels": "on"}
@@ -2823,6 +2878,7 @@ async def _next_value_and_url(
     sort_desc,
     page_size,
     is_view,
+    timezone=None,
 ):
     next_value = None
     next_url = None
@@ -2863,6 +2919,8 @@ async def _next_value_and_url(
                 added_args["_sort_desc"] = sort_desc
         else:
             added_args = {"_next": next_value}
+        if timezone:
+            added_args["_tz_cursor"] = timezone
         next_url = datasette.absolute_url(
             request,
             datasette.urls.modify(request, replace=added_args),

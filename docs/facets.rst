@@ -296,3 +296,39 @@ If Datasette finds any columns that contain dates in the first 100 values, it wi
 This works especially well against timestamp values such as ``2019-03-01 12:44:00``.
 
 Example here: `latest.datasette.io/fixtures/facetable?_facet_date=created <https://latest.datasette.io/fixtures/facetable?_facet_date=created>`__
+
+.. _facet_by_date_timezone:
+
+Facet by date in a business timezone
+------------------------------------
+
+By default date facets use SQLite's ``date()`` function, which interprets timestamps as UTC.
+Add ``?_tz=`` to group those timestamps by their date in an IANA timezone instead, for example::
+
+    /dbname/events?_facet_date=happened&_tz=America/New_York
+
+The timezone is applied consistently to the facet counts, the ``?happened__date=`` filter used by the facet links and the rows those links return.
+This matters around daylight saving time: on 2026-11-01 a timestamp of ``2026-11-01T05:30:00Z`` and another of ``2026-11-01T06:30:00Z`` are both ``01:30`` in New York, one before and one after the clocks go back, and both belong to the local date ``2026-11-01``.
+
+Each facet link keeps the current ``?_tz=`` and any other filters such as ``?source=``, and removes the ``?_next=`` pagination cursor.
+Changing the timezone or the page size invalidates an existing cursor: Datasette writes ``?_tz_cursor=`` into ``next_url`` links and ignores a ``?_next=`` cursor when the timezone no longer matches.
+
+With ``?_tz=`` enabled, values that are null or the empty string appear in an ``empty`` facet bucket and values that cannot be parsed appear in an ``invalid`` bucket, labeled "unreadable".
+These buckets do not belong to a real date, and can be selected with ``?happened__date=empty`` and ``?happened__date=invalid`` respectively.
+Without ``?_tz=`` the existing behavior is unchanged: null and unparseable values are omitted and only real dates are shown.
+
+The timezone can also be configured for a table using ``timezone``, or for a single configured date facet using a ``{"date": {"column": ..., "timezone": ...}}`` object:
+
+.. code-block:: yaml
+
+    databases:
+      events:
+        tables:
+          events:
+            timezone: America/New_York
+            facets:
+            - date:
+                column: happened
+                timezone: America/New_York
+
+A ``?_tz=`` query string parameter overrides the configured timezone.

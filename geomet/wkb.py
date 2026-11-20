@@ -114,6 +114,149 @@ _BINARY_TO_GEOM_TYPE = dict(
 _INT_TO_DIM_LABEL = {2: '2D', 3: 'Z', 4: 'ZM'}
 
 
+class WKBError(ValueError):
+    """Base class for errors raised while decoding a WKB record."""
+
+
+class WKBCoordinateBudgetExceeded(WKBError):
+    """Raised when a record contains more vertices than the caller's
+    coordinate budget allows.
+
+    The check happens before the coordinates of the offending ring,
+    linestring, or point are consumed, so the input stream is left positioned
+    at the start of that coordinate run.
+
+    Attributes:
+        budget: The coordinate budget in effect for the record.
+        vertices_counted: Vertices already counted within the record when
+            the over-limit member was encountered.
+        vertices_required: Total vertices the member declares, including the
+            portion that would exceed the budget.
+        layer: Path of geometry-type labels from the record root to the
+            member whose vertex count exceeds the budget.
+    """
+
+    def __init__(self, budget, vertices_counted, vertices_required, layer):
+        self.budget = budget
+        self.vertices_counted = vertices_counted
+        self.vertices_required = vertices_required
+        self.layer = list(layer)
+        super().__init__(
+            "Coordinate budget of %d vertices exceeded at %s: %d vertices "
+            "already counted, member declares %d more"
+            % (budget, ' > '.join(self.layer) or 'record',
+               vertices_counted, vertices_required)
+        )
+
+
+class WKBTruncated(WKBError):
+    """Raised when a record ends before all of its declared structure and
+    coordinates have been read.
+
+    Attributes:
+        layer: Path of geometry-type labels from the record root to the
+            member whose payload could not be read in full.
+        expected_bytes: Number of bytes the member still needed.
+        available_bytes: Number of bytes actually left in the record.
+    """
+
+    def __init__(self, layer, expected_bytes, available_bytes):
+        self.layer = list(layer)
+        self.expected_bytes = expected_bytes
+        self.available_bytes = available_bytes
+        super().__init__(
+            "Truncated WKB payload at %s: needed %d bytes but only %d "
+            "remained" % (' > '.join(self.layer) or 'record',
+                          expected_bytes, available_bytes)
+        )
+
+
+class WKBDepthExceeded(WKBError):
+    """Raised when nested geometry collections go deeper than the caller's
+    depth limit.
+
+    Attributes:
+        max_depth: The nesting depth limit in effect for the record.
+        depth: The depth of the first member that would exceed the limit.
+        layer: Path of geometry-type labels from the record root to the
+            member that would exceed the depth limit.
+    """
+
+    def __init__(self, max_depth, depth, layer):
+        self.max_depth = max_depth
+        self.depth = depth
+        self.layer = list(layer)
+        super().__init__(
+            "Geometry nesting depth limit of %d exceeded at %s: depth %d"
+            % (max_depth, ' > '.join(self.layer), depth)
+        )
+
+
+class _DecodeContext:
+    """Per-record bookkeeping for optional coordinate and depth budgets.
+
+    A single context is shared by every geometry in one record, so the
+    coordinate count accumulates across nested polygons, multipolygons and
+    geometry collections. Empty members (for example a polygon ring or a
+    linestring declaring zero vertices) consume no coordinate budget but are
+    still recorded as a layer for depth accounting.
+
+    When no budget is supplied the counters still run, but they can never
+    trip a limit, preserving the historical behavior of ``loads``.
+    """
+
+    def __init__(self, coordinate_budget=None, max_depth=None):
+        self.coordinate_budget = coordinate_budget
+        self.max_depth = max_depth
+        self.vertices = 0
+        self.depth = 0
+        self.layer = []
+
+    def enter(self, geom_type):
+        self.layer.append(geom_type)
+        self.depth += 1
+
+    def leave(self):
+        self.depth -= 1
+        self.layer.pop()
+
+    def check_depth(self):
+        if self.max_depth is None:
+            return
+        if self.depth > self.max_depth:
+            raise WKBDepthExceeded(self.max_depth, self.depth, self.layer)
+
+    def reserve_vertices(self, num_vertices):
+        """Account for ``num_vertices`` vertices before their coordinates
+        are read. Raises without consuming any of the coordinate bytes when
+        the declared count would exceed the remaining budget."""
+        if num_vertices == 0:
+            return
+        if self.coordinate_budget is not None:
+            if self.vertices + num_vertices > self.coordinate_budget:
+                raise WKBCoordinateBudgetExceeded(
+                    self.coordinate_budget, self.vertices,
+                    num_vertices, self.layer
+                )
+        self.vertices += num_vertices
+
+
+def _read_exact(num_bytes, stream, ctx):
+    """Read exactly ``num_bytes`` from ``stream`` or report a truncated
+    record without borrowing bytes from whatever follows it."""
+    data = as_bin_str(take(num_bytes, stream))
+    if len(data) != num_bytes:
+        raise WKBTruncated(ctx.layer, num_bytes, len(data))
+    return data
+
+
+def _read_count(endian_token, stream, ctx):
+    """Read a 4-byte member count at the current decode layer."""
+    [count] = struct.unpack('%sl' % endian_token,
+                            _read_exact(4, stream, ctx))
+    return count
+
+
 def _get_geom_type(type_bytes):
     """Get the GeoJSON geometry type label from a WKB type byte string.
 
@@ -251,7 +394,7 @@ def _dumps(obj, big_endian=True, include_meta=True):
     return exporter(obj, big_endian, meta)
 
 
-def loads(string):
+def loads(string, coordinate_budget=None, max_depth=None):
     """
     Construct a GeoJSON `dict` from WKB (`string`).
 
@@ -284,6 +427,33 @@ def loads(string):
     order to be consistent with [1], we'll stick with this approach
     for now.
 
+    :param bytes string:
+        A single WKB record. When a budget or depth limit is given, the
+        record boundary is the caller's responsibility: exactly the bytes
+        of this record must be supplied so a failed decode can never
+        consume bytes that belong to the next record.
+    :param int coordinate_budget:
+        Optional maximum number of vertices the whole record may contain.
+        The count accumulates across the entire record, including the
+        vertices of polygon interior rings and any nested members. Empty
+        members consume no vertex budget but still occupy a layer. When a
+        member declares more vertices than the budget allows,
+        :class:`WKBCoordinateBudgetExceeded` is raised before any of that
+        member's coordinate bytes are read. Defaults to `None`, which
+        preserves the historical unbounded behavior.
+    :param int max_depth:
+        Optional maximum nesting depth, counted in geometry layers (for
+        example a geometry collection holding another collection is
+        depth 2). The first member that would exceed the limit raises
+        :class:`WKBDepthExceeded` before its body is read. Defaults to
+        `None`, which preserves the historical unbounded behavior.
+
+    A record which ends before its declared payload is fully read raises
+    :class:`WKBTruncated`. Every budget-related error carries the layer
+    path at which it occurred and the counted (or over-limit) metrics, so
+    bulk loaders can distinguish coordinate overflow from structurally
+    incomplete input.
+
     References:
 
     [1] - https://github.com/bryanjos/geo/issues/76
@@ -291,9 +461,29 @@ def loads(string):
     [3] - https://tools.ietf.org/html/rfc7946#appendix-B.1
     [4] - https://tools.ietf.org/html/rfc7946#section-4
     """  # noqa
-    string = iter(string)
+    ctx = _DecodeContext(coordinate_budget=coordinate_budget,
+                         max_depth=max_depth)
+    result, has_srid, srid = _loads_geometry(iter(string), ctx)
+    if has_srid:
+        # As mentioned in the docstring above, include both approaches to
+        # indicating the SRID.
+        result['meta'] = {'srid': int(srid)}
+        result['crs'] = {
+            'type': 'name',
+            'properties': {'name': 'EPSG%s' % srid},
+        }
+    return result
+
+
+def _loads_geometry(string, ctx):
+    """Parse one geometry, including its header, from a shared stream.
+
+    A single :class:`_DecodeContext` is shared by every geometry in a
+    record so that coordinate and depth accounting span nested members.
+    Returns a ``(geometry, has_srid, srid)`` tuple.
+    """
     # endianness = string[0:1]
-    endianness = as_bin_str(take(1, string))
+    endianness = _read_exact(1, string, ctx)
     if endianness == BIG_ENDIAN:
         big_endian = True
     elif endianness == LITTLE_ENDIAN:
@@ -304,7 +494,7 @@ def loads(string):
 
     endian_token = '>' if big_endian else '<'
     # type_bytes = string[1:5]
-    type_bytes = as_bin_str(take(4, string))
+    type_bytes = _read_exact(4, string, ctx)
     if not big_endian:
         # To identify the type, order the type bytes in big endian:
         type_bytes = type_bytes[::-1]
@@ -312,28 +502,21 @@ def loads(string):
     geom_type, type_bytes, has_srid = _get_geom_type(type_bytes)
     srid = None
     if has_srid:
-        srid_field = as_bin_str(take(4, string))
+        srid_field = _read_exact(4, string, ctx)
         [srid] = struct.unpack('%si' % endian_token, srid_field)
-
-    # data_bytes = string[5:]  # FIXME: This won't work for GeometryCollections
-    data_bytes = string
 
     importer = _loads_registry.get(geom_type)
 
     if importer is None:
         _unsupported_geom_type(geom_type)
 
-    data_bytes = iter(data_bytes)
-    result = importer(big_endian, type_bytes, data_bytes)
-    if has_srid:
-        # As mentioned in the docstring above, include both approaches to
-        # indicating the SRID.
-        result['meta'] = {'srid': int(srid)}
-        result['crs'] = {
-            'type': 'name',
-            'properties': {'name': 'EPSG%s' % srid},
-        }
-    return result
+    ctx.enter(geom_type)
+    try:
+        ctx.check_depth()
+        result = importer(big_endian, type_bytes, string, ctx)
+    finally:
+        ctx.leave()
+    return result, has_srid, srid
 
 
 def _unsupported_geom_type(geom_type):
@@ -597,7 +780,7 @@ def _dump_geometrycollection(obj, big_endian, meta):
     return wkb_string
 
 
-def _load_point(big_endian, type_bytes, data_bytes):
+def _load_point(big_endian, type_bytes, data_bytes, ctx):
     """
     Convert byte data for a Point to a GeoJSON `dict`.
 
@@ -611,6 +794,9 @@ def _load_point(big_endian, type_bytes, data_bytes):
         value of ``big_endian``.
     :param str data_bytes:
         Coordinate data in a binary string.
+    :param ctx:
+        :class:`_DecodeContext` tracking the record's coordinate and depth
+        budgets.
 
     :returns:
         GeoJSON `dict` representing the Point geometry.
@@ -618,27 +804,31 @@ def _load_point(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
 
     if type_bytes == WKB_2D['Point']:
+        ctx.reserve_vertices(1)
         coords = struct.unpack('%sdd' % endian_token,
-                               as_bin_str(take(16, data_bytes)))
+                               _read_exact(16, data_bytes, ctx))
     elif type_bytes == WKB_Z['Point']:
+        ctx.reserve_vertices(1)
         coords = struct.unpack('%sddd' % endian_token,
-                               as_bin_str(take(24, data_bytes)))
+                               _read_exact(24, data_bytes, ctx))
     elif type_bytes == WKB_M['Point']:
         # NOTE: The use of XYM types geometries is quite rare. In the interest
         # of removing ambiguity, we will treat all XYM geometries as XYZM when
         # generate the GeoJSON. A default Z value of `0.0` will be given in
         # this case.
+        ctx.reserve_vertices(1)
         coords = list(struct.unpack('%sddd' % endian_token,
-                                    as_bin_str(take(24, data_bytes))))
+                                    _read_exact(24, data_bytes, ctx)))
         coords.insert(2, 0.0)
     elif type_bytes == WKB_ZM['Point']:
+        ctx.reserve_vertices(1)
         coords = struct.unpack('%sdddd' % endian_token,
-                               as_bin_str(take(32, data_bytes)))
+                               _read_exact(32, data_bytes, ctx))
 
     return dict(type='Point', coordinates=list(coords))
 
 
-def _load_linestring(big_endian, type_bytes, data_bytes):
+def _load_linestring(big_endian, type_bytes, data_bytes, ctx):
     endian_token = '>' if big_endian else '<'
 
     is_m = False
@@ -654,11 +844,13 @@ def _load_linestring(big_endian, type_bytes, data_bytes):
         num_dims = 4
 
     coords = []
-    [num_verts] = struct.unpack('%sl' % endian_token,
-                                as_bin_str(take(4, data_bytes)))
+    num_verts = _read_count(endian_token, data_bytes, ctx)
+    # Reserve the whole run up front so an over-budget linestring stops
+    # before any of its coordinate bytes are consumed.
+    ctx.reserve_vertices(num_verts)
 
-    while True:
-        vert_wkb = as_bin_str(take(8 * num_dims, data_bytes))
+    for _ in range(num_verts):
+        vert_wkb = _read_exact(8 * num_dims, data_bytes, ctx)
         fmt = '%s' + 'd' * num_dims
         vert = list(struct.unpack(fmt % endian_token, vert_wkb))
         if is_m:
@@ -666,13 +858,10 @@ def _load_linestring(big_endian, type_bytes, data_bytes):
 
         coords.append(vert)
 
-        if len(coords) == num_verts:
-            break
-
     return dict(type='LineString', coordinates=list(coords))
 
 
-def _load_polygon(big_endian, type_bytes, data_bytes):
+def _load_polygon(big_endian, type_bytes, data_bytes, ctx):
     endian_token = '>' if big_endian else '<'
     data_bytes = iter(data_bytes)
 
@@ -689,31 +878,36 @@ def _load_polygon(big_endian, type_bytes, data_bytes):
         num_dims = 4
 
     coords = []
-    [num_rings] = struct.unpack('%sl' % endian_token,
-                                as_bin_str(take(4, data_bytes)))
+    num_rings = _read_count(endian_token, data_bytes, ctx)
 
-    while True:
+    for ring_index in range(num_rings):
         ring = []
-        [num_verts] = struct.unpack('%sl' % endian_token,
-                                    as_bin_str(take(4, data_bytes)))
+        num_verts = _read_count(endian_token, data_bytes, ctx)
 
-        verts_wkb = as_bin_str(take(8 * num_verts * num_dims, data_bytes))
-        verts = block_splitter(verts_wkb, 8)
-        verts = (b''.join(bytes([y]) for y in x) for x in verts)
-        for vert_wkb in block_splitter(verts, num_dims):
-            values = [struct.unpack('%sd' % endian_token, x)[0]
-                      for x in vert_wkb]
-            if is_m:
-                values.insert(2, 0.0)
-            ring.append(values)
+        ctx.layer.append('ring[%d]' % ring_index)
+        try:
+            # An empty ring declares no vertices and spends no coordinate
+            # budget, but it still occupies this layer.
+            ctx.reserve_vertices(num_verts)
+
+            verts_wkb = _read_exact(8 * num_verts * num_dims,
+                                    data_bytes, ctx)
+            verts = block_splitter(verts_wkb, 8)
+            verts = (b''.join(bytes([y]) for y in x) for x in verts)
+            for vert_wkb in block_splitter(verts, num_dims):
+                values = [struct.unpack('%sd' % endian_token, x)[0]
+                          for x in vert_wkb]
+                if is_m:
+                    values.insert(2, 0.0)
+                ring.append(values)
+        finally:
+            ctx.layer.pop()
         coords.append(ring)
-        if len(coords) == num_rings:
-            break
 
     return dict(type='Polygon', coordinates=coords)
 
 
-def _load_multipoint(big_endian, type_bytes, data_bytes):
+def _load_multipoint(big_endian, type_bytes, data_bytes, ctx):
     endian_token = '>' if big_endian else '<'
     data_bytes = iter(data_bytes)
 
@@ -735,14 +929,21 @@ def _load_multipoint(big_endian, type_bytes, data_bytes):
         dim = _INT_TO_DIM_LABEL[num_dims]
 
     coords = []
-    [num_points] = struct.unpack('%sl' % endian_token,
-                                 as_bin_str(take(4, data_bytes)))
+    num_points = _read_count(endian_token, data_bytes, ctx)
 
-    while True:
-        point_endian = as_bin_str(take(1, data_bytes))
-        point_type = as_bin_str(take(4, data_bytes))
-        values = struct.unpack('%s%s' % (endian_token, 'd' * num_dims),
-                               as_bin_str(take(8 * num_dims, data_bytes)))
+    for point_index in range(num_points):
+        point_endian = _read_exact(1, data_bytes, ctx)
+        point_type = _read_exact(4, data_bytes, ctx)
+
+        ctx.layer.append('point[%d]' % point_index)
+        try:
+            ctx.reserve_vertices(1)
+            values = struct.unpack(
+                '%s%s' % (endian_token, 'd' * num_dims),
+                _read_exact(8 * num_dims, data_bytes, ctx)
+            )
+        finally:
+            ctx.layer.pop()
         values = list(values)
         if is_m:
             values.insert(2, 0.0)
@@ -755,13 +956,11 @@ def _load_multipoint(big_endian, type_bytes, data_bytes):
             assert point_type[::-1] == _WKB[dim]['Point']
 
         coords.append(list(values))
-        if len(coords) == num_points:
-            break
 
     return dict(type='MultiPoint', coordinates=coords)
 
 
-def _load_multilinestring(big_endian, type_bytes, data_bytes):
+def _load_multilinestring(big_endian, type_bytes, data_bytes, ctx):
     endian_token = '>' if big_endian else '<'
     data_bytes = iter(data_bytes)
 
@@ -782,13 +981,12 @@ def _load_multilinestring(big_endian, type_bytes, data_bytes):
     else:
         dim = _INT_TO_DIM_LABEL[num_dims]
 
-    [num_ls] = struct.unpack('%sl' % endian_token,
-                             as_bin_str(take(4, data_bytes)))
+    num_ls = _read_count(endian_token, data_bytes, ctx)
     coords = []
 
-    while True:
-        ls_endian = as_bin_str(take(1, data_bytes))
-        ls_type = as_bin_str(take(4, data_bytes))
+    for linestring_index in range(num_ls):
+        ls_endian = _read_exact(1, data_bytes, ctx)
+        ls_type = _read_exact(4, data_bytes, ctx)
         if big_endian:
             assert ls_endian == BIG_ENDIAN
             assert ls_type == _WKB[dim]['LineString']
@@ -796,24 +994,29 @@ def _load_multilinestring(big_endian, type_bytes, data_bytes):
             assert ls_endian == LITTLE_ENDIAN
             assert ls_type[::-1] == _WKB[dim]['LineString']
 
-        [num_verts] = struct.unpack('%sl' % endian_token,
-                                    as_bin_str(take(4, data_bytes)))
+        num_verts = _read_count(endian_token, data_bytes, ctx)
         num_values = num_dims * num_verts
-        values = struct.unpack(endian_token + 'd' * num_values,
-                               as_bin_str(take(8 * num_values, data_bytes)))
+
+        ctx.layer.append('linestring[%d]' % linestring_index)
+        try:
+            ctx.reserve_vertices(num_verts)
+            values = struct.unpack(
+                endian_token + 'd' * num_values,
+                _read_exact(8 * num_values, data_bytes, ctx)
+            )
+        finally:
+            ctx.layer.pop()
 
         values = list(block_splitter(values, num_dims))
         if is_m:
             for v in values:
                 v.insert(2, 0.0)
         coords.append(values)
-        if len(coords) == num_ls:
-            break
 
     return dict(type='MultiLineString', coordinates=coords)
 
 
-def _load_multipolygon(big_endian, type_bytes, data_bytes):
+def _load_multipolygon(big_endian, type_bytes, data_bytes, ctx):
     endian_token = '>' if big_endian else '<'
 
     is_m = False
@@ -833,13 +1036,12 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
     else:
         dim = _INT_TO_DIM_LABEL[num_dims]
 
-    [num_polys] = struct.unpack('%sl' % endian_token,
-                                as_bin_str(take(4, data_bytes)))
+    num_polys = _read_count(endian_token, data_bytes, ctx)
     coords = []
-    while True:
+    for polygon_index in range(num_polys):
         polygon = []
-        poly_endian = as_bin_str(take(1, data_bytes))
-        poly_type = as_bin_str(take(4, data_bytes))
+        poly_endian = _read_exact(1, data_bytes, ctx)
+        poly_type = _read_exact(4, data_bytes, ctx)
         if big_endian:
             assert poly_endian == BIG_ENDIAN
             assert poly_type == _WKB[dim]['Polygon']
@@ -847,26 +1049,32 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
             assert poly_endian == LITTLE_ENDIAN
             assert poly_type[::-1] == _WKB[dim]['Polygon']
 
-        [num_rings] = struct.unpack('%sl' % endian_token,
-                                    as_bin_str(take(4, data_bytes)))
-        for _ in range(num_rings):
-            ring = []
-            [num_verts] = struct.unpack('%sl' % endian_token,
-                                        as_bin_str(take(4, data_bytes)))
-            for _ in range(num_verts):
-                vert_wkb = as_bin_str(take(8 * num_dims, data_bytes))
-                fmt = '%s' + 'd' * num_dims
-                vert = list(struct.unpack(fmt % endian_token, vert_wkb))
-                if is_m:
-                    vert.insert(2, 0.0)
-                ring.append(vert)
+        num_rings = _read_count(endian_token, data_bytes, ctx)
+        ctx.layer.append('polygon[%d]' % polygon_index)
+        try:
+            for ring_index in range(num_rings):
+                ring = []
+                num_verts = _read_count(endian_token, data_bytes, ctx)
 
-            polygon.append(ring)
+                ctx.layer.append('ring[%d]' % ring_index)
+                try:
+                    ctx.reserve_vertices(num_verts)
+                    for _ in range(num_verts):
+                        vert_wkb = _read_exact(8 * num_dims, data_bytes, ctx)
+                        fmt = '%s' + 'd' * num_dims
+                        vert = list(struct.unpack(fmt % endian_token,
+                                                  vert_wkb))
+                        if is_m:
+                            vert.insert(2, 0.0)
+                        ring.append(vert)
+                finally:
+                    ctx.layer.pop()
+
+                polygon.append(ring)
+        finally:
+            ctx.layer.pop()
 
         coords.append(polygon)
-
-        if len(coords) == num_polys:
-            break
 
     return dict(type='MultiPolygon', coordinates=coords)
 
@@ -890,7 +1098,7 @@ def _check_dimensionality(geom, num_dims):
         raise Exception(error)
 
 
-def _load_geometrycollection(big_endian, type_bytes, data_bytes):
+def _load_geometrycollection(big_endian, type_bytes, data_bytes, ctx):
     endian_token = '>' if big_endian else '<'
 
     is_m = False
@@ -906,10 +1114,13 @@ def _load_geometrycollection(big_endian, type_bytes, data_bytes):
         num_dims = 4
 
     geometries = []
-    [num_geoms] = struct.unpack('%sl' % endian_token,
-                                as_bin_str(take(4, data_bytes)))
-    while True:
-        geometry = loads(data_bytes)
+    num_geoms = _read_count(endian_token, data_bytes, ctx)
+    for geom_index in range(num_geoms):
+        ctx.layer.append('geometry[%d]' % geom_index)
+        try:
+            geometry, _, _ = _loads_geometry(data_bytes, ctx)
+        finally:
+            ctx.layer.pop()
         if is_m:
             _check_dimensionality(geometry, 4)
         else:
@@ -917,8 +1128,6 @@ def _load_geometrycollection(big_endian, type_bytes, data_bytes):
         # TODO(LB): Add type assertions for the geometry; collections should
         # not mix 2d, 3d, 4d, etc.
         geometries.append(geometry)
-        if len(geometries) == num_geoms:
-            break
 
     return dict(type='GeometryCollection', geometries=geometries)
 

@@ -21,6 +21,7 @@ import geomet
 import unittest
 
 from geomet import wkt
+from geomet.util import MixedDimensionalityError
 
 
 WKT = {}
@@ -1253,3 +1254,67 @@ class TestMisc(unittest.TestCase):
 
         expected = 'Expected "b" but found "a"'
         self.assertEqual(expected, str(ar.exception))
+
+
+class DumpsMixedDimensionalityTestCase(unittest.TestCase):
+
+    def test_mixed_multipolygon_reports_ring_and_vertex(self):
+        from geomet.tests.util_test import MIXED_MULTIPOLYGON
+
+        with self.assertRaises(MixedDimensionalityError) as ar:
+            wkt.dumps(MIXED_MULTIPOLYGON)
+        self.assertEqual(
+            ['MultiPolygon', 'polygon[2]', 'ring[2]', 'vertex[2]'],
+            ar.exception.path,
+        )
+
+    def test_mixed_collection_path_reaches_second_member(self):
+        from geomet.tests.util_test import MIXED_COLLECTION
+
+        with self.assertRaises(MixedDimensionalityError) as ar:
+            wkt.dumps(MIXED_COLLECTION)
+        self.assertEqual(
+            ['GeometryCollection', 'MultiPolygon[2]', 'polygon[2]',
+             'ring[2]', 'vertex[2]'],
+            ar.exception.path,
+        )
+
+    def test_legal_collection_output_is_unchanged(self):
+        from geomet.tests.util_test import LEGAL_COLLECTION
+
+        expected = (
+            'GEOMETRYCOLLECTION ('
+            'POINT (1.000 2.000 3.000),'
+            'LINESTRING (0.000 0.000 0.000, 1.000 1.000 1.000),'
+            'POLYGON ((0.000 0.000 0.000, 1.000 0.000 0.000, '
+            '1.000 1.000 0.000, 0.000 0.000 0.000), '
+            '(0.200 0.200 0.000, 0.800 0.200 0.000, 0.800 0.800 0.000, '
+            '0.200 0.200 0.000)),'
+            'MULTIPOINT ((1.000 1.000 1.000), (2.000 2.000 2.000)),'
+            'MULTILINESTRING ((0.000 0.000 0.000, 1.000 1.000 1.000), '
+            '(2.000 2.000 2.000, 3.000 3.000 3.000)),'
+            'MULTIPOLYGON (((0.000 0.000 0.000, 1.000 0.000 0.000, '
+            '1.000 1.000 0.000, 0.000 0.000 0.000))),'
+            'GEOMETRYCOLLECTION (POINT (9.000 9.000 9.000),'
+            'LINESTRING (5.000 5.000 5.000, 6.000 6.000 6.000)))'
+        )
+        self.assertEqual(expected, wkt.dumps(LEGAL_COLLECTION, decimals=3))
+
+    def test_empty_geometry_is_not_mixed_dimensionality(self):
+        # WKT can represent an ordinary empty geometry; the empty support
+        # difference between formats must not be reported as mixed dimensions.
+        empty = {'type': 'Point', 'coordinates': []}
+        self.assertEqual('POINT EMPTY', wkt.dumps(empty))
+
+    def test_mixed_dimensionality_matches_wkb_message(self):
+        from geomet.tests.util_test import MIXED_MULTIPOLYGON
+        from geomet import wkb
+
+        try:
+            wkt.dumps(MIXED_MULTIPOLYGON)
+        except MixedDimensionalityError as wkt_error:
+            wkt_message = str(wkt_error)
+
+        with self.assertRaises(MixedDimensionalityError) as ar:
+            wkb.dumps(MIXED_MULTIPOLYGON)
+        self.assertEqual(wkt_message, str(ar.exception))

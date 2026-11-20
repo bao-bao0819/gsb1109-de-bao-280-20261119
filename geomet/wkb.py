@@ -18,6 +18,7 @@ from geomet.util import block_splitter
 from geomet.util import take
 from geomet.util import as_bin_str
 from geomet.util import flatten_multi_dim
+from geomet.util import validate_geometry
 from itertools import chain
 
 """
@@ -247,6 +248,12 @@ def _dumps(obj, big_endian=True, include_meta=True):
             'Empty geometries cannot be represented in WKB. Reason: The '
             'dimensionality of the WKB would be ambiguous.'
         )
+
+    # Enforce the structural rules shared with the WKT writer. Empty inputs
+    # are handled above (WKB cannot represent them); anything that reaches
+    # here is validated for problems such as mixed coordinate dimensionality
+    # before any binary packing runs.
+    validate_geometry(obj)
 
     return exporter(obj, big_endian, meta)
 

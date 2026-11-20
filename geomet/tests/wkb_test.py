@@ -14,6 +14,7 @@
 import unittest
 
 from geomet import wkb
+from geomet.util import MixedDimensionalityError
 
 
 class WKBTestCase(unittest.TestCase):
@@ -1352,3 +1353,73 @@ class GeometryCollectionTestCase(unittest.TestCase):
 
     def test_loads_2d_srid1234(self):
         self.assertEqual(self.gc2d_srid1234, wkb.loads(self.gc2d_srid1234_wkb))
+
+
+class DumpsMixedDimensionalityTestCase(unittest.TestCase):
+
+    def test_mixed_multipolygon_reports_ring_and_vertex(self):
+        from geomet.tests.util_test import MIXED_MULTIPOLYGON
+
+        with self.assertRaises(MixedDimensionalityError) as ar:
+            wkb.dumps(MIXED_MULTIPOLYGON)
+        self.assertEqual(
+            ['MultiPolygon', 'polygon[2]', 'ring[2]', 'vertex[2]'],
+            ar.exception.path,
+        )
+        self.assertEqual(3, ar.exception.expected_dims)
+        self.assertEqual(2, ar.exception.actual_dims)
+
+    def test_mixed_collection_path_reaches_second_member(self):
+        from geomet.tests.util_test import MIXED_COLLECTION
+
+        with self.assertRaises(MixedDimensionalityError) as ar:
+            wkb.dumps(MIXED_COLLECTION)
+        self.assertEqual(
+            ['GeometryCollection', 'MultiPolygon[2]', 'polygon[2]',
+             'ring[2]', 'vertex[2]'],
+            ar.exception.path,
+        )
+
+    def test_mixed_dimensionality_paths_match_wkt(self):
+        from geomet.tests.util_test import MIXED_MULTIPOLYGON, MIXED_COLLECTION
+        from geomet import wkt
+
+        for geom in (MIXED_MULTIPOLYGON, MIXED_COLLECTION):
+            try:
+                wkt.dumps(geom)
+            except MixedDimensionalityError as wkt_error:
+                wkt_path = list(wkt_error.path)
+
+            with self.assertRaises(MixedDimensionalityError) as ar:
+                wkb.dumps(geom)
+            self.assertEqual(wkt_path, ar.exception.path)
+
+    def test_legal_collection_is_accepted(self):
+        from geomet.tests.util_test import LEGAL_COLLECTION
+
+        # A uniform, multi-type, nested collection must still write without
+        # the validator raising.
+        blob = wkb.dumps(LEGAL_COLLECTION)
+        self.assertTrue(blob)
+
+    def test_legal_uniform_collection_round_trips(self):
+        collection = dict(type='GeometryCollection', geometries=[
+            dict(type='Point', coordinates=[0.0, 1.0, 2.0]),
+            dict(type='LineString', coordinates=[
+                [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),
+            dict(type='Polygon', coordinates=[
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                 [1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]]),
+        ])
+        self.assertEqual(collection, wkb.loads(wkb.dumps(collection)))
+
+    def test_empty_geometry_keeps_wkb_specific_limitation(self):
+        # WKB cannot represent an empty geometry. That format-specific
+        # limitation must be preserved and must not surface as a mixed
+        # dimensionality error.
+        empty = dict(type='Point', coordinates=[])
+        with self.assertRaises(ValueError) as ar:
+            wkb.dumps(empty)
+        self.assertNotIsInstance(ar.exception, MixedDimensionalityError)
+        self.assertIn('Empty geometries cannot be represented in WKB',
+                      str(ar.exception))

@@ -82,6 +82,11 @@ def dumps(obj, decimals=16):
             # Geom has no coordinate values at all, and must be empty.
             if len(list(util.flatten_multi_dim(obj['coordinates']))) == 0:
                 return '%s EMPTY' % geom_type.upper()
+
+        # Enforce the structural rules shared with the WKB writer. This
+        # reports problems (e.g. mixed coordinate dimensionality) before any
+        # format-specific formatting runs, with a path into the object.
+        util.validate_geometry(obj)
     except KeyError:
         raise geomet.InvalidGeoJSONException('Invalid GeoJSON: %s' % obj)
 

@@ -38,7 +38,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
-from .. import Dialect, insert, supports_attach, supports_user_agent
+from .. import Dialect, insert, multipart_schema_name, supports_attach, supports_user_agent
 from .._supports import has_comment_support
 
 try:
@@ -236,6 +236,139 @@ def test_get_table_names(inspector: Inspector, session: Session) -> None:
     assert set(table_names_all).issuperset({"t1", "t2", "t3", "t4"})
     for table_name in table_names_all:
         assert inspector.has_table(table_name)
+
+
+@mark.skipif(
+    supports_attach is False,
+    reason="ATTACH is not supported for DuckDB version < 0.7.0",
+)
+def test_dotted_database_and_schema_names(engine: Engine, session: Session) -> None:
+    # Using multi-line strings because of all the single and double quotes flying around...
+    cmds = [
+        """ATTACH ':memory:' AS "daily.archive" """,
+        """ATTACH ':memory:' AS "daily" """,
+        """ATTACH ':memory:' AS "arc""hive" """,
+        """CREATE SCHEMA "daily.archive"."sales east" """,
+        """CREATE SCHEMA "daily"."archive.sales east" """,
+        """CREATE SCHEMA "arc""hive"."dai""ly sync" """,
+        """CREATE TABLE "daily.archive"."sales east".daily_totals (id INTEGER, marker VARCHAR)""",
+        """CREATE TABLE "daily"."archive.sales east".daily_totals (id INTEGER, note VARCHAR)""",
+    ]
+    for cmd in cmds:
+        session.execute(text(cmd))
+        session.commit()
+
+    inspector = inspect(engine)
+
+    # discovery returns identifiers that preserve the exact segmentation
+    names = set(inspector.get_schema_names())
+    assert {
+        '"daily.archive"."sales east"',
+        'daily."archive.sales east"',
+        '"arc""hive"."dai""ly sync"',
+    } <= names
+
+    # returned identifiers can be fed back into reflection unambiguously
+    for schema, marker_column in (
+        ('"daily.archive"."sales east"', "marker"),
+        ('daily."archive.sales east"', "note"),
+    ):
+        assert "daily_totals" in inspector.get_table_names(schema=schema)
+        assert inspector.has_table("daily_totals", schema=schema)
+        columns = inspector.get_columns("daily_totals", schema=schema)
+        assert [col["name"] for col in columns] == ["id", marker_column]
+
+    # create, insert and query with the same identifiers, one value per target
+    meta = MetaData()
+    for database, schema, tag in (
+        ("daily.archive", "sales east", "supply"),
+        ("daily", "archive.sales east", "archive"),
+        ('arc"hive', 'dai"ly sync', "quoted"),
+    ):
+        table = Table(
+            "sync_log",
+            meta,
+            Column("id", Integer),
+            Column("tag", String),
+            schema=multipart_schema_name(database, schema),
+        )
+        table.create(engine)
+        with engine.connect() as conn:
+            conn.execute(table.insert().values(id=1, tag=tag))
+            assert conn.execute(select([table.c.tag])).scalar() == tag
+
+    # values only landed in the specified databases
+    with engine.connect() as conn:
+        assert (
+            conn.execute(text('SELECT tag FROM "daily.archive"."sales east".sync_log')).scalar()
+            == "supply"
+        )
+        assert (
+            conn.execute(text('SELECT tag FROM "daily"."archive.sales east".sync_log')).scalar()
+            == "archive"
+        )
+
+    # the same table can be re-reflected with the same identifier
+    reflected = Table(
+        "sync_log",
+        MetaData(),
+        schema='"daily.archive"."sales east"',
+        autoload_with=engine,
+    )
+    assert [col.name for col in reflected.columns] == ["id", "tag"]
+
+
+def test_multipart_schema_name(engine: Engine) -> None:
+    assert (
+        multipart_schema_name("daily.archive", "sales east")
+        == '"daily.archive"."sales east"'
+    )
+    assert (
+        multipart_schema_name("daily", "archive.sales east")
+        == '"daily"."archive.sales east"'
+    )
+    assert (
+        multipart_schema_name('arc"hive', 'dai"ly sync')
+        == '"arc""hive"."dai""ly sync"'
+    )
+    assert multipart_schema_name(None, "public") == '"public"'
+    assert multipart_schema_name(None, None) is None
+
+    # the helper output round-trips through the preparer
+    preparer = engine.dialect.identifier_preparer
+    for database, schema in (
+        ("daily.archive", "sales east"),
+        ("daily", "archive.sales east"),
+        ('arc"hive', 'dai"ly sync'),
+        ("sales", "public"),
+    ):
+        assert preparer._separate(multipart_schema_name(database, schema)) == (
+            database,
+            schema,
+        )
+    assert preparer._separate(multipart_schema_name(None, "public")) == (
+        None,
+        "public",
+    )
+
+    # unquoted two-part and single-part names keep working
+    assert preparer._separate("sales.public") == ("sales", "public")
+    assert preparer._separate("public") == (None, "public")
+    assert preparer._separate(None) == (None, None)
+
+
+def test_unresolvable_schema_name_raises(engine: Engine) -> None:
+    inspector = inspect(engine)
+    with raises(ValueError, match="Could not parse schema name"):
+        inspector.get_columns("test", schema="too.many.parts")
+    with raises(ValueError, match="Could not parse schema name"):
+        inspector.has_table("test", schema="too.many.parts")
+    with raises(ValueError, match="Could not parse schema name"):
+        Table(
+            "t", MetaData(), Column("id", Integer), schema="too.many.parts"
+        ).create(engine)
+    with raises(ValueError, match="Unterminated quoted identifier"):
+        inspector.has_table("test", schema='"unterminated')
 
 
 def test_get_views(conn: Connection, dialect: Dialect) -> None:

@@ -144,6 +144,26 @@ The `pandas.read_sql()` method can read tables from `duckdb_engine` into DataFra
 
 Unsigned integers are supported by DuckDB, and are available in [`duckdb_engine.datatypes`](duckdb_engine/datatypes.py).
 
+### Tables in attached databases
+
+Wherever SQLAlchemy accepts a `schema` name (e.g. `Table(..., schema=...)` or `inspect(engine).get_columns(..., schema=...)`), you can target a table in an attached database with a multipart name of the form `<database>.<schema>`:
+
+```python
+>>> users = sqlalchemy.Table('users', metadata, schema='sales.public')  # database "sales", schema "public"
+```
+
+If the database or schema name itself contains a dot, a space or a double quote, wrap that part in double quotes (doubling any embedded double quotes), or use `duckdb_engine.multipart_schema_name` to build the identifier from the two explicit names:
+
+```python
+>>> import duckdb_engine
+>>> duckdb_engine.multipart_schema_name('daily.archive', 'sales east')
+'"daily.archive"."sales east"'
+>>> duckdb_engine.multipart_schema_name('arc"hive', 'dai"ly sync')
+'"arc""hive"."dai""ly sync"'
+```
+
+The schema identifiers returned by `inspect(engine).get_schema_names()` follow the same format, so they can be persisted and fed back into reflection unambiguously. A qualified name that cannot be resolved (for example `too.many.parts`) raises a `ValueError` before any statement is issued against the target table.
+
 ## Alembic Integration
 
 SQLAlchemy's companion library `alembic` can optionally be used to manage database migrations.

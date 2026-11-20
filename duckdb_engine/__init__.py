@@ -1,4 +1,3 @@
-import re
 import warnings
 from functools import lru_cache
 from typing import (
@@ -60,7 +59,36 @@ __all__ = [
     "DBAPI",
     "DuckDBEngineWarning",
     "insert",  # reexport of sqlalchemy.dialects.postgresql.insert
+    "multipart_schema_name",
 ]
+
+
+def multipart_schema_name(
+    database_name: Optional[str], schema_name: Optional[str]
+) -> Optional[str]:
+    """
+    Build a multipart schema identifier from an explicit database name and
+    schema name, for use anywhere SQLAlchemy accepts a ``schema`` name
+    (``Table(..., schema=...)``, ``inspect(...).get_columns(..., schema=...)``,
+    etc).
+
+    Each part is double quoted (with embedded double quotes escaped by
+    doubling), so database or schema names containing dots, spaces or double
+    quotes round-trip unambiguously::
+
+        >>> multipart_schema_name("daily.archive", "sales east")
+        '"daily.archive"."sales east"'
+
+    Passing ``None`` for the database name yields a schema-only identifier.
+    """
+    parts = [
+        '"{}"'.format(part.replace('"', '""'))
+        for part in (database_name, schema_name)
+        if part is not None
+    ]
+    if not parts:
+        return None
+    return ".".join(parts)
 
 
 class DBAPI:
@@ -202,25 +230,81 @@ class DuckDBIdentifierPreparer(PGIdentifierPreparer):
             }
         )
 
+    @staticmethod
+    def _split_qualified_name(name: str) -> List[str]:
+        """
+        Split a multipart identifier into its raw (unquoted, unescaped) parts.
+
+        Parts are separated by dots; a part that itself contains dots, spaces
+        or double quotes must be wrapped in double quotes, with embedded
+        double quotes escaped by doubling them (``"you're "" despicable"``).
+        """
+        parts: List[str] = []
+        i, n = 0, len(name)
+        while i < n:
+            if name[i] == '"':
+                i += 1
+                buf: List[str] = []
+                while True:
+                    if i >= n:
+                        raise ValueError(
+                            f"Unterminated quoted identifier in schema name {name!r}"
+                        )
+                    if name[i] == '"':
+                        if i + 1 < n and name[i + 1] == '"':
+                            buf.append('"')
+                            i += 2
+                        else:
+                            i += 1
+                            break
+                    else:
+                        buf.append(name[i])
+                        i += 1
+                parts.append("".join(buf))
+                if i < n:
+                    if name[i] != ".":
+                        raise ValueError(
+                            f"Expected '.' after quoted identifier in schema name {name!r}"
+                        )
+                    i += 1
+            else:
+                j = name.find(".", i)
+                if j == -1:
+                    parts.append(name[i:])
+                    break
+                parts.append(name[i:j])
+                i = j + 1
+        return parts
+
     def _separate(self, name: Optional[str]) -> Tuple[Optional[Any], Optional[str]]:
         """
         Get database name and schema name from schema if it contains a database name
             Format:
               <db_name>.<schema_name>
-              db_name and schema_name are double quoted if contains spaces or double quotes
+              db_name and schema_name are double quoted if they contain dots, spaces
+              or double quotes, with embedded double quotes escaped by doubling
+
+        Raises ValueError if the name cannot be resolved into a database and
+        schema name, before any statement is issued against the target table.
         """
-        database_name, schema_name = None, name
-        if name is not None and "." in name:
-            database_name, schema_name = (
-                max(s) for s in re.findall(r'"([^.]+)"|([^.]+)', name)
-            )
-        return database_name, schema_name
+        if name is None:
+            return None, None
+        parts = self._split_qualified_name(name)
+        if len(parts) == 1 and parts[0]:
+            return None, parts[0]
+        if len(parts) == 2 and all(parts):
+            return parts[0], parts[1]
+        raise ValueError(
+            "Could not parse schema name {!r} as '<database>.<schema>'; "
+            "quote parts containing dots, spaces or double quotes with "
+            "double quotes".format(name)
+        )
 
     def format_schema(self, name: str) -> str:
         """Prepare a quoted schema name."""
         database_name, schema_name = self._separate(name)
         if database_name is None:
-            return self.quote(name)
+            return self.quote(schema_name)
         return ".".join(self.quote(_n) for _n in [database_name, schema_name])
 
     def quote_schema(self, schema: str, force: Any = None) -> str:
@@ -377,8 +461,10 @@ class Dialect(PGDialect_psycopg2):
     @cache  # type: ignore[call-arg]
     def get_schema_names(self, connection: "Connection", **kw: "Any"):  # type: ignore[no-untyped-def]
         """
-        Return unquoted database_name.schema_name unless either contains spaces or double quotes.
-        In that case, escape double quotes and then wrap in double quotes.
+        Return database_name.schema_name, quoting each part in double quotes if it
+        contains dots, spaces or double quotes (escaping embedded double quotes by
+        doubling them), so that the returned identifiers can be fed back into
+        reflection unambiguously.
         SQLAlchemy definition of a schema includes database name for databases like SQL Server (Ex: databasename.dbo)
         (see https://docs.sqlalchemy.org/en/20/dialects/mssql.html#multipart-schema-names)
         """
@@ -394,8 +480,8 @@ class Dialect(PGDialect_psycopg2):
             """
         rs = connection.execute(text(s))
 
-        qs = self.identifier_preparer.quote_schema
-        return [qs(".".join(nspname)) for nspname in rs]
+        quote = self.identifier_preparer.quote
+        return [".".join(quote(part) for part in nspname) for nspname in rs]
 
     def _build_query_where(
         self,

@@ -92,8 +92,22 @@ class HistoricalQuerySet(QuerySet):
         return c
 
     def _fetch_all(self) -> None:
-        super()._fetch_all()
-        self._instanceize()
+        if self._as_instances and self._prefetch_related_lookups:
+            # Historical rows must be converted to their instances before
+            # prefetching, otherwise the prefetcher sees historical models
+            # rather than the instances carrying the ``_as_of`` timepoint.
+            prefetch_lookups = self._prefetch_related_lookups
+            self._prefetch_related_lookups = ()
+            try:
+                super()._fetch_all()
+            finally:
+                self._prefetch_related_lookups = prefetch_lookups
+            self._instanceize()
+            if not self._prefetch_done:
+                self._prefetch_related_objects()
+        else:
+            super()._fetch_all()
+            self._instanceize()
 
     def _instanceize(self) -> None:
         """

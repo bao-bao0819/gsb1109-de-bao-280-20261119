@@ -15,6 +15,7 @@ from django.core.files.base import ContentFile
 from django.db import IntegrityError, models
 from django.db.models import Prefetch
 from django.db.models.fields.proxy import OrderWrt
+from django.db.models.query import prefetch_related_objects
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -119,6 +120,7 @@ from ..models import (
     TestHistoricParticipantToHistoricOrganizationOneToOne,
     TestHistoricParticipantToOrganization,
     TestHistoricParticipantToOrganizationOneToOne,
+    TestHistoricParticipantWithNullableOrganization,
     TestHistoricSubParticipantToHistoricParticipant,
     TestOrganization,
     TestOrganizationWithHistory,
@@ -2949,6 +2951,161 @@ class HistoricForeignKeyTest(TestCase):
                 org: list(org.historic_participants.all()) for org in orgs
             }
             self.assertDictEqual(prefetched_org_to_participants, org_to_participants)
+
+    def test_forward_prefetch_uses_each_instances_timepoint(self):
+        """Forward ``prefetch_related()`` must honor each historic instance's cutoff.
+
+        Two batches of the same historic rows use different cutoffs and point at the
+        same organization primary key.  The first cutoff sees that organization under
+        its old name; it is then renamed, deleted, and its primary key is reused by a
+        new organization only visible at the second cutoff.  Prefetching in either
+        order must resolve each batch at its own cutoff without leaking results.
+        """
+        Organization = TestOrganizationWithHistory
+        Participant = TestHistoricParticipantWithNullableOrganization
+
+        old_org = Organization.objects.create(pk=1, name="old")
+        order = Participant.objects.create(name="order", organization=old_org)
+        no_org = Participant.objects.create(name="no_org", organization=None)
+        old_cutoff = timezone.now()
+
+        old_org.name = "renamed"
+        old_org.save()
+        Participant.objects.filter(organization=old_org).update(organization=None)
+        old_org.delete()
+        no_target_cutoff = timezone.now()
+
+        # Both exports select the same order history versions.
+        old_instances = list(Participant.history.as_of(old_cutoff).order_by("name"))
+        no_target_instances = list(
+            Participant.history.as_of(no_target_cutoff).order_by("name")
+        )
+        self.assertEqual(len(old_instances), 2)
+        self.assertEqual(len(no_target_instances), 2)
+
+        new_org = Organization.objects.create(pk=1, name="new")
+        Participant.objects.filter(pk=order.pk).update(organization=new_org)
+        order.refresh_from_db()
+
+        def prefetch_and_resolve(batch, other_batch):
+            for participant in list(batch) + list(other_batch):
+                participant._prefetched_objects_cache = {}
+                participant.__dict__.pop("organization", None)
+                participant._state.fields_cache.pop("organization", None)
+            with self.assertNumQueries(2):
+                prefetch_related_objects(
+                    list(batch) + list(other_batch),
+                    "organization",
+                )
+                resolved = {}
+                for participant in batch:
+                    try:
+                        organization = participant.organization
+                    except Participant.organization.RelatedObjectDoesNotExist:
+                        resolved[participant.name] = "missing"
+                    else:
+                        resolved[participant.name] = (
+                            organization.name if organization is not None else None
+                        )
+            return resolved
+
+        old_expected = {"no_org": None, "order": "old"}
+        no_target_expected = {"no_org": None, "order": "missing"}
+
+        # Read the newer cutoff first, then the older one.
+        self.assertEqual(
+            prefetch_and_resolve(no_target_instances, old_instances),
+            no_target_expected,
+        )
+        self.assertEqual(
+            prefetch_and_resolve(old_instances, no_target_instances),
+            old_expected,
+        )
+
+        # Reverse the reading order; results must stay independent.
+        self.assertEqual(
+            prefetch_and_resolve(old_instances, no_target_instances),
+            old_expected,
+        )
+        self.assertEqual(
+            prefetch_and_resolve(no_target_instances, old_instances),
+            no_target_expected,
+        )
+
+        # The non-historic query keeps returning the current relation.
+        self.assertEqual(order.organization.name, "new")
+        self.assertIsNone(no_org.organization)
+
+    def test_forward_prefetch_distinguishes_empty_and_missing_relations(self):
+        """An empty FK stays ``None``; a dangling FK raises as without prefetching."""
+        Organization = TestOrganizationWithHistory
+        Participant = TestHistoricParticipantWithNullableOrganization
+
+        org = Organization.objects.create(name="org")
+        has_org = Participant.objects.create(name="has_org", organization=org)
+        Participant.objects.create(name="no_org", organization=None)
+        cutoff = timezone.now()
+
+        # The order history keeps the non-empty FK, but the target has no
+        # historical row visible at the cutoff.
+        Participant.objects.filter(pk=has_org.pk).delete()
+        org.delete()
+        Organization.history.all().delete()
+
+        historic = list(Participant.history.as_of(cutoff).order_by("name"))
+        with self.assertNumQueries(1):
+            prefetch_related_objects(historic, "organization")
+            has_org, no_org = historic
+            self.assertIsNone(no_org.organization)
+            with self.assertRaises(Organization.DoesNotExist):
+                has_org.organization
+
+    def test_historic_queryset_prefetch_uses_each_instances_timepoint(self):
+        """``as_of().prefetch_related()`` resolves cutoffs after instance conversion."""
+        Organization = TestOrganizationWithHistory
+        Participant = TestHistoricParticipantWithNullableOrganization
+
+        org = Organization.objects.create(name="old")
+        Participant.objects.create(name="order", organization=org)
+        cutoff = timezone.now()
+        org.name = "new"
+        org.save()
+
+        with self.assertNumQueries(2):
+            participant = (
+                Participant.history.as_of(cutoff)
+                .prefetch_related("organization")
+                .get(name="order")
+            )
+            self.assertEqual(participant.organization.name, "old")
+
+    def test_nested_forward_prefetch_uses_each_instances_timepoint(self):
+        """Nested forward prefetch keeps the originating cutoff at every level."""
+        Organization = TestOrganizationWithHistory
+        Participant = TestHistoricParticipantToHistoricOrganization
+        SubParticipant = TestHistoricSubParticipantToHistoricParticipant
+
+        org = Organization.objects.create(name="old")
+        participant = Participant.objects.create(name="p", organization=org)
+        SubParticipant.objects.create(name="sub", participant=participant)
+        cutoff = timezone.now()
+
+        org.name = "new"
+        org.save()
+        participant.name = "p_new"
+        participant.save()
+        SubParticipant.objects.filter(participant=participant).update(
+            name="sub_new"
+        )
+
+        with self.assertNumQueries(3):
+            subs = list(
+                SubParticipant.history.as_of(cutoff).prefetch_related(
+                    "participant__organization"
+                )
+            )
+            self.assertEqual(subs[0].participant.name, "p")
+            self.assertEqual(subs[0].participant.organization.name, "old")
 
     def test_nested_prefetch_across_historic_foreign_keys(self):
         """Nested ``prefetch_related()`` across two ``HistoricForeignKey`` reverse

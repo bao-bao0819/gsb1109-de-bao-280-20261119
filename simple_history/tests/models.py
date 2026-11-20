@@ -1011,6 +1011,25 @@ class TestHistoricParticipantToHistoricOrganization(BaseTestParticipantToOrganiz
     history = HistoricalRecords()
 
 
+class TestHistoricParticipantWithNullableOrganization(models.Model):
+    """
+    Historic table with a nullable ``HistoricForeignKey`` to a historic table.
+
+    Used to verify that a missing historic target stays distinguishable from an
+    empty foreign key when historic relations are prefetched.
+    """
+
+    name = models.CharField(max_length=15, unique=True)
+    organization = HistoricForeignKey(
+        TestOrganizationWithHistory,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="nullable_historic_participants",
+    )
+    history = HistoricalRecords()
+
+
 class TestHistoricSubParticipantToHistoricParticipant(models.Model):
     """
     Historic table foreign key to a historic table that itself has a

@@ -162,6 +162,20 @@ reverse relationships.
 
 See the `HistoricForeignKeyTest` code and models for an example.
 
+Historic relations can also be eagerly loaded with ``prefetch_related()``.
+When the source objects come from different ``as_of`` cutoffs, each related
+object is resolved at the source object's cutoff, and related objects are
+fetched in batches per cutoff rather than once per source object:
+
+.. code-block:: pycon
+
+    >>> participants = (
+    ...     Participant.history.as_of(cutoff)
+    ...     .prefetch_related("organization")
+    ... )
+    >>> [participant.organization.name for participant in participants]
+    ['old region name', ...]
+
 
 HistoricOneToOneField
 ---------------------

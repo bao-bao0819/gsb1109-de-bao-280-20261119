@@ -850,22 +850,197 @@ def transform_field(field):
 
 class HistoricDescriptorMixin:
 
+    _HISTORIC_MISSING_RELATIONS_ATTR = "_historic_missing_relations"
+
+    def _get_history_manager(self):
+        related_model = self.get_related_model()
+        return getattr(
+            related_model,
+            getattr(
+                related_model._meta,
+                "simple_history_manager_attribute",
+                "_notthere",
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _get_historic_cutoff(instance):
+        history = getattr(instance, SIMPLE_HISTORY_REVERSE_ATTR_NAME, None)
+        if history is None:
+            return None
+        return getattr(history, "_as_of", history.history_date)
+
+    def _set_historic_relation_missing(self, instance, missing):
+        markers = getattr(instance, self._HISTORIC_MISSING_RELATIONS_ATTR, None)
+        if missing:
+            if markers is None:
+                markers = set()
+                setattr(instance, self._HISTORIC_MISSING_RELATIONS_ATTR, markers)
+            markers.add(self.field.cache_name)
+        elif markers is not None:
+            markers.discard(self.field.cache_name)
+
+    def __get__(self, instance, cls=None):
+        if instance is None or not hasattr(self, "field"):
+            return super().__get__(instance, cls)
+        markers = getattr(instance, self._HISTORIC_MISSING_RELATIONS_ATTR, ())
+        if (
+            self.field.cache_name in markers
+            and None not in self.field.get_local_related_value(instance)
+        ):
+            raise self.RelatedObjectDoesNotExist(
+                "%s has no %s." % (self.field.model.__name__, self.field.name)
+            )
+        return super().__get__(instance, cls)
+
     def get_queryset(self, **hints):
         instance = hints.get("instance")
         if instance:
             history = getattr(instance, SIMPLE_HISTORY_REVERSE_ATTR_NAME, None)
-            histmgr = getattr(
-                self.get_related_model(),
-                getattr(
-                    self.get_related_model()._meta,
-                    "simple_history_manager_attribute",
-                    "_notthere",
-                ),
-                None,
-            )
+            histmgr = self._get_history_manager()
             if history and histmgr:
                 return histmgr.as_of(getattr(history, "_as_of", history.history_date))
         return super().get_queryset(**hints)
+
+    def _get_prefetch_key(self, value, cutoff):
+        return (value, cutoff)
+
+    def _get_cutoff_prefetched_objects(self, instances, querysets):
+        """
+        Prefetch historic related objects for instances originating from
+        different timepoints.
+
+        The standard prefetcher only supports a single queryset.  Historic
+        instances, however, may come from several different cutoffs, and the
+        same related primary key may refer to different rows at each cutoff.
+        Grouping by cutoff both avoids a query per instance and keeps equal
+        related keys from different cutoffs separate.
+        """
+        histmgr = self._get_history_manager()
+        target_field = self.field.target_field
+        cache_name = self.field.cache_name
+        target_attr = self.field.get_foreign_related_value
+        instance_attr = self.field.get_local_related_value
+
+        cutoff_by_instance = {
+            id(instance): self._get_historic_cutoff(instance) for instance in instances
+        }
+        instances_by_cutoff = {}
+        current_instances = []
+        for instance in instances:
+            cutoff = cutoff_by_instance[id(instance)]
+            if cutoff is None:
+                current_instances.append(instance)
+            else:
+                instances_by_cutoff.setdefault(cutoff, []).append(instance)
+
+        related_objects = []
+        cutoff_by_related_object = {}
+        instance_by_prefetch_key = {}
+        is_forward_relation = isinstance(self, ForwardManyToOneDescriptor)
+        if is_forward_relation:
+            for instance in instances:
+                instance_by_prefetch_key[
+                    self._get_prefetch_key(
+                        instance_attr(instance), cutoff_by_instance[id(instance)]
+                    )
+                ] = instance
+
+        # Current instances keep the standard ``ForeignKey`` prefetch behavior,
+        # including support for an explicit ``Prefetch`` queryset.
+        if current_instances:
+            (
+                current_queryset,
+                current_rel_obj_attr,
+                _,
+                _,
+                _,
+                _,
+            ) = super().get_prefetch_querysets(current_instances, querysets)
+            for related_object in current_queryset:
+                related_objects.append(related_object)
+                cutoff_by_related_object[id(related_object)] = None
+                if is_forward_relation:
+                    instance = instance_by_prefetch_key.get(
+                        self._get_prefetch_key(
+                            current_rel_obj_attr(related_object), None
+                        )
+                    )
+                    if instance is not None:
+                        self.field.remote_field.set_cached_value(
+                            related_object, instance
+                        )
+
+        for cutoff, cutoff_instances in instances_by_cutoff.items():
+            target_values = {
+                value
+                for instance in cutoff_instances
+                for value in instance_attr(instance)
+                if value is not None
+            }
+            if not target_values:
+                continue
+            related_queryset = histmgr.as_of(cutoff).filter(
+                **{f"{target_field.attname}__in": target_values}
+            )
+            for related_object in related_queryset:
+                related_objects.append(related_object)
+                cutoff_by_related_object[id(related_object)] = cutoff
+                if is_forward_relation:
+                    instance = instance_by_prefetch_key.get(
+                        self._get_prefetch_key(target_attr(related_object), cutoff)
+                    )
+                    if instance is not None:
+                        self.field.remote_field.set_cached_value(
+                            related_object, instance
+                        )
+
+        def rel_obj_attr(related_object):
+            return self._get_prefetch_key(
+                target_attr(related_object),
+                cutoff_by_related_object[id(related_object)],
+            )
+
+        def instance_prefetch_key(instance):
+            return self._get_prefetch_key(
+                instance_attr(instance), cutoff_by_instance[id(instance)]
+            )
+
+        if is_forward_relation:
+            found_keys = {
+                rel_obj_attr(related_object) for related_object in related_objects
+            }
+            for instance in instances:
+                if (
+                    self._get_historic_cutoff(instance) is not None
+                    and None not in instance_attr(instance)
+                    and instance_prefetch_key(instance) not in found_keys
+                ):
+                    self._set_historic_relation_missing(instance, True)
+
+        return (
+            related_objects,
+            rel_obj_attr,
+            instance_prefetch_key,
+            True,
+            cache_name,
+            False,
+        )
+
+    def get_prefetch_querysets(self, instances, querysets=None):
+        if not instances:
+            return super().get_prefetch_querysets(instances, querysets)
+
+        if self._get_history_manager() is None:
+            return super().get_prefetch_querysets(instances, querysets)
+
+        if all(
+            self._get_historic_cutoff(instance) is None for instance in instances
+        ):
+            return super().get_prefetch_querysets(instances, querysets)
+
+        return self._get_cutoff_prefetched_objects(instances, querysets)
 
 
 class HistoricForwardManyToOneDescriptor(

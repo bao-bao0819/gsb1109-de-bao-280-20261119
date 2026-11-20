@@ -12,6 +12,11 @@ Unreleased
 
 **Bug fixes:**
 
+- Fixed forward ``prefetch_related()`` with ``HistoricForeignKey`` and
+  ``HistoricOneToOneField`` so historic instances from different ``as_of``
+  cutoffs resolve their related objects at their own cutoff without
+  per-instance queries.
+
 
 **Other changes:**
 

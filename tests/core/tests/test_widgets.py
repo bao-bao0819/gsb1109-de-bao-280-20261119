@@ -963,6 +963,67 @@ class CachedForeignKeyWidgetTest(TestCase):
         row_dict = {"name": "Foo", "birthday": author2.birthday}
         self.assertEqual(birthday_widget.clean("Foo", row=row_dict), author2)
 
+    def test_clean_interleaved_row_dependent_querysets(self):
+        # each distinct row-dependent queryset is cached separately, so
+        # interleaved rows must not reuse the dataset cached for the first row
+        class VersionedWidget(widgets.CachedForeignKeyWidget):
+            def get_queryset(self, value, row, *args, **kwargs):
+                return self.model.objects.filter(birthday=row["version"])
+
+        author_old = Author.objects.create(name="Foo", birthday="2016-01-01")
+        author_new = Author.objects.create(name="Foo", birthday="2020-01-01")
+        widget = VersionedWidget(Author, "name")
+        with CaptureQueriesContext(connection) as ctx:
+            self.assertEqual(
+                widget.clean("Foo", row={"version": "2016-01-01"}), author_old
+            )
+            self.assertEqual(
+                widget.clean("Foo", row={"version": "2020-01-01"}), author_new
+            )
+            self.assertEqual(
+                widget.clean("Foo", row={"version": "2016-01-01"}), author_old
+            )
+        # one query per distinct queryset
+        self.assertEqual(len(ctx.captured_queries), 2)
+
+    def test_clean_row_dependent_queryset_no_borrowed_hit(self):
+        # a value which only exists in another row's queryset must raise
+        # DoesNotExist, not borrow a hit from the other version's dataset
+        class VersionedWidget(widgets.CachedForeignKeyWidget):
+            def get_queryset(self, value, row, *args, **kwargs):
+                return self.model.objects.filter(birthday=row["version"])
+
+        Author.objects.create(name="Bar", birthday="2020-01-01")
+        widget = VersionedWidget(Author, "name")
+        self.assertEqual(
+            widget.clean("Bar", row={"version": "2020-01-01"}).name, "Bar"
+        )
+        with self.assertRaises(Author.DoesNotExist):
+            widget.clean("Bar", row={"version": "2016-01-01"})
+
+    def test_cache_is_not_reused_after_config_change(self):
+        widget = widgets.CachedForeignKeyWidget(Author, "name")
+        self.assertEqual(widget.clean("Foo"), self.author)
+        widget.field = "pk"
+        self.assertEqual(widget.clean(self.author.pk), self.author)
+
+    def test_clean_with_varying_lookup_fields(self):
+        class MultiLookupWidget(widgets.CachedForeignKeyWidget):
+            def get_lookup_kwargs(self, value, row, **kwargs):
+                if row.get("by") == "email":
+                    return {"author_email": row["email"]}
+                return {"name": value}
+
+        book = Book.objects.create(
+            name="Baz", author=self.author, author_email="baz@email.com"
+        )
+        widget = MultiLookupWidget(Book, "name")
+        self.assertEqual(widget.clean("Baz", row={}), book)
+        self.assertEqual(
+            widget.clean("ignored", row={"by": "email", "email": "baz@email.com"}),
+            book,
+        )
+
     def test_invalid_get_queryset(self):
         class BirthdayWidget(widgets.CachedForeignKeyWidget):
             def get_queryset(self, value, row):

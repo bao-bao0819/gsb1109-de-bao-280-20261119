@@ -854,17 +854,20 @@ class _CachedQuerySetWrapper:
         to lists of instances. The values of the returned dict are lists
         to handle potential multiple instances with the same lookup fields values.
         """
-        if hasattr(self, "_instances"):
-            return self._instances
+        if not hasattr(self, "_instances"):
+            self._instances = {}
 
-        self._instances = defaultdict(list)
-        for instance in queryset:
-            key = key_cls(
-                **{field: str(getattr(instance, field)) for field in key_cls._fields}
-            )
-            self._instances[key].append(instance)
+        fields = key_cls._fields
+        if fields not in self._instances:
+            instances = defaultdict(list)
+            for instance in queryset:
+                key = key_cls(
+                    **{field: str(getattr(instance, field)) for field in fields}
+                )
+                instances[key].append(instance)
+            self._instances[fields] = instances
 
-        return self._instances
+        return self._instances[fields]
 
     def get(self, **lookup_fields):
         Key = namedtuple("Key", list(lookup_fields.keys()))
@@ -898,11 +901,13 @@ class CachedForeignKeyWidget(ForeignKeyWidget):
 
     - It does not support caching when ``use_natural_foreign_keys=True`` is set.
 
-    - It calls :meth:`~import_export.widgets.ForeignKeyWidget.get_queryset` only once,
-      so if the queryset depends on the row data, this widget may not work as expected.
-      You must be sure that the queryset is static for all rows.
-      Avoid using :class:`~import_export.widgets.CachedForeignKeyWidget`
-      in the following way::
+    - It calls :meth:`~import_export.widgets.ForeignKeyWidget.get_queryset` for
+      each row and keeps a separate cache for each distinct queryset (as
+      identified by :meth:`~import_export.widgets.CachedForeignKeyWidget.get_cache_key`),
+      so a queryset which depends on row data is supported.  Each distinct
+      queryset is evaluated once and cached in memory for subsequent lookups.
+      For example, the following caches one dataset per distinct
+      ``first_name`` / ``last_name`` pair::
 
             class FullNameForeignKeyWidget(CachedForeignKeyWidget):
                 def get_queryset(self, value, row, *args, **kwargs):
@@ -911,7 +916,7 @@ class CachedForeignKeyWidget(ForeignKeyWidget):
                         last_name__iexact=row["last_name"]
                     )
 
-      It makes more sense to filter by static values::
+      If the queryset is static for all rows, only one dataset is cached::
 
             class ActiveForeignKeyWidget(CachedForeignKeyWidget):
                 def get_queryset(self, value, row, *args, **kwargs):
@@ -919,16 +924,7 @@ class CachedForeignKeyWidget(ForeignKeyWidget):
 
     - It stores data in a hash table where the key is a tuple of the fields that
       returned by :meth:`~import_export.widgets.ForeignKeyWidget.get_lookup_kwargs`.
-      You must be sure that the lookup fields are the same for all rows.
-      If the lookup fields differ between rows, this widget may not work as expected.
-      The following example is incorrect usage::
-
-            class MultiColumnForeignKeyWidget(CachedForeignKeyWidget):
-                def get_lookup_kwargs(self, value, row, **kwargs):
-                    if row['active'] == 'yes':
-                        return {self.field: value, 'active': True}
-                    else:
-                        return {self.field: value, 'inactive': True}
+      A separate hash table is kept for each distinct set of lookup fields.
 
     - It does not support complex lookups like ``__gt`` or ``__lt`` in the
     ``get_lookup_kwargs()``.
@@ -963,13 +959,40 @@ class CachedForeignKeyWidget(ForeignKeyWidget):
             return {"django_import_export_cached_lookup": value}
         return super().get_lookup_kwargs(value, row, **kwargs)
 
+    def get_cache_key(self, value, row, queryset, **kwargs):
+        """
+        Returns a key which uniquely identifies the cached queryset for the
+        current row.  A separate cache is kept for each distinct key, so a
+        :meth:`~import_export.widgets.ForeignKeyWidget.get_queryset` which
+        depends on row data is cached per distinct queryset instead of
+        reusing the dataset cached for the first row.
+
+        The default implementation includes the widget's model and lookup
+        field, so that modifying the widget configuration does not reuse a
+        stale cache, and the queryset's SQL, so that each distinct queryset
+        is cached separately.
+
+        :param value: The field's value in the dataset.
+        :param row: The dataset's current row.
+        :param queryset: The queryset returned by
+            :meth:`~import_export.widgets.ForeignKeyWidget.get_queryset` for
+            the current row.
+        :param \\**kwargs:
+            Optional kwargs.
+        """
+        return (self.model, self.field, str(queryset.query))
+
     def get_instance_by_lookup_fields(self, value, row, **kwargs):
         if not hasattr(self, "_cached_qs"):
-            queryset = self.get_queryset(value, row, **kwargs)
-            self._cached_qs = _CachedQuerySetWrapper(queryset)
+            self._cached_qs = {}
+
+        queryset = self.get_queryset(value, row, **kwargs)
+        cache_key = self.get_cache_key(value, row, queryset, **kwargs)
+        if cache_key not in self._cached_qs:
+            self._cached_qs[cache_key] = _CachedQuerySetWrapper(queryset)
 
         lookup_kwargs = self.get_lookup_kwargs(value, row, **kwargs)
-        return self._cached_qs.get(**lookup_kwargs)
+        return self._cached_qs[cache_key].get(**lookup_kwargs)
 
 
 class ManyToManyWidget(RelatedModelWidgetMixin, Widget):

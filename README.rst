@@ -45,6 +45,41 @@ Example
 That's it.
 
 
+Streaming reads
+---------------
+
+``File`` values can also be read incrementally without loading the whole
+value into memory.  ``open_window`` captures the current version of a key and
+returns a bounded reader::
+
+    >>> p.append({'x': b'Hello world!'})
+    >>> window = p.open_window('x', blocksize=5)
+    >>> data, position = window.read()   # returns (data, position)
+    >>> data, position
+    (b'Hello', 5)
+    >>> window.read(5, 5)[0]              # read 5 bytes starting at position 5
+    b' worl'
+    >>> str(window.read(5, 10).status)    # status distinguishes data from endings
+    'data'
+    >>> end = window.read(5, 12)          # beyond the captured end
+    >>> end[0], end[1], str(end.status)
+    (b'', 12, 'window_end')
+
+A window only ever sees the bytes which existed when it was opened.  Appends
+made while it is open are visible to newly opened windows but not to the old
+one.  If the key is deleted and recreated, an already open window continues to
+read the original data, while a new window reads the replacement.  ``status``
+is ``"missing"`` for a key which did not exist and ``"empty"`` for a
+zero-length value.  Windows hold an open file descriptor, so they should be
+closed (or used as context managers) when finished.
+
+The ordinary ``get`` operation is unchanged and still returns the complete
+value::
+
+    >>> p.get('x')
+    b'Hello world!'
+
+
 Implementations
 ---------------
 

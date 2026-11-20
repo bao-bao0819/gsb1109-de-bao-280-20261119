@@ -6,10 +6,33 @@ import string
 import tempfile
 
 from .core import Interface
+from .window import (
+    DEFAULT_BLOCKSIZE,
+    ReadResult,
+    ReadStatus,
+    ReadWindow,
+    Window,
+    DATA,
+    OK,
+    EMPTY,
+    MISSING,
+    WINDOW_END,
+    END,
+    EOF,
+    STATUS_DATA,
+    STATUS_OK,
+    STATUS_EMPTY,
+    STATUS_MISSING,
+    STATUS_WINDOW_END,
+    STATUS_END,
+    STATUS_EOF,
+)
 import locket
 
 
 class File(Interface):
+    blocksize = DEFAULT_BLOCKSIZE
+
     def __init__(self, path=None, dir=None):
         if not path:
             path = tempfile.mkdtemp(suffix='.partd', dir=dir)
@@ -96,6 +119,59 @@ class File(Interface):
 
     def filename(self, key):
         return filename(self.path, key)
+
+    def open_window(self, key, blocksize=None, lock=True):
+        """Open a snapshot read window for ``key``.
+
+        The returned :class:`partd.window.ReadWindow` reads from a file
+        descriptor captured at call time.  It only ever exposes the bytes
+        which existed when it was opened; later appends, deletions and
+        recreations of the same key are invisible to it.  Opening a new
+        window sees the current version.
+        """
+        return ReadWindow(self, key, blocksize=blocksize, lock=lock)
+
+    def read_window(self, key, blocksize=None, lock=True):
+        return self.open_window(key, blocksize=blocksize, lock=lock)
+
+    def get_window(self, key, blocksize=None, lock=True):
+        return self.open_window(key, blocksize=blocksize, lock=lock)
+
+    def window(self, key, blocksize=None, lock=True):
+        return self.open_window(key, blocksize=blocksize, lock=lock)
+
+    def reader(self, key, blocksize=None, lock=True):
+        return self.open_window(key, blocksize=blocksize, lock=lock)
+
+    def open_read(self, key, blocksize=None, lock=True):
+        return self.open_window(key, blocksize=blocksize, lock=lock)
+
+    def iter_window(self, key, blocksize=None, position=0, lock=True):
+        """Iterate over the blocks of a snapshot of ``key``.
+
+        Returns ``(data, position)`` pairs; the iteration stops at the end of
+        the snapshot captured when it starts.
+        """
+        return self.open_window(key, blocksize=blocksize,
+                                lock=lock).iter_chunks(position=position)
+
+    def read_blocks(self, key, blocksize=None, position=0, lock=True):
+        return self.iter_window(key, blocksize=blocksize, position=position,
+                                lock=lock)
+
+    def read_at(self, key, position=0, size=None, blocksize=None, lock=True):
+        return self.read(key, blocksize=blocksize, position=position,
+                         size=size, lock=lock)
+
+    def read(self, key, blocksize=None, position=0, size=None, lock=True):
+        """Read one block from a fresh window.
+
+        This is a stateless convenience wrapper around
+        :meth:`open_window`.  Use :meth:`open_window` when several blocks
+        must come from one consistent snapshot.
+        """
+        with self.open_window(key, blocksize=blocksize, lock=lock) as window:
+            return window.read(size=size, position=position)
 
     def __exit__(self, *args):
         self.drop()

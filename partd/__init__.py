@@ -1,6 +1,21 @@
 from contextlib import suppress
 
 from .file import File
+from .window import (
+    DEFAULT_BLOCKSIZE,
+    ReadResult,
+    ReadStatus,
+    ReadWindow,
+    Window,
+    open_window,
+    DATA,
+    OK,
+    EMPTY,
+    MISSING,
+    WINDOW_END,
+    END,
+    EOF,
+)
 from .dict import Dict
 from .buffer import Buffer
 from .encode import Encode

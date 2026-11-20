@@ -3019,6 +3019,236 @@ class HistoricForeignKeyTest(TestCase):
             )
         )
 
+    HISTORICAL_MEMBER_ASSIGNMENTS_AT_CUTOFF = {
+        "A": {
+            "alpha": ["alpha-cutoff-1", "alpha-cutoff-2"],
+            "beta": ["beta-cutoff-1"],
+        },
+        "B": {},
+    }
+    CURRENT_MEMBER_ASSIGNMENTS = {
+        "A": {"gamma": []},
+        "B": {
+            "alpha": [
+                "alpha-current-1",
+                "alpha-cutoff-1",
+                "alpha-cutoff-2",
+            ]
+        },
+    }
+
+    def create_historical_export_fixture(self):
+        Organization = TestOrganizationWithHistory
+        Member = TestHistoricParticipantToHistoricOrganization
+        Assignment = TestHistoricSubParticipantToHistoricParticipant
+        UntrackedParticipant = TestParticipantToHistoricOrganization
+
+        project_a = Organization.objects.create(name="A")
+        project_b = Organization.objects.create(name="B")
+        alpha = Member.objects.create(name="alpha", organization=project_a)
+        beta = Member.objects.create(name="beta", organization=project_a)
+        Assignment.objects.create(name="alpha-cutoff-1", participant=alpha)
+        Assignment.objects.create(name="alpha-cutoff-2", participant=alpha)
+        beta_assignment = Assignment.objects.create(
+            name="beta-cutoff-1", participant=beta
+        )
+        untracked_a = UntrackedParticipant.objects.create(
+            name="plain-a", organization=project_a
+        )
+        UntrackedParticipant.objects.create(name="plain-b", organization=project_b)
+
+        cutoff = timezone.now()
+
+        alpha.organization = project_b
+        alpha.save()
+        Assignment.objects.create(name="alpha-current-1", participant=alpha)
+        beta_assignment.delete()
+        beta.delete()
+        Member.objects.create(name="gamma", organization=project_a)
+        untracked_a.name = "plain-a-current"
+        untracked_a.save()
+
+        return cutoff
+
+    @staticmethod
+    def member_assignment_report(projects):
+        return {
+            project.name: {
+                member.name: sorted(
+                    assignment.name
+                    for assignment in member.historic_sub_participants.all()
+                )
+                for member in project.historic_participants.all()
+            }
+            for project in projects
+        }
+
+    def assertMemberAssignmentReport(self, actual, expected, context):
+        self.assertEqual(
+            sorted(actual),
+            sorted(expected),
+            f"{context}: wrong parent projects; got {actual!r}",
+        )
+        for project_name, expected_members in expected.items():
+            actual_members = actual.get(project_name, {})
+            self.assertEqual(
+                sorted(actual_members),
+                sorted(expected_members),
+                f"{context}: parent project {project_name!r} received members "
+                f"from the wrong project; got {actual_members!r}",
+            )
+            for member_name, expected_assignments in expected_members.items():
+                self.assertEqual(
+                    actual_members[member_name],
+                    expected_assignments,
+                    f"{context}: child member {member_name!r} in project "
+                    f"{project_name!r} received assignments from the current "
+                    f"version; got {actual_members[member_name]!r}",
+                )
+
+    def test_as_of_nested_prefetch_matches_individual_reverse_access(self):
+        cutoff = self.create_historical_export_fixture()
+
+        historical_projects = list(
+            TestOrganizationWithHistory.history.as_of(cutoff).filter(
+                name__in=["A", "B"]
+            )
+        )
+        individually_loaded = self.member_assignment_report(historical_projects)
+        self.assertMemberAssignmentReport(
+            individually_loaded,
+            self.HISTORICAL_MEMBER_ASSIGNMENTS_AT_CUTOFF,
+            "individual reverse access",
+        )
+
+        with self.assertNumQueries(3):
+            prefetched_projects = list(
+                TestOrganizationWithHistory.history.as_of(cutoff)
+                .filter(name__in=["A", "B"])
+                .prefetch_related(
+                    "historic_participants__historic_sub_participants"
+                )
+            )
+            prefetched = self.member_assignment_report(prefetched_projects)
+
+        self.assertMemberAssignmentReport(
+            prefetched,
+            self.HISTORICAL_MEMBER_ASSIGNMENTS_AT_CUTOFF,
+            "nested prefetch",
+        )
+        self.assertEqual(prefetched, individually_loaded)
+        for project in prefetched_projects:
+            self.assertIn("historic_participants", project._prefetched_objects_cache)
+            for member in project.historic_participants.all():
+                self.assertIn(
+                    "historic_sub_participants",
+                    member._prefetched_objects_cache,
+                )
+
+    def test_as_of_nested_prefetch_parent_order_does_not_change_membership(self):
+        cutoff = self.create_historical_export_fixture()
+        reports = {}
+
+        for ordering, expected_order in (
+            ("name", ["A", "B"]),
+            ("-name", ["B", "A"]),
+        ):
+            with self.assertNumQueries(3):
+                projects = list(
+                    TestOrganizationWithHistory.history.as_of(cutoff)
+                    .filter(name__in=["A", "B"])
+                    .order_by(ordering)
+                    .prefetch_related(
+                        "historic_participants__historic_sub_participants"
+                    )
+                )
+                reports[ordering] = self.member_assignment_report(projects)
+
+            self.assertEqual([project.name for project in projects], expected_order)
+            self.assertMemberAssignmentReport(
+                reports[ordering],
+                self.HISTORICAL_MEMBER_ASSIGNMENTS_AT_CUTOFF,
+                f"nested prefetch ordered by {ordering!r}",
+            )
+
+        self.assertEqual(reports["name"], reports["-name"])
+
+    def test_current_and_untracked_relations_are_not_historical_evidence(self):
+        cutoff = self.create_historical_export_fixture()
+
+        current_projects = list(
+            TestOrganizationWithHistory.objects.filter(name__in=["A", "B"])
+            .order_by("-name")
+            .prefetch_related("historic_participants__historic_sub_participants")
+        )
+        self.assertEqual([project.name for project in current_projects], ["B", "A"])
+        current_report = self.member_assignment_report(current_projects)
+        self.assertMemberAssignmentReport(
+            current_report,
+            self.CURRENT_MEMBER_ASSIGNMENTS,
+            "current view",
+        )
+        self.assertNotEqual(
+            current_report, self.HISTORICAL_MEMBER_ASSIGNMENTS_AT_CUTOFF
+        )
+
+        historic_projects = {
+            project.name: project
+            for project in TestOrganizationWithHistory.history.as_of(
+                cutoff
+            ).filter(name__in=["A", "B"])
+        }
+        historical_report = self.member_assignment_report(
+            historic_projects.values()
+        )
+        self.assertMemberAssignmentReport(
+            historical_report,
+            self.HISTORICAL_MEMBER_ASSIGNMENTS_AT_CUTOFF,
+            "historical view",
+        )
+
+        untracked_relations = {
+            project_name: sorted(
+                participant.name for participant in project.participants.all()
+            )
+            for project_name, project in historic_projects.items()
+        }
+        self.assertEqual(
+            untracked_relations,
+            {"A": ["plain-a-current"], "B": ["plain-b"]},
+        )
+
+        with self.assertNumQueries(2):
+            untracked_prefetched_projects = list(
+                TestOrganizationWithHistory.history.as_of(cutoff)
+                .filter(name__in=["A", "B"])
+                .order_by("-name")
+                .prefetch_related("participants")
+            )
+            untracked_prefetched = {
+                project.name: sorted(
+                    participant.name for participant in project.participants.all()
+                )
+                for project in untracked_prefetched_projects
+            }
+        self.assertEqual(untracked_prefetched, untracked_relations)
+        for project in untracked_prefetched_projects:
+            self.assertIn("participants", project._prefetched_objects_cache)
+
+        self.assertNotIn("gamma", historical_report["A"])
+        self.assertNotIn(
+            "alpha-current-1", historical_report.get("B", {}).get("alpha", [])
+        )
+        untracked_names = {
+            name for names in untracked_relations.values() for name in names
+        }
+        historical_member_names = {
+            member
+            for members in historical_report.values()
+            for member in members
+        }
+        self.assertFalse(untracked_names & historical_member_names)
+
 
 class HistoricOneToOneFieldTest(TestCase):
     """

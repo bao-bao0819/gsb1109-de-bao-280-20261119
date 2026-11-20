@@ -95,6 +95,13 @@ class HistoricalQuerySet(QuerySet):
         super()._fetch_all()
         self._instanceize()
 
+    def _prefetch_related_objects(self) -> None:
+        # Prefetch lookups are resolved against the original model, but this
+        # queryset initially holds historical records. Materialize the original
+        # instances first so ``prefetch_related()`` can find their relations.
+        self._instanceize()
+        super()._prefetch_related_objects()
+
     def _instanceize(self) -> None:
         """
         Convert the result cache to instances if possible and it has not already been

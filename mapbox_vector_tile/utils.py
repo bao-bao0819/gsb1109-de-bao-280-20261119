@@ -49,7 +49,7 @@ DEFAULT_ENCODE_OPTIONS = {
 DEFAULT_DECODE_OPTIONS = {"y_coord_down": False, "transformer": None, "geojson": True}
 
 
-def _get_options(layer_options, default_options, global_default_options, operation_name):
+def _get_options(layer_options, default_options, global_default_options, operation_name, optional_keys=()):
     """Get the entire options dictionary filled using: first, the provided `layer_options`, then the provided
     `default_options` and finally filled using the provided `global_default_options`.
 
@@ -66,6 +66,10 @@ def _get_options(layer_options, default_options, global_default_options, operati
         operation_name:
             The name of the current operation.
 
+        optional_keys:
+            Additional option names which are accepted but are not part of the
+            global defaults.
+
     Returns:
         The options to use to operate the layer.
     """
@@ -80,7 +84,7 @@ def _get_options(layer_options, default_options, global_default_options, operati
     result.update(layer_options)
 
     result_keys = set(result.keys())
-    expected_keys = set(global_default_options.keys())
+    expected_keys = set(global_default_options.keys()).union(optional_keys)
     extra_keys = result_keys.difference(expected_keys)
     if extra_keys:
         extra_keys_msg = ", ".join(f"{str(x)!r}" for x in sorted(extra_keys))
@@ -103,11 +107,14 @@ def get_encode_options(layer_options, default_options):
     Returns:
         The options to use for encoding the layer.
     """
+    from mapbox_vector_tile import clipping
+
     result = _get_options(
         layer_options=layer_options,
         default_options=default_options,
         global_default_options=DEFAULT_ENCODE_OPTIONS,
         operation_name="encoding",
+        optional_keys=clipping.OPTIONAL_ENCODE_OPTIONS,
     )
 
     # Checks on final values

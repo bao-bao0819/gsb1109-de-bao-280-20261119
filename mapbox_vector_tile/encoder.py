@@ -8,6 +8,7 @@ from shapely.ops import transform
 from shapely.wkb import loads as load_wkb
 from shapely.wkt import loads as load_wkt
 
+from mapbox_vector_tile.clipping import resolve_clipper
 from mapbox_vector_tile.geom_encoder import GeometryEncoder
 from mapbox_vector_tile.Mapbox import vector_tile_pb2 as vector_tile
 from mapbox_vector_tile.polygon import make_it_valid
@@ -58,6 +59,8 @@ class VectorTile:
         self.seen_values_idx = {}
         self.seen_values_bool_idx = {}
 
+        clipper = resolve_clipper(self.layer_options)
+
         for feature in features:
             # skip missing or empty geometries
             geometry_spec = feature.get("geometry")
@@ -70,6 +73,11 @@ class VectorTile:
 
             if shape.is_empty:
                 continue
+
+            if clipper is not None:
+                shape = clipper.clip(shape)
+                if shape is None or shape.is_empty:
+                    continue
 
             if self.layer_options["quantize_bounds"]:
                 shape = self.quantize(shape)

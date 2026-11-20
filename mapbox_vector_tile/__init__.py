@@ -78,6 +78,26 @@ def encode(layers, per_layer_options=None, default_options=None, **kwargs):
             * `check_winding_order`: it forces the check of the winding order for polygons. Default to True.
             * `max_geometry_validate_tries`: the number of tries when trying to enforce the good winding order. Default
             to 5.
+            * `clip_bounds`: optional physical bounds `(minx, miny, maxx, maxy)` used to clip geometries before they
+            are quantized. Default to `None`, which keeps the historical behaviour (no clipping). A layer which
+            provides `clip_bounds` is clipped even if `quantize_bounds` is not the same rectangle; this makes it
+            possible to release a tile whose geometry is clipped to one rectangle while its own extent differs.
+            * `shared_edge`: optional description of the edge shared with a neighbouring tile. It is a mapping with
+            `axis` (`"x"` or `"y"`), `position` (in physical coordinates), `owner` (`"low"`/`"high"`, or named
+            sides such as `"left"`/`"right"`), and `ticks` (a physical tick spacing, an `(origin, spacing)` pair,
+            or an explicit sequence of physical positions). A shared edge makes it possible to state which side
+            owns segments that lie exactly on the edge, and to agree on physical junction coordinates. Vertices on
+            the edge are snapped to the physical tick grid before quantization, so they match across tiles even
+            when the two layers use different extents. Default to `None`.
+
+            The `shared_edge` option may also be supplied inside `clip_bounds` as a mapping containing `bounds`
+            and `shared_edge` keys. Flat options such as `shared_edge_axis`, `shared_edge_owner` and
+            `shared_edge_ticks` are accepted as a shorthand.
+
+            The `clip_bounds` option may alternatively be named `clip_box`, `clip_rect`, `clip_region` or
+            `tile_bounds`. Setting `clip` to `True` clips to `quantize_bounds`. Shared edge clipping requires
+            physical bounds, so a plain `shared_edge` without `clip_bounds` (or `quantize_bounds`) raises a
+            `ClipError`.
     """
     if kwargs:
         warnings.warn("`encode` signature has changed, use `default_options` instead", DeprecationWarning, stacklevel=2)

@@ -2,6 +2,12 @@
 
 _In development_
 
+- Add optional geometry clipping via `clip_bounds`, with a `shared_edge` declaration for
+  shared-edge ownership and physical tick grids. Neighbouring tiles can now agree on the same
+  physical junction even when their local extents differ, on-edge segments are written by one
+  side only, and lines which merely touch the edge do not become spurious points on the other
+  side. Encoding without these options is unchanged.
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

@@ -270,6 +270,74 @@ mapbox_vector_tile.encode([
     ], default_options={"quantize_bounds": (0.0, 0.0, 10.0, 10.0), "extents":50})
 ```
 
+### Clipping at shared tile edges
+
+Tiles are often produced by independent offline jobs. A plain intersection with the tile
+rectangle causes two problems at the edge two tiles share:
+
+- a road which only touches the edge becomes a point, and that point can be written by both tiles;
+- a road which runs along the edge is written by both tiles.
+
+The encoder accepts an optional `clip_bounds` and an optional `shared_edge`. Clipping is
+performed in the source (physical) coordinate system, before quantization:
+
+```python
+shared_edge = {
+    "axis": "x",            # a vertical edge (use "y" for a horizontal one)
+    "position": 10.0,       # physical coordinate of the edge
+    "owner": "low",         # "low"/"left" owns segments exactly on the edge
+    "ticks": 1.0,           # physical tick spacing along the edge
+}
+
+mapbox_vector_tile.encode(
+    {"name": "roads", "features": [{"geometry": "LINESTRING (8 2, 10 2, 10 8, 12 8)"}]},
+    default_options={
+        "clip_bounds": (0.0, 0.0, 10.0, 20.0),
+        "quantize_bounds": (0.0, 0.0, 10.0, 20.0),
+        "extents": 100,
+        "shared_edge": shared_edge,
+    },
+)
+```
+
+The left and right tiles use the same `shared_edge` declaration but their own `clip_bounds`,
+`quantize_bounds` and `extents`. A road which crosses the edge is split at the same physical
+junction on both tiles. A road which runs along the edge is written only by the tile declared
+as the owner. A road which touches the edge and turns back stays entirely in its own tile and
+does not become a point on the other side.
+
+`ticks` is always expressed in physical coordinates - it is a value the two jobs agree on, not
+the local integer grid of either tile. It can be:
+
+- a spacing (`1.0`), or an `(origin, spacing)` pair;
+- an explicit sequence of physical positions (`[0.0, 2.0, 4.0]`);
+- a mapping with `spacing`/`origin` or `values`.
+
+A declaration which explicitly says its ticks are local tile integers raises a `ClipError`:
+
+```python
+{"spacing": 1, "units": "local"}   # raises ClipError
+```
+
+Vertices which land on the shared edge are snapped to the physical tick grid before
+quantization. Because the snap happens in physical space, junctions agree after decoding even
+when the two layers use different extents. Only junctions (line ends and the ends of an
+on-edge run) are snapped; a touch-and-return vertex keeps its source position because it is not
+shared with the neighbouring tile.
+
+The option may also be written as a single mapping:
+
+```python
+{"clip": {"bounds": (0.0, 0.0, 10.0, 20.0),
+          "shared_edge": {"axis": "x", "position": 10.0, "owner": "low", "ticks": 1.0}}}
+```
+
+Flat spellings (`clip_bounds`, `edge`, `edge_owner`, `edge_ticks`, ...) are accepted as a
+shorthand. When no clipping option is provided, encoding keeps the historical quantization,
+extent and y-direction behaviour unchanged. Annotation layers which need a different range
+should be encoded with their own `quantize_bounds`/`extents` (and `clip_bounds` if they should
+be clipped); the roads layer's shared edge does not leak into them.
+
 ## Decoding
 
 Decode method takes in a valid google.protobuf.message Tile and returns decoded string in the following format:

@@ -8,7 +8,8 @@ from shapely import wkt
 
 import mapbox_vector_tile
 from mapbox_vector_tile import decode, encode
-from mapbox_vector_tile.utils import DEFAULT_ENCODE_OPTIONS, get_encode_options
+from mapbox_vector_tile.Mapbox import vector_tile_pb2 as vector_tile
+from mapbox_vector_tile.utils import DEFAULT_ENCODE_OPTIONS, get_encode_options, zig_zag_decode
 
 
 class BaseTestCase(unittest.TestCase):
@@ -576,6 +577,173 @@ class ExtentTest(unittest.TestCase):
         act_geom = act_feature["geometry"]
         exp_geom = {"type": "Point", "coordinates": [50, 50]}
         self.assertEqual(exp_geom, act_geom)
+
+
+class QuantizationOrderTest(unittest.TestCase):
+    @staticmethod
+    def _features():
+        return [
+            # x = y = 3 lands exactly on the half-grid in both layers: 1.5 with the odd
+            # layer's bounds and 0.5 with the even layer's bounds.
+            {"id": 1, "geometry": "POINT (3 3)", "properties": {}},
+            # Just below and just above the half-grid: 1.49 / 1.51 after the odd layer's
+            # scaling and 0.49 / 0.51 after the even layer's scaling.
+            {"id": 2, "geometry": "POINT (2.98 3.02)", "properties": {}},
+            # Just above and just below the half-grid with the same per-layer scaling.
+            {"id": 3, "geometry": "POINT (3.02 2.98)", "properties": {}},
+            # The middle two vertices land in the same quantized cell in both layers.
+            {"id": 4, "geometry": "LINESTRING (2.2 2.2, 4.4 3.2, 4.8 3.4, 7 7)", "properties": {}},
+        ]
+
+    @staticmethod
+    def _encode():
+        return encode(
+            [
+                {"name": "odd", "features": QuantizationOrderTest._features()},
+                {"name": "even", "features": QuantizationOrderTest._features()},
+            ],
+            per_layer_options={
+                # extent 7 is odd: 1.5 rounds to 2, and 7 - 2 = 5 differs from round(7 - 1.5) = 6.
+                "odd": {
+                    "extents": 7,
+                    "quantize_bounds": (0.0, 0.0, 14.0, 14.0),
+                    "y_coord_down": False,
+                },
+                # extent 8 is even: the same coordinates map to different grid positions.
+                "even": {
+                    "extents": 8,
+                    "quantize_bounds": (2.0, 2.0, 18.0, 18.0),
+                    "y_coord_down": True,
+                },
+            },
+            # Each layer's own Y option and extent must override this default.
+            default_options={"y_coord_down": True, "extents": 4096},
+        )
+
+    @staticmethod
+    def _absolute_coords(geometry):
+        coords = []
+        x = y = 0
+        i = 0
+        while i < len(geometry):
+            command = geometry[i]
+            i += 1
+            cmd = command & 0x7
+            count = command >> 3
+            if cmd == 7:  # SEG_END
+                continue
+            for _ in range(count):
+                x += zig_zag_decode(geometry[i])
+                y += zig_zag_decode(geometry[i + 1])
+                i += 2
+                coords.append((x, y))
+        return coords
+
+    def test_decoded_geometry_matches_quantized_grid(self):
+        decoded = decode(self._encode())
+
+        def geometry_of(layer_name, feature_id):
+            return next(f["geometry"] for f in decoded[layer_name]["features"] if f["id"] == feature_id)
+
+        # Odd layer, bounds (0, 0, 14, 14) and extent 7: round first, then reflect y as 7 - y.
+        # The default decode flips it back, exposing the integer grid positions.
+        self.assertEqual({"type": "Point", "coordinates": [2, 2]}, geometry_of("odd", 1))
+        self.assertEqual({"type": "Point", "coordinates": [1, 2]}, geometry_of("odd", 2))
+        self.assertEqual({"type": "Point", "coordinates": [2, 1]}, geometry_of("odd", 3))
+        # The duplicate vertex is dropped by its quantized position, not its source position.
+        self.assertEqual(
+            {"type": "LineString", "coordinates": [[1, 1], [2, 2], [4, 4]]},
+            geometry_of("odd", 4),
+        )
+
+        # Even layer, bounds (2, 2, 18, 18) and extent 8. The layer asks for y_coord_down,
+        # so the encoder does not reflect y; decoding with the default flips it once.
+        # The half-grid y = 0.5 rounds to 0 (banker's rounding), hence the decoded y of 8.
+        self.assertEqual({"type": "Point", "coordinates": [0, 8]}, geometry_of("even", 1))
+        self.assertEqual({"type": "Point", "coordinates": [0, 7]}, geometry_of("even", 2))
+        self.assertEqual({"type": "Point", "coordinates": [1, 8]}, geometry_of("even", 3))
+        self.assertEqual(
+            {"type": "LineString", "coordinates": [[0, 8], [1, 7], [2, 6]]},
+            geometry_of("even", 4),
+        )
+
+    def test_protobuf_commands_show_round_then_y_flip(self):
+        pbf = self._encode()
+        tile = vector_tile.tile()
+        tile.ParseFromString(pbf)
+
+        layers = {layer.name: layer for layer in tile.layers}
+        self.assertEqual({"odd", "even"}, set(layers))
+
+        # Odd layer: extent 7, factor 1/2, y reflected after rounding.
+        # Quantized (x, y): (2, 2), (1, 2), (2, 1), then (1, 1), (2, 2), (4, 4).
+        # Stored y values are 7 - y: 5, 5, 6, then 6, 5, 3.
+        odd = layers["odd"]
+        self.assertEqual(7, odd.extent)
+        odd_commands = {feature.id: list(feature.geometry) for feature in odd.features}
+        self.assertEqual([9, 4, 10], odd_commands[1])
+        self.assertEqual([9, 2, 10], odd_commands[2])
+        self.assertEqual([9, 4, 12], odd_commands[3])
+        self.assertEqual([9, 2, 12, 18, 2, 1, 4, 3], odd_commands[4])
+        # Reflecting before rounding would turn y = 1.5 into 7 - 1.5 = 5.5 and store 6
+        # for the half-grid point, while rounding first stores 7 - 2 = 5.
+        self.assertNotEqual([9, 4, 12], odd_commands[1])
+
+        # Even layer: extent 8, factor 1/2, no reflection during encoding.
+        # Quantized (x, y): (0, 0), (0, 1), (1, 0), then (0, 0), (1, 1), (2, 2).
+        even = layers["even"]
+        self.assertEqual(8, even.extent)
+        even_commands = {feature.id: list(feature.geometry) for feature in even.features}
+        self.assertEqual([9, 0, 0], even_commands[1])
+        self.assertEqual([9, 0, 2], even_commands[2])
+        self.assertEqual([9, 2, 0], even_commands[3])
+        self.assertEqual([9, 0, 0, 18, 2, 2, 2, 2], even_commands[4])
+
+        # Decode the commands independently of the decoder to inspect the stored integers.
+        self.assertEqual([(2, 5)], self._absolute_coords(odd_commands[1]))
+        self.assertEqual([(1, 6), (2, 5), (4, 3)], self._absolute_coords(odd_commands[4]))
+        self.assertEqual([(0, 0)], self._absolute_coords(even_commands[1]))
+        self.assertEqual([(0, 0), (1, 1), (2, 2)], self._absolute_coords(even_commands[4]))
+
+    def test_read_back_layers_with_explicit_options(self):
+        pbf = self._encode()
+        decoded = decode(
+            pbf,
+            per_layer_options={
+                "odd": {"y_coord_down": False},
+                "even": {"y_coord_down": True},
+            },
+        )
+
+        self.assertEqual(7, decoded["odd"]["extent"])
+        self.assertEqual(8, decoded["even"]["extent"])
+
+        def geometry_of(layer_name, feature_id):
+            return next(f["geometry"] for f in decoded[layer_name]["features"] if f["id"] == feature_id)
+
+        # Explicit per-layer decode options reproduce each layer's encoding orientation.
+        self.assertEqual({"type": "Point", "coordinates": [2, 2]}, geometry_of("odd", 1))
+        self.assertEqual({"type": "Point", "coordinates": [0, 0]}, geometry_of("even", 1))
+        self.assertEqual(
+            {"type": "LineString", "coordinates": [[1, 1], [2, 2], [4, 4]]},
+            geometry_of("odd", 4),
+        )
+        self.assertEqual(
+            {"type": "LineString", "coordinates": [[0, 0], [1, 1], [2, 2]]},
+            geometry_of("even", 4),
+        )
+
+        # Decoding both layers with an explicit default (True) instead exposes what the
+        # encoder stored: the odd layer's reflected y and the even layer's unreflected y.
+        decoded_default = decode(pbf, default_options={"y_coord_down": True})
+        self.assertEqual(
+            {"type": "Point", "coordinates": [2, 5]},
+            next(f["geometry"] for f in decoded_default["odd"]["features"] if f["id"] == 1),
+        )
+        self.assertEqual(
+            {"type": "Point", "coordinates": [0, 0]},
+            next(f["geometry"] for f in decoded_default["even"]["features"] if f["id"] == 1),
+        )
 
 
 class InvalidGeometryTest(unittest.TestCase):

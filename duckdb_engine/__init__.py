@@ -233,6 +233,18 @@ class DuckDBIdentifierPreparer(PGIdentifierPreparer):
         return self.format_schema(schema)
 
 
+def _render_enum_type_def(labels: Iterable[str]) -> str:
+    """
+    Render enum labels the same way DuckDB renders an ENUM type definition,
+    e.g. ``ENUM('queued', 'it''s')``, so that the ``data_type`` reported by
+    ``duckdb_columns()`` can be matched back to a named type from
+    ``duckdb_types()`` without parsing any comma/quote containing labels.
+    """
+    return "ENUM({})".format(
+        ", ".join("'{}'".format(label.replace("'", "''")) for label in labels)
+    )
+
+
 class DuckDBNullType(sqltypes.NullType):
     def result_processor(
         self, dialect: RootDialect, coltype: sqltypes.TypeEngine
@@ -498,6 +510,165 @@ class Dialect(PGDialect_psycopg2):
         except NoSuchTableError:
             return False
 
+    def has_type(
+        self,
+        connection: "Connection",
+        type_name: str,
+        schema: Optional[str] = None,
+        **kw: Any,
+    ) -> bool:
+        """
+        Check for a type, supporting duckdb's multipart ``database.schema``
+        schema names (the postgres implementation this overrides only
+        understands plain schema names).
+        """
+        database_name, schema_name = self.identifier_preparer._separate(schema)
+        query = """
+            SELECT count(*) FROM duckdb_types()
+            WHERE type_name = :type_name
+            AND schema_name = coalesce(:schema_name, current_schema())
+            AND database_name = coalesce(:database_name, current_database())
+            """
+        rs = connection.execute(
+            text(query),
+            {
+                "type_name": type_name,
+                "schema_name": schema_name,
+                "database_name": database_name,
+            },
+        )
+        return bool(rs.scalar())
+
+    def get_columns(  # type: ignore[no-untyped-def]
+        self,
+        connection: "Connection",
+        table_name: str,
+        schema: Optional[str] = None,
+        **kw: Any,
+    ):
+        columns = super().get_columns(connection, table_name, schema, **kw)
+        return self._resolve_enum_columns(connection, schema, table_name, columns)
+
+    def _load_enum_type_defs(self, connection: "Connection") -> List[Dict[str, Any]]:
+        """
+        Load all named ENUM types as
+        ``{database, schema, name, labels}`` records, so that same-named
+        types in different databases/schemas never overwrite each other
+        regardless of reflection order.
+        """
+        try:
+            rs = connection.execute(
+                text(
+                    """
+                    SELECT database_name, schema_name, type_name, labels
+                    FROM duckdb_types()
+                    WHERE logical_type = 'ENUM' AND labels IS NOT NULL
+                    ORDER BY database_name, schema_name, type_name
+                    """
+                )
+            )
+            return [
+                {
+                    "database": database_name,
+                    "schema": schema_name,
+                    "name": type_name,
+                    "labels": list(labels),
+                }
+                for (database_name, schema_name, type_name, labels) in rs.fetchall()
+            ]
+        except Exception:
+            # duckdb version without duckdb_types()/labels support
+            return []
+
+    def _load_enum_column_defs(
+        self, connection: "Connection", schema: Optional[str], table_name: str
+    ) -> Dict[str, str]:
+        """Map column name to rendered type definition for a table."""
+        database_name, schema_name = self.identifier_preparer._separate(schema)
+        query = """
+            SELECT column_name, data_type FROM duckdb_columns()
+            WHERE NOT internal AND table_name = :table_name
+            """
+        params = {"table_name": table_name}
+        if schema_name is not None:
+            query += "AND schema_name = :schema_name\n"
+            params["schema_name"] = schema_name
+        if database_name is not None:
+            query += "AND database_name = :database_name\n"
+            params["database_name"] = database_name
+        try:
+            return dict(connection.execute(text(query), params).fetchall())
+        except Exception:
+            # duckdb version without duckdb_columns() support
+            return {}
+
+    def _resolve_enum_columns(
+        self,
+        connection: "Connection",
+        schema: Optional[str],
+        table_name: str,
+        columns: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Replace bare ``Enum()`` placeholders (duckdb's ``format_type`` only
+        reports ``enum`` for enum columns) with fully qualified
+        ``Enum(*labels, name=..., schema=...)`` types.
+        """
+        enum_columns = [
+            col
+            for col in columns
+            if isinstance(col["type"], sqltypes.Enum) and not col["type"].enums
+        ]
+        if not enum_columns:
+            return columns
+
+        column_defs = self._load_enum_column_defs(connection, schema, table_name)
+        if not column_defs:
+            return columns
+
+        types_by_def: Dict[str, List[Dict[str, Any]]] = {}
+        for rec in self._load_enum_type_defs(connection):
+            types_by_def.setdefault(_render_enum_type_def(rec["labels"]), []).append(
+                rec
+            )
+        if not types_by_def:
+            return columns
+
+        database_name, schema_name = self.identifier_preparer._separate(schema)
+
+        for col in enum_columns:
+            candidates = types_by_def.get(column_defs.get(col["name"], ""))
+            if not candidates:
+                continue
+            rec = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if (candidate["database"], candidate["schema"])
+                    == (database_name, schema_name)
+                ),
+                None,
+            ) or next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate["schema"] == schema_name
+                ),
+                candidates[0],
+            )
+            if database_name is not None:
+                # reflection schema was given as "database.schema", so keep
+                # the enum type qualified with its own catalog as well
+                enum_schema = self.identifier_preparer.quote_schema(
+                    ".".join([rec["database"], rec["schema"]])
+                )
+            else:
+                enum_schema = self.identifier_preparer.quote_schema(rec["schema"])
+            col["type"] = sqltypes.Enum(
+                *rec["labels"], name=rec["name"], schema=enum_schema
+            )
+        return columns
+
     def get_indexes(
         self,
         connection: "Connection",
@@ -628,6 +799,14 @@ class Dialect(PGDialect_psycopg2):
         )
 
         columns = self._get_columns_info(rows, domains, enums, schema)  # type: ignore[attr-defined]
+
+        grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+        for key, column in columns.items():
+            table_name = key[-1]
+            table_schema = key[-2] if len(key) > 1 else schema
+            grouped.setdefault((table_schema, table_name), []).append(column)
+        for (table_schema, table_name), cols in grouped.items():
+            self._resolve_enum_columns(connection, table_schema, table_name, cols)
 
         return columns.items()
 

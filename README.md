@@ -126,6 +126,28 @@ header of the GeoPackage geometry:
 If an integer SRID identifier is present in a `'meta'` key (like `'meta': {'srid': 4326}`), then the SRID will be included in the
 GeoPackage header.
 
+### Explicit axes: Z versus M
+
+GeoJSON has no way to distinguish a third value that is elevation (`Z`) from
+one that is a linear reference (`M`). GeoMet carries that distinction on the
+geometry object with a `'dimensions'` key:
+
+    >>> wkt.loads('LINESTRING M (30 10 5, 10 30 7)')
+    {'type': 'LineString', 'coordinates': [[30.0, 10.0, 5.0], [10.0, 30.0, 7.0]], 'dimensions': 'M'}
+    >>> wkt.dumps({'type': 'LineString', 'coordinates': [[30.0, 10.0, 5.0]], 'dimensions': 'M'}, decimals=0)
+    'LINESTRING M (30 10 5)'
+
+The key is JSON-safe, so an object can be persisted and read back without
+losing its axis identity. Supported values are `2D`, `Z`, `M`, and `ZM`;
+`XYZ`, `XYM`, and `XYZM` are accepted as aliases. `wkt` and `wkb` both write the
+declared WKT tag and the corresponding WKB type flag. An explicit `M` is
+never converted to `ZM`, and a real `ZM` zero-height value is preserved.
+
+Objects **without** a `'dimensions'` key keep the historical convention: the
+number of values per vertex is used (2 → `2D`, 3 → `Z`, 4 → `ZM`). When a
+declaration *is* present, coordinates whose arity does not match it raise a
+`ValueError` instead of being silently reinterpreted by length.
+
 ## History
 
 This library was originally created as the result of a bug report related

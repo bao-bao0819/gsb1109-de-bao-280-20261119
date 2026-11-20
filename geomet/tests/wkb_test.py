@@ -14,6 +14,8 @@
 import unittest
 
 from geomet import wkb
+from geomet.wkb import WKB_M
+from geomet.wkb import WKB_ZM
 
 
 class WKBTestCase(unittest.TestCase):
@@ -118,14 +120,16 @@ class PointTestCase(unittest.TestCase):
 
     def test_loads_m(self):
         exp_pt = self.pt3d.copy()
-        exp_pt['coordinates'].insert(2, 0.0)
+        exp_pt['dimensions'] = 'M'
 
         pt_wkb = b'\x00\x00\x00\x07\xd1'
         pt_wkb += self.pt3d_wkb[5:]
         self.assertEqual(exp_pt, wkb.loads(pt_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.pt4d, wkb.loads(self.pt4d_wkb))
+        exp_pt = self.pt4d.copy()
+        exp_pt['dimensions'] = 'ZM'
+        self.assertEqual(exp_pt, wkb.loads(self.pt4d_wkb))
 
     def test_loads_2d_srid4326(self):
         self.assertEqual(self.pt2d_srid4326, wkb.loads(self.pt2d_srid4326_wkb))
@@ -212,15 +216,16 @@ class LineStringTestCase(unittest.TestCase):
 
     def test_loads_m(self):
         exp_ls = self.ls3d.copy()
-        for vert in exp_ls['coordinates']:
-            vert.insert(2, 0.0)
+        exp_ls['dimensions'] = 'M'
 
         ls_wkb = b'\x01\xd2\x07\x00\x00'
         ls_wkb += self.ls3d_wkb[5:]
         self.assertEqual(exp_ls, wkb.loads(ls_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.ls4d, wkb.loads(self.ls4d_wkb))
+        exp_ls = self.ls4d.copy()
+        exp_ls['dimensions'] = 'ZM'
+        self.assertEqual(exp_ls, wkb.loads(self.ls4d_wkb))
 
     def test_loads_2d_srid1234(self):
         self.assertEqual(self.ls2d_srid1234, wkb.loads(self.ls2d_srid1234_wkb))
@@ -424,9 +429,7 @@ class PolygonTestCase(unittest.TestCase):
 
     def test_loads_m(self):
         exp_poly = self.poly3d.copy()
-        for ring in exp_poly['coordinates']:
-            for vert in ring:
-                vert.insert(2, 0.0)
+        exp_poly['dimensions'] = 'M'
 
         poly_wkb = b'\x00\x00\x00\x07\xd3'
         poly_wkb += self.poly3d_wkb[5:]
@@ -434,7 +437,9 @@ class PolygonTestCase(unittest.TestCase):
         self.assertEqual(exp_poly, wkb.loads(poly_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.poly4d, wkb.loads(self.poly4d_wkb))
+        exp_poly = self.poly4d.copy()
+        exp_poly['dimensions'] = 'ZM'
+        self.assertEqual(exp_poly, wkb.loads(self.poly4d_wkb))
 
     def test_loads_2d_srid26918(self):
         self.assertEqual(
@@ -587,8 +592,7 @@ class MultiPointTestCase(unittest.TestCase):
 
     def test_loads_m(self):
         exp_mp = self.multipoint3d.copy()
-        for pt in exp_mp['coordinates']:
-            pt.insert(2, 0.0)
+        exp_mp['dimensions'] = 'M'
 
         mp_wkb = (
             b'\x01'  # little endian
@@ -618,7 +622,9 @@ class MultiPointTestCase(unittest.TestCase):
         self.assertEqual(exp_mp, wkb.loads(mp_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.multipoint4d, wkb.loads(self.multipoint4d_wkb))
+        exp_mp = self.multipoint4d.copy()
+        exp_mp['dimensions'] = 'ZM'
+        self.assertEqual(exp_mp, wkb.loads(self.multipoint4d_wkb))
 
     def test_loads_2d_srid664(self):
         self.assertEqual(
@@ -766,9 +772,7 @@ class MultiLineStringTestCase(unittest.TestCase):
 
     def test_loads_m(self):
         exp_mls = self.mls3d.copy()
-        for ls in exp_mls['coordinates']:
-            for vert in ls:
-                vert.insert(2, 0.0)
+        exp_mls['dimensions'] = 'M'
 
         mls_wkb = (
             b'\x00'
@@ -799,7 +803,9 @@ class MultiLineStringTestCase(unittest.TestCase):
         self.assertEqual(exp_mls, wkb.loads(mls_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.mls4d, wkb.loads(self.mls4d_wkb))
+        exp_mls = self.mls4d.copy()
+        exp_mls['dimensions'] = 'ZM'
+        self.assertEqual(exp_mls, wkb.loads(self.mls4d_wkb))
 
     def test_loads_2d_srid4326(self):
         self.assertEqual(
@@ -1100,10 +1106,7 @@ class MultiPolygonTestCase(unittest.TestCase):
 
     def test_loads_m(self):
         exp_mpoly = self.mpoly3d.copy()
-        for polygon in exp_mpoly['coordinates']:
-            for ring in polygon:
-                for vert in ring:
-                    vert.insert(2, 0.0)
+        exp_mpoly['dimensions'] = 'M'
 
         mpoly_wkb = (
             b'\x01'  # little endian
@@ -1167,7 +1170,9 @@ class MultiPolygonTestCase(unittest.TestCase):
         self.assertEqual(exp_mpoly, wkb.loads(mpoly_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.mpoly4d, wkb.loads(self.mpoly4d_wkb))
+        exp_mpoly = self.mpoly4d.copy()
+        exp_mpoly['dimensions'] = 'ZM'
+        self.assertEqual(exp_mpoly, wkb.loads(self.mpoly4d_wkb))
 
     def test_loads_2d_srid4326(self):
         self.assertEqual(
@@ -1316,13 +1321,17 @@ class GeometryCollectionTestCase(unittest.TestCase):
         self.assertEqual(self.gc3d, wkb.loads(self.gc3d_wkb))
 
     def test_loads_m(self):
-        exp_gc = dict(type='GeometryCollection', geometries=[
-            dict(type='Point', coordinates=[0.0, 1.0, 0.0, 2.0]),
-            dict(type='LineString', coordinates=[
-                [102.0, 2.0, 0.0, 6.0], [103.0, 3.0, 0.0, 7.0],
-                [104.0, 4.0, 0.0, 8.0]
-            ]),
-        ])
+        exp_gc = dict(
+            type='GeometryCollection',
+            dimensions='M',
+            geometries=[
+                dict(type='Point', coordinates=[0.0, 1.0, 2.0],
+                     dimensions='M'),
+                dict(type='LineString', coordinates=[
+                    [102.0, 2.0, 6.0], [103.0, 3.0, 7.0],
+                    [104.0, 4.0, 8.0]
+                ], dimensions='M'),
+            ])
         gc_wkb = (
             b'\x01'  # little endian
             b'\xd7\x07\x00\x00'
@@ -1348,7 +1357,104 @@ class GeometryCollectionTestCase(unittest.TestCase):
         self.assertEqual(exp_gc, wkb.loads(gc_wkb))
 
     def test_loads_zm(self):
-        self.assertEqual(self.gc4d, wkb.loads(self.gc4d_wkb))
+        exp_gc = dict(
+            type='GeometryCollection',
+            dimensions='ZM',
+            geometries=[
+                dict(type='Point', coordinates=[0.0, 1.0, 2.0, 3.0],
+                     dimensions='ZM'),
+                dict(type='LineString', coordinates=[
+                    [102.0, 2.0, 6.0, 10.0], [103.0, 3.0, 7.0, 11.0],
+                    [104.0, 4.0, 8.0, 12.0]
+                ], dimensions='ZM'),
+            ])
+        self.assertEqual(exp_gc, wkb.loads(self.gc4d_wkb))
 
     def test_loads_2d_srid1234(self):
         self.assertEqual(self.gc2d_srid1234, wkb.loads(self.gc2d_srid1234_wkb))
+
+
+class AxisDeclarationTestCase(unittest.TestCase):
+    """WKB type flags must agree with the source's explicit axis."""
+
+    M = 'LINESTRING M (30 10 5, 10 30 7, 40 40 9)'
+    ZM = 'LINESTRING ZM (30 10 0 5, 10 30 0 7, 40 40 0 9)'
+
+    def test_m_type_flag(self):
+        from geomet import wkt
+        m = wkt.loads(self.M)
+        encoded = wkb.dumps(m, big_endian=True)
+        self.assertEqual(WKB_M['LineString'], encoded[1:5])
+        self.assertEqual(m, wkb.loads(encoded))
+
+    def test_zm_type_flag(self):
+        from geomet import wkt
+        zm = wkt.loads(self.ZM)
+        encoded = wkb.dumps(zm, big_endian=True)
+        self.assertEqual(WKB_ZM['LineString'], encoded[1:5])
+        self.assertEqual(zm, wkb.loads(encoded))
+
+    def test_m_is_not_promoted_to_zm(self):
+        from geomet import wkt
+        m = wkt.loads(self.M)
+        back = wkb.loads(wkb.dumps(m))
+        self.assertEqual('M', back['dimensions'])
+        self.assertEqual(3, len(back['coordinates'][0]))
+
+        zm = wkt.loads(self.ZM)
+        back_zm = wkb.loads(wkb.dumps(zm))
+        self.assertEqual('ZM', back_zm['dimensions'])
+        self.assertEqual(0.0, back_zm['coordinates'][0][2])
+        self.assertEqual(5.0, back_zm['coordinates'][0][3])
+
+    def test_little_endian_m(self):
+        from geomet import wkt
+        m = wkt.loads(self.M)
+        encoded = wkb.dumps(m, big_endian=False)
+        self.assertEqual(WKB_M['LineString'][::-1], encoded[1:5])
+        self.assertEqual(m, wkb.loads(encoded))
+
+    def test_m_declared_mismatch_rejected(self):
+        bad = dict(
+            type='LineString',
+            coordinates=[[0.0, 1.0]],
+            dimensions='M',
+        )
+        with self.assertRaises(ValueError):
+            wkb.dumps(bad)
+
+    def test_declared_m_not_inferred_from_length(self):
+        # A three-value explicit M must not be silently switched to Z.
+        from geomet import wkt
+        m = dict(type='LineString',
+                 coordinates=[[0.0, 1.0, 2.0]],
+                 dimensions='M')
+        self.assertEqual(
+            b'\x00\x00\x07\xd2',
+            wkb.dumps(m)[1:5],
+        )
+        self.assertEqual(m, wkb.loads(wkb.dumps(m)))
+        self.assertEqual(
+            'LINESTRING M (0 1 2)', wkt.dumps(m, decimals=0))
+
+    def test_collection_preserves_measure(self):
+        gc = dict(
+            type='GeometryCollection',
+            geometries=[
+                dict(type='LineString',
+                     coordinates=[[0.0, 0.0, 1.0], [1.0, 1.0, 2.0]],
+                     dimensions='M'),
+                dict(type='LineString',
+                     coordinates=[[0.0, 0.0, 3.0], [1.0, 1.0, 4.0]]),
+            ],
+        )
+        encoded = wkb.dumps(gc, big_endian=True)
+        self.assertEqual(WKB_M['GeometryCollection'], encoded[1:5])
+        back = wkb.loads(encoded)
+        self.assertEqual('M', back['dimensions'])
+        self.assertEqual('M', back['geometries'][0]['dimensions'])
+        self.assertEqual(
+            [[0.0, 0.0, 1.0], [1.0, 1.0, 2.0]],
+            back['geometries'][0]['coordinates'],
+        )
+        self.assertNotIn('dimensions', back['geometries'][1])

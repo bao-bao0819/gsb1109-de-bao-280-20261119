@@ -1253,3 +1253,87 @@ class TestMisc(unittest.TestCase):
 
         expected = 'Expected "b" but found "a"'
         self.assertEqual(expected, str(ar.exception))
+
+
+class AxisDeclarationTestCase(unittest.TestCase):
+    """Explicit axis semantics must survive textual round trips."""
+
+    M = 'LINESTRING M (30 10 5, 10 30 7, 40 40 9)'
+    ZM = 'LINESTRING ZM (30 10 0 5, 10 30 0 7, 40 40 0 9)'
+    LEGACY = 'LINESTRING (30 10 5, 10 30 7, 40 40 9)'
+
+    def test_loads_m(self):
+        self.assertEqual(
+            dict(
+                type='LineString',
+                coordinates=[[30.0, 10.0, 5.0], [10.0, 30.0, 7.0],
+                             [40.0, 40.0, 9.0]],
+                dimensions='M',
+            ),
+            wkt.loads(self.M),
+        )
+
+    def test_loads_zm_keeps_zero_height(self):
+        result = wkt.loads(self.ZM)
+        self.assertEqual('ZM', result['dimensions'])
+        self.assertEqual(0.0, result['coordinates'][0][2])
+
+    def test_loads_legacy_three_values_is_z(self):
+        result = wkt.loads(self.LEGACY)
+        self.assertNotIn('dimensions', result)
+        self.assertEqual(
+            [[30.0, 10.0, 5.0], [10.0, 30.0, 7.0], [40.0, 40.0, 9.0]],
+            result['coordinates'],
+        )
+
+    def test_m_and_zm_share_measure(self):
+        m = wkt.loads(self.M)
+        zm = wkt.loads(self.ZM)
+        self.assertEqual([5.0, 7.0, 9.0], [v[2] for v in m['coordinates']])
+        self.assertEqual([5.0, 7.0, 9.0], [v[3] for v in zm['coordinates']])
+
+    def test_dumps_m(self):
+        self.assertEqual(self.M, wkt.dumps(wkt.loads(self.M), decimals=0))
+
+    def test_dumps_zm(self):
+        self.assertEqual(self.ZM, wkt.dumps(wkt.loads(self.ZM), decimals=0))
+
+    def test_dumps_legacy_unchanged(self):
+        self.assertEqual(
+            self.LEGACY, wkt.dumps(wkt.loads(self.LEGACY), decimals=0))
+
+    def test_mismatched_arity_is_rejected(self):
+        bad = [
+            'LINESTRING M (0 1, 2 3 4)',
+            'LINESTRING ZM (0 1 2, 3 4 5)',
+            'POINT M (0 1 2 3)',
+        ]
+        for text in bad:
+            with self.assertRaises(ValueError):
+                wkt.loads(text)
+
+    def test_dumps_rejects_declared_mismatch(self):
+        obj = dict(
+            type='LineString',
+            coordinates=[[0.0, 1.0]],
+            dimensions='M',
+        )
+        with self.assertRaises(ValueError):
+            wkt.dumps(obj)
+
+    def test_collection_preserves_measure(self):
+        text = ('GEOMETRYCOLLECTION M ('
+                'LINESTRING M (0 0 1, 1 1 2),'
+                'LINESTRING M (0 0 3, 1 1 4))')
+        result = wkt.loads(text)
+        self.assertEqual('M', result['dimensions'])
+        self.assertEqual(
+            [{'type': 'LineString',
+              'coordinates': [[0.0, 0.0, 1.0], [1.0, 1.0, 2.0]],
+              'dimensions': 'M'},
+             {'type': 'LineString',
+              'coordinates': [[0.0, 0.0, 3.0], [1.0, 1.0, 4.0]],
+              'dimensions': 'M'}],
+            result['geometries'],
+        )
+        self.assertEqual(text, wkt.dumps(result, decimals=0))

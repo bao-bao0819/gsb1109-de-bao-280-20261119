@@ -15,6 +15,164 @@ import itertools
 import collections.abc as collections
 
 
+#: Number of coordinate values for each explicit axis declaration.
+DIMENSION_SIZES = {
+    '2D': 2,
+    'Z': 3,
+    'M': 3,
+    'ZM': 4,
+}
+
+#: Accepted spellings for explicit axis declarations.  The short labels are
+#: the ones used by WKT/WKB; the XYZ-based spellings make the axis order
+#: explicit and are useful when constructing objects by hand.
+_DIMENSION_ALIASES = {
+    '2D': '2D',
+    'XY': '2D',
+    'Z': 'Z',
+    'XYZ': 'Z',
+    'M': 'M',
+    'XYM': 'M',
+    'ZM': 'ZM',
+    'XYZM': 'ZM',
+}
+
+_DIMENSION_KEYS = ('dimensions', 'dimension', 'axis', 'axes')
+
+
+def normalize_dimension(value):
+    """
+    Normalize an explicit axis declaration to one of ``2D``, ``Z``, ``M`` or
+    ``ZM``.
+
+    Returns ``None`` when ``value`` is ``None``.  Raises ``ValueError`` for
+    unrecognized declarations so an inconsistent record is rejected instead
+    of being silently reinterpreted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        axes = [str(axis).upper() for axis in value]
+        value = ''.join(axes)
+    label = _DIMENSION_ALIASES.get(str(value).upper())
+    if label is None:
+        raise ValueError('Unsupported axis declaration: %r' % (value,))
+    return label
+
+
+def get_dimensions(obj):
+    """
+    Return the explicit axis declaration carried by a GeoJSON-like ``obj``.
+
+    Objects produced by :mod:`geomet.wkt` and :mod:`geomet.wkb` use the
+    top-level ``dimensions`` key.  ``meta`` and the singular/plural axis
+    spellings are also accepted so hand-built objects remain convenient.
+    Returns ``None`` when the object has no explicit declaration, which keeps
+    the historical calling convention intact.
+    """
+    declarations = []
+    for key in _DIMENSION_KEYS:
+        if key in obj and obj[key] is not None:
+            declarations.append(obj[key])
+
+    meta = obj.get('meta')
+    if isinstance(meta, collections.Mapping):
+        for key in _DIMENSION_KEYS:
+            if key in meta and meta[key] is not None:
+                declarations.append(meta[key])
+
+    if not declarations:
+        return None
+
+    labels = {normalize_dimension(value) for value in declarations}
+    if len(labels) != 1:
+        raise ValueError(
+            'Conflicting axis declarations: %s' % sorted(labels))
+    return labels.pop()
+
+
+def dimensions_size(dimension):
+    """Return the number of coordinate values for ``dimension``."""
+    return DIMENSION_SIZES[normalize_dimension(dimension)]
+
+
+def _check_vertex(vertex, expected_size, dimension):
+    if len(vertex) != expected_size:
+        raise ValueError(
+            'Coordinates do not match declared dimension %s: expected %d '
+            'values per vertex but found %d' % (
+                dimension, expected_size, len(vertex)))
+
+
+def validate_dimensions(obj, dimension=None):
+    """
+    Validate that every vertex in ``obj`` has the number of values required
+    by its explicit axis declaration.
+
+    ``dimension`` is the declaration inherited from an enclosing geometry
+    collection.  A missing declaration on both the object and its parent
+    means the historical, length-based convention applies and no arity check
+    is performed.
+    """
+    own = get_dimensions(obj)
+    if own is not None:
+        if dimension is not None and dimensions_size(own) != \
+                dimensions_size(dimension):
+            raise ValueError(
+                'Cannot mix dimensionality in a geometry: %s != %s' % (
+                    normalize_dimension(own), normalize_dimension(dimension)))
+        dimension = own
+
+    geom_type = obj['type']
+    if geom_type == 'GeometryCollection':
+        members = obj.get('geometries', [])
+        if dimension is None:
+            for geom in members:
+                validate_dimensions(geom)
+            return
+
+        expected_size = dimensions_size(dimension)
+        for geom in members:
+            member_dimension = get_dimensions(geom)
+            if member_dimension is not None and \
+                    dimensions_size(member_dimension) != expected_size:
+                raise ValueError(
+                    'Cannot mix dimensionality in a geometry: %s != %s' % (
+                        member_dimension, dimension))
+            validate_dimensions(geom, dimension)
+        return
+
+    if dimension is None:
+        expected_size = None
+    else:
+        expected_size = dimensions_size(dimension)
+
+    coords = obj.get('coordinates')
+    if not coords:
+        return
+
+    if geom_type == 'Point':
+        vertices = [coords]
+    elif geom_type in ('LineString', 'MultiPoint'):
+        vertices = coords
+    elif geom_type in ('Polygon', 'MultiLineString'):
+        vertices = [vertex for part in coords for vertex in part]
+    elif geom_type == 'MultiPolygon':
+        vertices = [
+            vertex
+            for polygon in coords
+            for ring in polygon
+            for vertex in ring
+        ]
+    else:
+        return
+
+    if expected_size is None:
+        return
+    for vertex in vertices:
+        _check_vertex(vertex, expected_size, dimension)
+
+
 def block_splitter(data, block_size):
     """
     Creates a generator by slicing ``data`` into chunks of ``block_size``.

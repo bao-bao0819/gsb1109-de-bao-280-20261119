@@ -36,6 +36,63 @@ POLYGON ((30 10, 40 40, 20 40, 10 20, 30 10))
 
 INVALID_WKT_FMT = 'Invalid WKT: `%s`'
 
+#: Axis declarations accepted after a WKT geometry type.
+_DIMENSION_TOKENS = {
+    '2D': '2D',
+    'Z': 'Z',
+    'M': 'M',
+    'ZM': 'ZM',
+}
+
+
+def _declared_prefix(geom_type, obj):
+    """
+    Return the geometry type keyword, including an explicit WKT axis tag.
+
+    Objects without an explicit declaration keep the historical output
+    (``LINESTRING``); an explicit ``2D``, ``Z``, ``M`` or ``ZM`` is preserved
+    in the geometry type keyword.
+    """
+    dimension = util.get_dimensions(obj)
+    if dimension is not None:
+        return '%s %s' % (geom_type, dimension)
+    return geom_type
+
+
+def _consume_dimension(tokens):
+    """
+    Consume an optional axis tag from the token stream.
+
+    :returns:
+        A ``(dimension, next_token)`` tuple.  ``next_token`` is the token
+        following the geometry type (or following the axis tag when one was
+        present).
+    """
+    token = next(tokens)
+    if token in _DIMENSION_TOKENS:
+        return _DIMENSION_TOKENS[token], next(tokens)
+    return None, token
+
+
+def _attach_dimension(result, dimension):
+    if dimension is not None:
+        result['dimensions'] = dimension
+    return result
+
+
+def _with_dimension(geom, dimension):
+    """
+    Return ``geom`` carrying the enclosing collection's explicit axis.
+
+    Members which already declare an axis are left untouched; validation has
+    already rejected conflicts by the time this is used.
+    """
+    if dimension is None or util.get_dimensions(geom) is not None:
+        return geom
+    geom = dict(geom)
+    geom['dimensions'] = dimension
+    return geom
+
 
 def dump(obj, dest_file):
     """
@@ -74,14 +131,17 @@ def dumps(obj, decimals=16):
         if exporter is None:
             _unsupported_geom_type(geom_type)
 
+        util.validate_dimensions(obj)
+
         # Check for empty cases
         if geom_type == 'GeometryCollection':
             if len(obj['geometries']) == 0:
-                return 'GEOMETRYCOLLECTION EMPTY'
+                return '%s EMPTY' % _declared_prefix(
+                    'GEOMETRYCOLLECTION', obj)
         else:
             # Geom has no coordinate values at all, and must be empty.
             if len(list(util.flatten_multi_dim(obj['coordinates']))) == 0:
-                return '%s EMPTY' % geom_type.upper()
+                return '%s EMPTY' % _declared_prefix(geom_type.upper(), obj)
     except KeyError:
         raise geomet.InvalidGeoJSONException('Invalid GeoJSON: %s' % obj)
 
@@ -140,17 +200,23 @@ def loads(string):
     if importer is None:
         _unsupported_geom_type(geom_type)
 
-    peek = next(tokens)
+    dimension, peek = _consume_dimension(tokens)
     if peek == 'EMPTY':
         if geom_type == 'GEOMETRYCOLLECTION':
-            return dict(type='GeometryCollection', geometries=[])
+            return _attach_dimension(
+                dict(type='GeometryCollection', geometries=[]), dimension)
         else:
-            return dict(type=_type_map_caps_to_mixed[geom_type],
-                        coordinates=[])
+            return _attach_dimension(
+                dict(type=_type_map_caps_to_mixed[geom_type], coordinates=[]),
+                dimension,
+            )
 
     # Put the peeked element back on the head of the token generator
     tokens = itertools.chain([peek], tokens)
     result = importer(tokens, string)
+    if dimension is not None:
+        result['dimensions'] = dimension
+    util.validate_dimensions(result)
     if srid is not None:
         result['meta'] = dict(srid=srid)
     return result
@@ -241,7 +307,7 @@ def _dump_point(obj, decimals):
             ' '.join(_round_and_pad(c, decimals) for c in coords)
         )
 
-    return 'POINT %s' % fmt
+    return '%s %s' % (_declared_prefix('POINT', obj), fmt)
 
 
 def _dump_linestring(obj, decimals):
@@ -263,7 +329,7 @@ def _dump_linestring(obj, decimals):
             )
         )
 
-    return 'LINESTRING %s' % fmt
+    return '%s %s' % (_declared_prefix('LINESTRING', obj), fmt)
 
 
 def _dump_polygon(obj, decimals):
@@ -284,7 +350,7 @@ def _dump_polygon(obj, decimals):
 
         fmt = '(%s)' % ', '.join('(%s)' % r for r in rings)
 
-    return 'POLYGON %s' % fmt
+    return '%s %s' % (_declared_prefix('POLYGON', obj), fmt)
 
 
 def _dump_multipoint(obj, decimals):
@@ -304,7 +370,7 @@ def _dump_multipoint(obj, decimals):
         # Add parens around each point.
         fmt = '(%s)' % ', '.join('(%s)' % pt for pt in points)
 
-    return 'MULTIPOINT %s' % fmt
+    return '%s %s' % (_declared_prefix('MULTIPOINT', obj), fmt)
 
 
 def _dump_multilinestring(obj, decimals):
@@ -330,7 +396,7 @@ def _dump_multilinestring(obj, decimals):
 
         fmt = '(%s)' % ', '.join(ls for ls in linestrs)
 
-    return 'MULTILINESTRING %s' % fmt
+    return '%s %s' % (_declared_prefix('MULTILINESTRING', obj), fmt)
 
 
 def _dump_multipolygon(obj, decimals):
@@ -360,7 +426,7 @@ def _dump_multipolygon(obj, decimals):
                 for poly in coords)
         )
 
-    return 'MULTIPOLYGON %s' % fmt
+    return '%s %s' % (_declared_prefix('MULTIPOLYGON', obj), fmt)
 
 
 def _dump_geometrycollection(obj, decimals):
@@ -377,12 +443,15 @@ def _dump_geometrycollection(obj, decimals):
     if not geoms:
         fmt = 'EMPTY'
     else:
+        dimension = util.get_dimensions(obj)
+        util.validate_dimensions(obj)
         geoms_wkt = []
         for geom in geoms:
             geom_type = geom['type']
-            geoms_wkt.append(_dumps_registry.get(geom_type)(geom, decimals))
+            target = _with_dimension(geom, dimension)
+            geoms_wkt.append(_dumps_registry.get(geom_type)(target, decimals))
         fmt = '(%s)' % ','.join(geoms_wkt)
-    return 'GEOMETRYCOLLECTION %s' % fmt
+    return '%s %s' % (_declared_prefix('GEOMETRYCOLLECTION', obj), fmt)
 
 
 def _load_point(tokens, string):
@@ -649,7 +718,13 @@ def _load_geometrycollection(tokens, string):
             else:
                 geom_type = t
                 load_func = _loads_registry.get(geom_type)
+                if load_func is None:
+                    _unsupported_geom_type(geom_type)
+                child_dimension, peek = _consume_dimension(tokens)
+                tokens = itertools.chain([peek], tokens)
                 geom = load_func(tokens, string)
+                if child_dimension is not None:
+                    geom['dimensions'] = child_dimension
                 geoms.append(geom)
         except (StopIteration, tokenize.TokenError):
             raise ValueError(INVALID_WKT_FMT % string)

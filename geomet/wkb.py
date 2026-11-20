@@ -14,6 +14,7 @@
 import binascii
 import struct
 
+from geomet import util
 from geomet.util import block_splitter
 from geomet.util import take
 from geomet.util import as_bin_str
@@ -179,6 +180,40 @@ def load(source_file):
     return loads(source_file.read())
 
 
+def _type_bytes_for(geom_type, num_dims, dimension):
+    """
+    Resolve the 4-byte WKB type header for a geometry.
+
+    An explicit ``dimension`` always takes precedence.  This is what keeps an
+    XYM geometry from being silently promoted to XYZM with a fabricated zero
+    Z.  Without a declaration the historical, length-based inference applies.
+    """
+    if dimension is None:
+        dimension = _INT_TO_DIM_LABEL[num_dims]
+    return dimension, _WKB[dimension][geom_type]
+
+
+def _dimensions_from_type_bytes(type_bytes):
+    """
+    Return the explicit dimension encoded in a big-endian WKB type header.
+
+    Raises ``ValueError`` for an unknown header instead of guessing.
+    """
+    for dimension, types in _WKB.items():
+        if type_bytes in types.values():
+            return dimension
+    raise ValueError('Unsupported WKB geometry type: %r' % (type_bytes,))
+
+
+def _with_dimension(geom, dimension):
+    """Return an untagged ``geom`` carrying ``dimension``."""
+    if dimension is None or util.get_dimensions(geom) is not None:
+        return geom
+    geom = dict(geom)
+    geom['dimensions'] = dimension
+    return geom
+
+
 def dumps(obj, big_endian=True):
     """
     Dump a GeoJSON-like `dict` to a WKB string.
@@ -198,10 +233,16 @@ def dumps(obj, big_endian=True):
         so the most common case is chosen: Z.
         If the first vertex contains 4 values, we assume a ZM geometry.
 
+        This inference only applies when the object has no explicit axis
+        declaration. If the top-level ``dimensions`` key is present (``2D``,
+        ``Z``, ``M`` or ``ZM``), it selects the WKB type flag directly; this
+        is what preserves an ``M`` geometry instead of promoting it to
+        ``ZM``.
+
         The WKT/WKB standards provide a way of differentiating normal (2D), Z,
         M, and ZM geometries (http://en.wikipedia.org/wiki/Well-known_text),
-        but the GeoJSON spec does not. Therefore, for the sake of interface
-        simplicity, we assume that geometry that looks 3D contains XYZ
+        but the GeoJSON spec does not. Therefore, without an explicit
+        declaration, we assume that geometry that looks 3D contains XYZ
         components, instead of XYM.
 
         If the coordinates list contains no coordinate values, including
@@ -248,6 +289,8 @@ def _dumps(obj, big_endian=True, include_meta=True):
             'dimensionality of the WKB would be ambiguous.'
         )
 
+    util.validate_dimensions(obj)
+
     return exporter(obj, big_endian, meta)
 
 
@@ -274,6 +317,11 @@ def loads(string):
          'coordinates': [0.0, 1.0],
          'meta': {'srid': 4326},
          'crs': {'type': 'name', 'properties': {'name': 'EPSG4326'}}}
+
+    Geometries whose WKB type flag is ``M`` or ``ZM`` also carry that axis
+    identity in a top-level ``dimensions`` key. ``M`` coordinates are returned
+    as ``(X, Y, M)`` rather than being padded into a synthetic ``(X, Y, 0, M)``
+    geometry.
 
     NOTE(larsbutler): I'm not sure if it's valid to just prefix EPSG
     (European Petroluem Survey Group) to an SRID like this, but we'll
@@ -341,16 +389,17 @@ def _unsupported_geom_type(geom_type):
 
 
 # TODO: dont default meta to none
-def _header_bytefmt_byteorder(geom_type, num_dims, big_endian, meta=None):
+def _header_bytefmt_byteorder(geom_type, num_dims, big_endian, meta=None,
+                              dimension=None):
     """
     Utility function to get the WKB header (endian byte + type header), byte
     format string, and byte order string.
-    """
-    dim = _INT_TO_DIM_LABEL.get(num_dims)
-    if dim is None:
-        pass  # TODO: raise
 
-    type_byte_str = _WKB[dim][geom_type]
+    ``dimension`` is an explicit axis declaration (``2D``, ``Z``, ``M`` or
+    ``ZM``).  When omitted the historical length-based inference is used.
+    """
+    dimension, type_byte_str = _type_bytes_for(
+        geom_type, num_dims, dimension)
     srid = meta.get('srid')
     if srid is not None:
         # Add the srid flag
@@ -407,9 +456,10 @@ def _dump_point(obj, big_endian, meta):
     """
     coords = obj['coordinates']
     num_dims = len(coords)
+    dimension = util.get_dimensions(obj)
 
     wkb_string, byte_fmt, _ = _header_bytefmt_byteorder(
-        'Point', num_dims, big_endian, meta
+        'Point', num_dims, big_endian, meta, dimension
     )
 
     wkb_string += struct.pack(byte_fmt, *coords)
@@ -426,9 +476,10 @@ def _dump_linestring(obj, big_endian, meta):
     vertex = coords[0]
     # Infer the number of dimensions from the first vertex
     num_dims = len(vertex)
+    dimension = util.get_dimensions(obj)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
-        'LineString', num_dims, big_endian, meta
+        'LineString', num_dims, big_endian, meta, dimension
     )
     # append number of vertices in linestring
     wkb_string += struct.pack('%sl' % byte_order, len(coords))
@@ -449,9 +500,10 @@ def _dump_polygon(obj, big_endian, meta):
     vertex = coords[0][0]
     # Infer the number of dimensions from the first vertex
     num_dims = len(vertex)
+    dimension = util.get_dimensions(obj)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
-        'Polygon', num_dims, big_endian, meta
+        'Polygon', num_dims, big_endian, meta, dimension
     )
 
     # number of rings:
@@ -474,12 +526,13 @@ def _dump_multipoint(obj, big_endian, meta):
     coords = obj['coordinates']
     vertex = coords[0]
     num_dims = len(vertex)
+    dimension = util.get_dimensions(obj)
+    dimension, point_type = _type_bytes_for('Point', num_dims, dimension)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
-        'MultiPoint', num_dims, big_endian, meta
+        'MultiPoint', num_dims, big_endian, meta, dimension
     )
 
-    point_type = _WKB[_INT_TO_DIM_LABEL.get(num_dims)]['Point']
     if big_endian:
         point_type = BIG_ENDIAN + point_type
     else:
@@ -503,12 +556,14 @@ def _dump_multilinestring(obj, big_endian, meta):
     coords = obj['coordinates']
     vertex = coords[0][0]
     num_dims = len(vertex)
+    dimension = util.get_dimensions(obj)
+    dimension, ls_type = _type_bytes_for(
+        'LineString', num_dims, dimension)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
-        'MultiLineString', num_dims, big_endian, meta
+        'MultiLineString', num_dims, big_endian, meta, dimension
     )
 
-    ls_type = _WKB[_INT_TO_DIM_LABEL.get(num_dims)]['LineString']
     if big_endian:
         ls_type = BIG_ENDIAN + ls_type
     else:
@@ -536,12 +591,13 @@ def _dump_multipolygon(obj, big_endian, meta):
     coords = obj['coordinates']
     vertex = coords[0][0][0]
     num_dims = len(vertex)
+    dimension = util.get_dimensions(obj)
+    dimension, poly_type = _type_bytes_for('Polygon', num_dims, dimension)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
-        'MultiPolygon', num_dims, big_endian, meta
+        'MultiPolygon', num_dims, big_endian, meta, dimension
     )
 
-    poly_type = _WKB[_INT_TO_DIM_LABEL.get(num_dims)]['Polygon']
     if big_endian:
         poly_type = BIG_ENDIAN + poly_type
     else:
@@ -567,25 +623,29 @@ def _dump_multipolygon(obj, big_endian, meta):
 def _dump_geometrycollection(obj, big_endian, meta):
     # TODO: handle empty collections
     geoms = obj['geometries']
-    # determine the dimensionality (2d, 3d, 4d) of the collection
-    # by sampling the first geometry
     first_geom = geoms[0]
     rest = geoms[1:]
+
+    declared = util.get_dimensions(obj)
+    if declared is not None:
+        util.validate_dimensions(obj, declared)
+        first_geom = _with_dimension(first_geom, declared)
+        rest = [_with_dimension(geom, declared) for geom in rest]
 
     first_wkb = dumps(first_geom, big_endian=big_endian)
     first_type = first_wkb[1:5]
     if not big_endian:
         first_type = first_type[::-1]
 
-    if first_type in WKB_2D.values():
-        num_dims = 2
-    elif first_type in WKB_Z.values():
-        num_dims = 3
-    elif first_type in WKB_ZM.values():
-        num_dims = 4
+    if declared is not None:
+        num_dims = util.dimensions_size(declared)
+        header_dimension = declared
+    else:
+        header_dimension = _dimensions_from_type_bytes(first_type)
+        num_dims = util.dimensions_size(header_dimension)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
-        'GeometryCollection', num_dims, big_endian, meta
+        'GeometryCollection', num_dims, big_endian, meta, header_dimension
     )
     # append the number of geometries
     wkb_string += struct.pack('%sl' % byte_order, len(geoms))
@@ -616,42 +676,31 @@ def _load_point(big_endian, type_bytes, data_bytes):
         GeoJSON `dict` representing the Point geometry.
     """
     endian_token = '>' if big_endian else '<'
+    dimension = _dimensions_from_type_bytes(type_bytes)
 
-    if type_bytes == WKB_2D['Point']:
+    if dimension == '2D':
         coords = struct.unpack('%sdd' % endian_token,
                                as_bin_str(take(16, data_bytes)))
-    elif type_bytes == WKB_Z['Point']:
+    elif dimension == 'Z':
         coords = struct.unpack('%sddd' % endian_token,
                                as_bin_str(take(24, data_bytes)))
-    elif type_bytes == WKB_M['Point']:
-        # NOTE: The use of XYM types geometries is quite rare. In the interest
-        # of removing ambiguity, we will treat all XYM geometries as XYZM when
-        # generate the GeoJSON. A default Z value of `0.0` will be given in
-        # this case.
-        coords = list(struct.unpack('%sddd' % endian_token,
-                                    as_bin_str(take(24, data_bytes))))
-        coords.insert(2, 0.0)
-    elif type_bytes == WKB_ZM['Point']:
+    elif dimension == 'M':
+        coords = struct.unpack('%sddd' % endian_token,
+                               as_bin_str(take(24, data_bytes)))
+    else:
         coords = struct.unpack('%sdddd' % endian_token,
                                as_bin_str(take(32, data_bytes)))
 
-    return dict(type='Point', coordinates=list(coords))
+    result = dict(type='Point', coordinates=list(coords))
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
 def _load_linestring(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
-
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
+    dimension = _dimensions_from_type_bytes(type_bytes)
+    num_dims = util.dimensions_size(dimension)
 
     coords = []
     [num_verts] = struct.unpack('%sl' % endian_token,
@@ -661,32 +710,23 @@ def _load_linestring(big_endian, type_bytes, data_bytes):
         vert_wkb = as_bin_str(take(8 * num_dims, data_bytes))
         fmt = '%s' + 'd' * num_dims
         vert = list(struct.unpack(fmt % endian_token, vert_wkb))
-        if is_m:
-            vert.insert(2, 0.0)
 
         coords.append(vert)
 
         if len(coords) == num_verts:
             break
 
-    return dict(type='LineString', coordinates=list(coords))
+    result = dict(type='LineString', coordinates=list(coords))
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
 def _load_polygon(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
     data_bytes = iter(data_bytes)
-
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
+    dimension = _dimensions_from_type_bytes(type_bytes)
+    num_dims = util.dimensions_size(dimension)
 
     coords = []
     [num_rings] = struct.unpack('%sl' % endian_token,
@@ -703,36 +743,22 @@ def _load_polygon(big_endian, type_bytes, data_bytes):
         for vert_wkb in block_splitter(verts, num_dims):
             values = [struct.unpack('%sd' % endian_token, x)[0]
                       for x in vert_wkb]
-            if is_m:
-                values.insert(2, 0.0)
             ring.append(values)
         coords.append(ring)
         if len(coords) == num_rings:
             break
 
-    return dict(type='Polygon', coordinates=coords)
+    result = dict(type='Polygon', coordinates=coords)
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
 def _load_multipoint(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
     data_bytes = iter(data_bytes)
-
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
-
-    if is_m:
-        dim = 'M'
-    else:
-        dim = _INT_TO_DIM_LABEL[num_dims]
+    dimension = _dimensions_from_type_bytes(type_bytes)
+    num_dims = util.dimensions_size(dimension)
 
     coords = []
     [num_points] = struct.unpack('%sl' % endian_token,
@@ -744,43 +770,29 @@ def _load_multipoint(big_endian, type_bytes, data_bytes):
         values = struct.unpack('%s%s' % (endian_token, 'd' * num_dims),
                                as_bin_str(take(8 * num_dims, data_bytes)))
         values = list(values)
-        if is_m:
-            values.insert(2, 0.0)
 
         if big_endian:
             assert point_endian == BIG_ENDIAN
-            assert point_type == _WKB[dim]['Point']
+            assert point_type == _WKB[dimension]['Point']
         else:
             assert point_endian == LITTLE_ENDIAN
-            assert point_type[::-1] == _WKB[dim]['Point']
+            assert point_type[::-1] == _WKB[dimension]['Point']
 
         coords.append(list(values))
         if len(coords) == num_points:
             break
 
-    return dict(type='MultiPoint', coordinates=coords)
+    result = dict(type='MultiPoint', coordinates=coords)
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
 def _load_multilinestring(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
     data_bytes = iter(data_bytes)
-
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
-
-    if is_m:
-        dim = 'M'
-    else:
-        dim = _INT_TO_DIM_LABEL[num_dims]
+    dimension = _dimensions_from_type_bytes(type_bytes)
+    num_dims = util.dimensions_size(dimension)
 
     [num_ls] = struct.unpack('%sl' % endian_token,
                              as_bin_str(take(4, data_bytes)))
@@ -791,10 +803,10 @@ def _load_multilinestring(big_endian, type_bytes, data_bytes):
         ls_type = as_bin_str(take(4, data_bytes))
         if big_endian:
             assert ls_endian == BIG_ENDIAN
-            assert ls_type == _WKB[dim]['LineString']
+            assert ls_type == _WKB[dimension]['LineString']
         else:
             assert ls_endian == LITTLE_ENDIAN
-            assert ls_type[::-1] == _WKB[dim]['LineString']
+            assert ls_type[::-1] == _WKB[dimension]['LineString']
 
         [num_verts] = struct.unpack('%sl' % endian_token,
                                     as_bin_str(take(4, data_bytes)))
@@ -803,35 +815,20 @@ def _load_multilinestring(big_endian, type_bytes, data_bytes):
                                as_bin_str(take(8 * num_values, data_bytes)))
 
         values = list(block_splitter(values, num_dims))
-        if is_m:
-            for v in values:
-                v.insert(2, 0.0)
         coords.append(values)
         if len(coords) == num_ls:
             break
 
-    return dict(type='MultiLineString', coordinates=coords)
+    result = dict(type='MultiLineString', coordinates=coords)
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
 def _load_multipolygon(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
-
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
-
-    if is_m:
-        dim = 'M'
-    else:
-        dim = _INT_TO_DIM_LABEL[num_dims]
+    dimension = _dimensions_from_type_bytes(type_bytes)
+    num_dims = util.dimensions_size(dimension)
 
     [num_polys] = struct.unpack('%sl' % endian_token,
                                 as_bin_str(take(4, data_bytes)))
@@ -842,10 +839,10 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
         poly_type = as_bin_str(take(4, data_bytes))
         if big_endian:
             assert poly_endian == BIG_ENDIAN
-            assert poly_type == _WKB[dim]['Polygon']
+            assert poly_type == _WKB[dimension]['Polygon']
         else:
             assert poly_endian == LITTLE_ENDIAN
-            assert poly_type[::-1] == _WKB[dim]['Polygon']
+            assert poly_type[::-1] == _WKB[dimension]['Polygon']
 
         [num_rings] = struct.unpack('%sl' % endian_token,
                                     as_bin_str(take(4, data_bytes)))
@@ -857,8 +854,6 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
                 vert_wkb = as_bin_str(take(8 * num_dims, data_bytes))
                 fmt = '%s' + 'd' * num_dims
                 vert = list(struct.unpack(fmt % endian_token, vert_wkb))
-                if is_m:
-                    vert.insert(2, 0.0)
                 ring.append(vert)
 
             polygon.append(ring)
@@ -868,59 +863,44 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
         if len(coords) == num_polys:
             break
 
-    return dict(type='MultiPolygon', coordinates=coords)
+    result = dict(type='MultiPolygon', coordinates=coords)
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
-def _check_dimensionality(geom, num_dims):
-    def first_geom(gc):
-        for g in gc['geometries']:
-            if not g['type'] == 'GeometryCollection':
-                return g
-
-    first_vert = {
-        'Point': lambda x: x['coordinates'],
-        'LineString': lambda x: x['coordinates'][0],
-        'Polygon': lambda x: x['coordinates'][0][0],
-        'MultiLineString': lambda x: x['coordinates'][0][0],
-        'MultiPolygon': lambda x: x['coordinates'][0][0][0],
-        'GeometryCollection': first_geom,
-    }
-    if not len(first_vert[geom['type']](geom)) == num_dims:
-        error = 'Cannot mix dimensionality in a geometry'
-        raise Exception(error)
+def _check_dimensionality(geom, dimension):
+    """
+    Verify that a collection member agrees with the collection's explicit
+    axis declaration.  Members without a declaration are checked by arity so
+    historical Z/2D geometry collections keep their existing behaviour.
+    """
+    try:
+        util.validate_dimensions(geom, dimension)
+    except ValueError:
+        raise ValueError('Cannot mix dimensionality in a geometry')
 
 
 def _load_geometrycollection(big_endian, type_bytes, data_bytes):
     endian_token = '>' if big_endian else '<'
-
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
+    dimension = _dimensions_from_type_bytes(type_bytes)
 
     geometries = []
     [num_geoms] = struct.unpack('%sl' % endian_token,
                                 as_bin_str(take(4, data_bytes)))
     while True:
         geometry = loads(data_bytes)
-        if is_m:
-            _check_dimensionality(geometry, 4)
-        else:
-            _check_dimensionality(geometry, num_dims)
+        _check_dimensionality(geometry, dimension)
         # TODO(LB): Add type assertions for the geometry; collections should
         # not mix 2d, 3d, 4d, etc.
         geometries.append(geometry)
         if len(geometries) == num_geoms:
             break
 
-    return dict(type='GeometryCollection', geometries=geometries)
+    result = dict(type='GeometryCollection', geometries=geometries)
+    if dimension in ('M', 'ZM'):
+        result['dimensions'] = dimension
+    return result
 
 
 _dumps_registry = {

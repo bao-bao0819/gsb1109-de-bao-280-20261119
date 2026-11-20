@@ -113,6 +113,28 @@ _BINARY_TO_GEOM_TYPE = dict(
 
 _INT_TO_DIM_LABEL = {2: '2D', 3: 'Z', 4: 'ZM'}
 
+#: Mapping of WKB dimension labels to the number of ordinates each vertex of
+#: the corresponding GeoJSON geometry is expected to have. 'M' (XYM)
+#: geometries are converted to XYZM when parsed (a Z value of 0.0 is
+#: inserted), so they are expected to yield 4 ordinates per vertex.
+_DIM_LABEL_TO_NUM_DIMS = {'2D': 2, 'Z': 3, 'M': 4, 'ZM': 4}
+
+
+def _dim_label(type_bytes):
+    """Get the dimension label ('2D', 'Z', 'M', or 'ZM') for a 4-byte WKB
+    geometry type string (in big endian byte order).
+    """
+    for label, wkb_map in _WKB.items():
+        if type_bytes in wkb_map.values():
+            return label
+
+
+def _member_path(path):
+    """Format a sequence of member indices as a readable path, e.g.
+    ``geometries[0].geometries[2]``.
+    """
+    return '.'.join('geometries[%d]' % index for index in path)
+
 
 def _get_geom_type(type_bytes):
     """Get the GeoJSON geometry type label from a WKB type byte string.
@@ -291,6 +313,31 @@ def loads(string):
     [3] - https://tools.ietf.org/html/rfc7946#appendix-B.1
     [4] - https://tools.ietf.org/html/rfc7946#section-4
     """  # noqa
+    errors = []
+    result, _ = _loads(string, errors, ())
+    if errors:
+        # The entire record has been consumed at this point, so raising here
+        # does not prevent subsequent records from being read from the same
+        # stream.
+        raise ValueError(errors[0])
+    return result
+
+
+def _loads(string, errors, path):
+    """Parse a single geometry from ``string`` (a byte string or iterator).
+
+    :param errors:
+        A list to which dimensionality mismatch errors (as strings) are
+        appended. Errors are collected rather than raised so that the entire
+        geometry record is consumed before the caller reports them.
+    :param path:
+        A tuple of member indices locating this geometry within the
+        outermost geometry record (used for error reporting).
+
+    :returns:
+        2-tuple of the GeoJSON `dict` and the dimension label ('2D', 'Z',
+        'M', or 'ZM') declared by the geometry's own WKB header.
+    """
     string = iter(string)
     # endianness = string[0:1]
     endianness = as_bin_str(take(1, string))
@@ -324,7 +371,10 @@ def loads(string):
         _unsupported_geom_type(geom_type)
 
     data_bytes = iter(data_bytes)
-    result = importer(big_endian, type_bytes, data_bytes)
+    if geom_type == 'GeometryCollection':
+        result = importer(big_endian, type_bytes, data_bytes, errors, path)
+    else:
+        result = importer(big_endian, type_bytes, data_bytes)
     if has_srid:
         # As mentioned in the docstring above, include both approaches to
         # indicating the SRID.
@@ -333,7 +383,7 @@ def loads(string):
             'type': 'name',
             'properties': {'name': 'EPSG%s' % srid},
         }
-    return result
+    return result, _dim_label(type_bytes)
 
 
 def _unsupported_geom_type(geom_type):
@@ -564,25 +614,60 @@ def _dump_multipolygon(obj, big_endian, meta):
     return wkb_string
 
 
-def _dump_geometrycollection(obj, big_endian, meta):
-    # TODO: handle empty collections
+def _first_vertex(geom):
+    """Get the first vertex of a (non-collection) geometry's coordinates,
+    or `None` if the coordinates contain no vertices.
+    """
+    coords = geom['coordinates']
+    geom_type = geom['type']
+    try:
+        if geom_type == 'Point':
+            return coords
+        elif geom_type in ('LineString', 'MultiPoint'):
+            return coords[0]
+        elif geom_type in ('Polygon', 'MultiLineString'):
+            return coords[0][0]
+        elif geom_type == 'MultiPolygon':
+            return coords[0][0][0]
+    except IndexError:
+        return None
+
+
+def _geom_num_dims(geom):
+    """Get the number of dimensions of a geometry, inferred from its first
+    vertex. Returns `None` if the geometry contains no vertices.
+    """
+    if geom['type'] == 'GeometryCollection':
+        return _collection_num_dims(geom['geometries'])
+    vertex = _first_vertex(geom)
+    if vertex:
+        return len(vertex)
+    return None
+
+
+def _collection_num_dims(geoms):
+    """Get the number of dimensions of a geometry collection's members,
+    inferred from the first member (recursively) that contains vertices.
+    Returns `None` if no member contains any vertices.
+    """
+    for geom in geoms:
+        num_dims = _geom_num_dims(geom)
+        if num_dims:
+            return num_dims
+    return None
+
+
+def _dump_geometrycollection(obj, big_endian, meta, num_dims=None):
     geoms = obj['geometries']
     # determine the dimensionality (2d, 3d, 4d) of the collection
-    # by sampling the first geometry
-    first_geom = geoms[0]
-    rest = geoms[1:]
-
-    first_wkb = dumps(first_geom, big_endian=big_endian)
-    first_type = first_wkb[1:5]
-    if not big_endian:
-        first_type = first_type[::-1]
-
-    if first_type in WKB_2D.values():
-        num_dims = 2
-    elif first_type in WKB_Z.values():
-        num_dims = 3
-    elif first_type in WKB_ZM.values():
-        num_dims = 4
+    # by sampling the first geometry (recursively) that contains vertices
+    if num_dims is None:
+        num_dims = _collection_num_dims(geoms)
+        if num_dims is None:
+            raise ValueError(
+                'Empty geometries cannot be represented in WKB. Reason: The '
+                'dimensionality of the WKB would be ambiguous.'
+            )
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
         'GeometryCollection', num_dims, big_endian, meta
@@ -590,9 +675,16 @@ def _dump_geometrycollection(obj, big_endian, meta):
     # append the number of geometries
     wkb_string += struct.pack('%sl' % byte_order, len(geoms))
 
-    wkb_string += first_wkb
-    for geom in rest:
-        wkb_string += dumps(geom, big_endian=big_endian)
+    for geom in geoms:
+        if (geom['type'] == 'GeometryCollection'
+                and _collection_num_dims(geom['geometries']) is None):
+            # Empty collections contain no vertices of their own, so their
+            # dimensionality is inherited from the enclosing collection.
+            wkb_string += _dump_geometrycollection(
+                geom, big_endian, geom.get('meta', {}), num_dims
+            )
+        else:
+            wkb_string += dumps(geom, big_endian=big_endian)
 
     return wkb_string
 
@@ -871,54 +963,32 @@ def _load_multipolygon(big_endian, type_bytes, data_bytes):
     return dict(type='MultiPolygon', coordinates=coords)
 
 
-def _check_dimensionality(geom, num_dims):
-    def first_geom(gc):
-        for g in gc['geometries']:
-            if not g['type'] == 'GeometryCollection':
-                return g
-
-    first_vert = {
-        'Point': lambda x: x['coordinates'],
-        'LineString': lambda x: x['coordinates'][0],
-        'Polygon': lambda x: x['coordinates'][0][0],
-        'MultiLineString': lambda x: x['coordinates'][0][0],
-        'MultiPolygon': lambda x: x['coordinates'][0][0][0],
-        'GeometryCollection': first_geom,
-    }
-    if not len(first_vert[geom['type']](geom)) == num_dims:
-        error = 'Cannot mix dimensionality in a geometry'
-        raise Exception(error)
-
-
-def _load_geometrycollection(big_endian, type_bytes, data_bytes):
+def _load_geometrycollection(big_endian, type_bytes, data_bytes, errors,
+                             path):
     endian_token = '>' if big_endian else '<'
 
-    is_m = False
-
-    if type_bytes in WKB_2D.values():
-        num_dims = 2
-    elif type_bytes in WKB_Z.values():
-        num_dims = 3
-    elif type_bytes in WKB_M.values():
-        num_dims = 3
-        is_m = True
-    elif type_bytes in WKB_ZM.values():
-        num_dims = 4
+    # The dimensionality declared by this collection's own header. Every
+    # member is checked against this declaration, including nested
+    # collections (which may be empty and thus carry no vertices to sample).
+    num_dims = _DIM_LABEL_TO_NUM_DIMS[_dim_label(type_bytes)]
 
     geometries = []
     [num_geoms] = struct.unpack('%sl' % endian_token,
                                 as_bin_str(take(4, data_bytes)))
-    while True:
-        geometry = loads(data_bytes)
-        if is_m:
-            _check_dimensionality(geometry, 4)
-        else:
-            _check_dimensionality(geometry, num_dims)
-        # TODO(LB): Add type assertions for the geometry; collections should
-        # not mix 2d, 3d, 4d, etc.
+    for index in range(num_geoms):
+        # Each member is a self-contained WKB geometry: it declares its own
+        # byte order and dimensionality, independent of the enclosing
+        # collection.
+        geometry, member_label = _loads(data_bytes, errors, path + (index,))
+        member_dims = _DIM_LABEL_TO_NUM_DIMS[member_label]
+        if member_dims != num_dims:
+            errors.append(
+                'Cannot mix dimensionality in a geometry: the geometry at '
+                '%s is %d-dimensional, but the enclosing collection is '
+                '%d-dimensional'
+                % (_member_path(path + (index,)), member_dims, num_dims)
+            )
         geometries.append(geometry)
-        if len(geometries) == num_geoms:
-            break
 
     return dict(type='GeometryCollection', geometries=geometries)
 

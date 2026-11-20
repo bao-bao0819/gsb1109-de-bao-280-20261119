@@ -1352,3 +1352,113 @@ class GeometryCollectionTestCase(unittest.TestCase):
 
     def test_loads_2d_srid1234(self):
         self.assertEqual(self.gc2d_srid1234, wkb.loads(self.gc2d_srid1234_wkb))
+
+
+class NestedGeometryCollectionDimTestCase(unittest.TestCase):
+    """Tests for dimensionality validation of nested geometry collections,
+    including empty sub-collections and mixed member byte orders.
+    """
+
+    def setUp(self):
+        self.maxDiff = None
+        # Outer Z collection (big endian) containing:
+        #   - a Z collection (little endian) containing:
+        #       - an empty Z collection (big endian, no members)
+        #       - a Z point (little endian)
+        #   - a Z linestring (big endian)
+        self.nested_gc3d = dict(type='GeometryCollection', geometries=[
+            dict(type='GeometryCollection', geometries=[
+                dict(type='GeometryCollection', geometries=[]),
+                dict(type='Point', coordinates=[0.0, 1.0, 2.0]),
+            ]),
+            dict(type='LineString', coordinates=[
+                [102.0, 2.0, 6.0], [103.0, 3.0, 7.0],
+            ]),
+        ])
+        self.nested_gc3d_wkb = (
+            b'\x00'  # big endian
+            b'\x00\x00\x03\xef'  # 3d geometry collection
+            b'\x00\x00\x00\x02'  # 2 geometries in the collection
+            b'\x01'  # little endian
+            b'\xef\x03\x00\x00'  # 3d geometry collection
+            b'\x02\x00\x00\x00'  # 2 geometries in the collection
+            b'\x00'  # big endian
+            b'\x00\x00\x03\xef'  # 3d geometry collection
+            b'\x00\x00\x00\x00'  # 0 geometries (empty sub-collection)
+            b'\x01'  # little endian
+            b'\xe9\x03\x00\x00'  # 3d point
+            b'\x00\x00\x00\x00\x00\x00\x00\x00'
+            b'\x00\x00\x00\x00\x00\x00\xf0?'
+            b'\x00\x00\x00\x00\x00\x00\x00@'
+            b'\x00'  # big endian
+            b'\x00\x00\x03\xea'  # 3d linestring
+            b'\x00\x00\x00\x02'  # 2 vertices
+            b'@Y\x80\x00\x00\x00\x00\x00'
+            b'@\x00\x00\x00\x00\x00\x00\x00'
+            b'@\x18\x00\x00\x00\x00\x00\x00'
+            b'@Y\xc0\x00\x00\x00\x00\x00'
+            b'@\x08\x00\x00\x00\x00\x00\x00'
+            b'@\x1c\x00\x00\x00\x00\x00\x00'
+        )
+        # Same record, but the deepest (empty) sub-collection declares 2d.
+        self.nested_gc_bad_wkb = self.nested_gc3d_wkb.replace(
+            b'\x00\x00\x00\x03\xef\x00\x00\x00\x00',
+            b'\x00\x00\x00\x00\x07\x00\x00\x00\x00',
+        )
+        self.followup_wkb = (
+            b'\x00'  # big endian
+            b'\x00\x00\x03\xe9'  # 3d point
+            b'@\x14\x00\x00\x00\x00\x00\x00'
+            b'@\x18\x00\x00\x00\x00\x00\x00'
+            b'@\x1c\x00\x00\x00\x00\x00\x00'
+        )
+        self.followup = dict(type='Point', coordinates=[5.0, 6.0, 7.0])
+
+    def test_loads_nested_empty_subcollection(self):
+        self.assertEqual(
+            self.nested_gc3d, wkb.loads(self.nested_gc3d_wkb))
+
+    def test_roundtrip_other_byte_order(self):
+        geom = wkb.loads(self.nested_gc3d_wkb)
+        reloaded = wkb.loads(wkb.dumps(geom, big_endian=False))
+        self.assertEqual(self.nested_gc3d, reloaded)
+
+    def test_dumps_empty_subcollection_inherits_dims(self):
+        dumped = wkb.dumps(self.nested_gc3d, big_endian=False)
+        # the empty sub-collection is written back as a Z collection
+        self.assertIn(b'\xef\x03\x00\x00', dumped)
+        self.assertEqual(self.nested_gc3d, wkb.loads(dumped))
+
+    def test_loads_mismatched_empty_subcollection(self):
+        with self.assertRaises(ValueError) as ar:
+            wkb.loads(self.nested_gc_bad_wkb)
+        self.assertIn('geometries[0].geometries[0]', str(ar.exception))
+
+    def test_loads_mismatched_intermediate_collection(self):
+        # The middle collection declares 2d but contains a 3d point; its own
+        # declaration must be checked, not replaced by the first non-empty
+        # geometry.
+        bad_wkb = self.nested_gc3d_wkb.replace(
+            b'\x01\xef\x03\x00\x00',
+            b'\x01\x07\x00\x00\x00',
+        )
+        with self.assertRaises(ValueError) as ar:
+            wkb.loads(bad_wkb)
+        self.assertIn('geometries[0]', str(ar.exception))
+
+    def test_bad_record_does_not_corrupt_stream(self):
+        stream = iter(
+            self.nested_gc3d_wkb + self.nested_gc_bad_wkb + self.followup_wkb
+        )
+        self.assertEqual(self.nested_gc3d, wkb.loads(stream))
+        with self.assertRaises(ValueError):
+            wkb.loads(stream)
+        # the failed record only affects itself; the next record is readable
+        self.assertEqual(self.followup, wkb.loads(stream))
+
+    def test_dumps_fully_empty_collection_raises(self):
+        geom = dict(type='GeometryCollection', geometries=[
+            dict(type='GeometryCollection', geometries=[]),
+        ])
+        with self.assertRaises(ValueError):
+            wkb.dumps(geom)

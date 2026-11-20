@@ -3,6 +3,24 @@ import os
 import shutil
 import tempfile
 import struct
+from collections import namedtuple
+
+
+FRAME_HEADER_BYTES = 8
+
+
+# Information about a single frame found while walking a framed buffer.
+#
+# index          ordinal position of the frame within the buffer (0 based)
+# offset         byte offset where the frame's length header starts
+# length         payload length declared by the header, or None when the
+#                header itself is shorter than FRAME_HEADER_BYTES
+# payload        payload bytes actually present (the leftover header fragment
+#                when ``length`` is None)
+# complete       True when every declared payload byte is available; a
+#                zero-length frame is complete
+FrameInfo = namedtuple('FrameInfo',
+                       ['index', 'offset', 'length', 'payload', 'complete'])
 
 
 def raises(exc, lamda):
@@ -54,6 +72,42 @@ def framesplit(bytes):
         i += 8
         yield bytes[i: i + nbytes]
         i += nbytes
+
+
+def inspect_frames(bytes):
+    """ Walk a framed buffer frame by frame without resynchronizing.
+
+    Yields a :class:`FrameInfo` for every frame, including trailing
+    fragments.  A frame whose length header is complete but whose payload is
+    missing bytes is still yielded once with ``complete=False``.  A frame
+    whose header itself is truncated is yielded with ``length=None`` and is
+    always the final entry; no attempt is made to guess where a later frame
+    could begin.
+
+    A declared zero-length frame is yielded with an empty payload and
+    ``complete=True``.
+
+    >>> data = frame(b'Hello') + frame(b'') + frame(b'World')
+    >>> [(info.index, info.length, info.payload, info.complete)
+    ...  for info in inspect_frames(data)]
+    [(0, 5, b'Hello', True), (1, 0, b'', True), (2, 5, b'World', True)]
+    """
+    i = 0
+    n = len(bytes)
+    index = 0
+    while i < n:
+        offset = i
+        header = bytes[i:i + FRAME_HEADER_BYTES]
+        i += FRAME_HEADER_BYTES
+        if len(header) < FRAME_HEADER_BYTES:
+            yield FrameInfo(index, offset, None, header, False)
+            break
+        nbytes = struct.unpack('Q', header)[0]
+        payload = bytes[i:i + nbytes]
+        i += nbytes
+        yield FrameInfo(index, offset, nbytes, payload,
+                        len(payload) == nbytes)
+        index += 1
 
 
 def partition_all(n, bytes):

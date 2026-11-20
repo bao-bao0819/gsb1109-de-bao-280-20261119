@@ -1,6 +1,7 @@
 from functools import partial
 import pickle
 
+import numpy as np
 import pandas as pd
 from packaging.version import Version
 
@@ -23,9 +24,10 @@ else:
 from . import numpy as pnp
 from .core import Interface
 from .encode import Encode
-from .utils import extend, framesplit, frame
+from .utils import extend, framesplit, frame, suffix
 from pandas.api.types import is_extension_array_dtype
 from pandas.api.extensions import ExtensionArray
+
 
 def is_extension_array(x):
     return isinstance(x, ExtensionArray)
@@ -34,46 +36,200 @@ def is_extension_array(x):
 dumps = partial(pickle.dumps, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+class AmbiguousColumnError(ValueError):
+    """A column name matches more than one positional column."""
+
+
+def _column_label_key(key, label):
+    """ Storage key of a column in the legacy unique-name layout """
+    return extend(key, label)
+
+
+def _column_position_key(key, position):
+    """ Storage key of a column in the positional layout """
+    return extend(key, ('.col', position))
+
 
 class PandasColumns(Interface):
+    # Legacy partitions (written by older partd) store one file per unique
+    # column name and cannot represent duplicate column names.  New partitions
+    # that contain duplicate names store every column at its position under
+    # ``.col/<position>`` and carry a ``.layout`` marker.
     def __init__(self, partd=None):
         self.partd = pnp.Numpy(partd)
         Interface.__init__(self)
 
-    def append(self, data, **kwargs):
-        for k, df in data.items():
-            self.iset(extend(k, '.columns'), dumps(list(df.columns)))
-            self.iset(extend(k, '.index-name'), dumps(df.index.name))
+    def _read_raw(self, keys, **kwargs):
+        return self.partd.partd.get(keys, **kwargs)
 
-        # TODO: don't use values, it does some work.  Look at _blocks instead
-        #       pframe/cframe do this well
-        arrays = {extend(k, col): df[col].values
-                       for k, df in data.items()
-                       for col in df.columns}
-        arrays.update({extend(k, '.index'): df.index.values
-                            for k, df in data.items()})
-        # TODO: handle categoricals
+    def _partition_layout(self, key, **kwargs):
+        """ Return (mode, stored_columns) for one partition key.
+
+        mode is ``'positional'`` or ``'legacy'``; stored_columns is the
+        pickled column-label list or ``None`` for an empty partition.
+        """
+        layout_raw, columns_raw = self._read_raw(
+            [extend(key, '.layout'), extend(key, '.columns')], **kwargs)
+        if layout_raw:
+            layout = pickle.loads(layout_raw)
+            if layout[0] != 'positional':
+                raise ValueError("Unknown partition layout %r" % (layout,))
+            columns = pickle.loads(columns_raw) if columns_raw else None
+            return 'positional', columns
+        return 'legacy', pickle.loads(columns_raw) if columns_raw else None
+
+    def _existing_dtypes(self, key, ncolumns, **kwargs):
+        dtype_keys = [suffix(_column_position_key(key, i), '.dtype')
+                      for i in range(ncolumns)]
+        return [pnp.parse_dtype(raw) for raw in self._read_raw(dtype_keys, **kwargs)]
+
+    def _validate_append(self, data):
+        """ Validate every frame before anything is written to disk.
+
+        Returns a list of (key, df, mode, column_keys) describing how each
+        frame must be stored.
+        """
+        plan = []
+        for key, df in data.items():
+            mode, stored_columns = self._partition_layout(key, lock=False)
+            labels = list(df.columns)
+            duplicate_names = len(set(labels)) != len(labels)
+
+            if mode == 'legacy':
+                if stored_columns is not None and duplicate_names:
+                    raise ValueError(
+                        "Partition %r uses the legacy unique-column-name "
+                        "layout and cannot store duplicate column names %r"
+                        % (key, labels))
+                if duplicate_names:
+                    mode = 'positional'
+                else:
+                    column_keys = [_column_label_key(key, label)
+                                   for label in labels]
+                    plan.append((key, df, 'legacy', column_keys))
+                    continue
+
+            if stored_columns is not None:
+                if len(stored_columns) != len(labels):
+                    raise ValueError(
+                        "Partition %r holds %d columns but the new block has "
+                        "%d; refusing to append a block that does not match "
+                        "the positional layout"
+                        % (key, len(stored_columns), len(labels)))
+                existing_dtypes = self._existing_dtypes(key, len(labels),
+                                                         lock=False)
+                for position, (existing, current) in enumerate(zip(
+                        existing_dtypes,
+                        [df.iloc[:, i].values.dtype for i in range(len(labels))])):
+                    if existing != current:
+                        raise ValueError(
+                            "Column at position %d of partition %r has dtype "
+                            "%s in storage but %s in the new block; the "
+                            "types do not match the positional layout"
+                            % (position, key, existing, current))
+
+            column_keys = [_column_position_key(key, i)
+                           for i in range(len(labels))]
+            plan.append((key, df, 'positional', column_keys))
+        return plan
+
+    def append(self, data, **kwargs):
+        plan = self._validate_append(data)
+
+        arrays = {}
+        for key, df, mode, column_keys in plan:
+            self.iset(extend(key, '.columns'), dumps(list(df.columns)))
+            self.iset(extend(key, '.index-name'), dumps(df.index.name))
+            if mode == 'positional':
+                self.iset(extend(key, '.layout'),
+                          dumps(('positional', len(df.columns))))
+            arrays.update({storage_key: df.iloc[:, i].values
+                           for i, storage_key in enumerate(column_keys)})
+            arrays[extend(key, '.index')] = df.index.values
+
+        # Validation above ran before any write, so a block rejected for a
+        # layout/dtype mismatch never reaches this point.
         self.partd.append(arrays, **kwargs)
 
-    def _get(self, keys, columns=None, **kwargs):
+    def _resolve_columns(self, key, mode, stored_columns, columns):
+        """ Map requested columns to storage positions and labels.
+
+        Integer selectors always address a position.  Label selectors address
+        every position carrying that label; in a positional partition a label
+        shared by several columns raises rather than silently picking one.
+        """
+        ncolumns = len(stored_columns)
         if columns is None:
-            columns = self.partd.partd.get([extend(k, '.columns') for k in keys],
-                                           **kwargs)
-            columns = list(map(pickle.loads, columns))
+            positions = list(range(ncolumns))
         else:
-            columns = [columns] * len(keys)
-        index_names = self.partd.partd.get([extend(k, '.index-name')
-                                            for k in keys], **kwargs)
-        index_names = map(pickle.loads, index_names)
+            positions = []
+            for selector in columns:
+                is_position = (isinstance(selector, (int, np.integer))
+                               and not isinstance(selector, bool))
+                if mode == 'positional' and is_position:
+                    position = int(selector)
+                    if position < 0 or position >= ncolumns:
+                        raise IndexError(
+                            "Column position %d out of range for partition "
+                            "%r with %d columns"
+                            % (position, key, ncolumns))
+                    positions.append(position)
+                    continue
 
-        keys = [[extend(k, '.index'), [extend(k, col) for col in cols]]
-                 for k, cols in zip(keys, columns)]
+                matches = [i for i, label in enumerate(stored_columns)
+                           if label == selector]
+                if not matches:
+                    raise KeyError(
+                        "Column %r not found in partition %r"
+                        % (selector, key))
+                if mode == 'positional' and len(matches) > 1:
+                    raise AmbiguousColumnError(
+                        "Column name %r is ambiguous in partition %r: it "
+                        "matches positions %s. Select a position explicitly "
+                        "instead." % (selector, key, matches))
+                positions.append(matches[0])
 
-        arrays = self.partd.get(keys, **kwargs)
+        selected_labels = [stored_columns[i] for i in positions]
+        if mode == 'positional':
+            storage_keys = [_column_position_key(key, i) for i in positions]
+        else:
+            storage_keys = [_column_label_key(key, stored_columns[i])
+                            for i in positions]
+        return positions, selected_labels, storage_keys
 
-        return [pd.DataFrame(dict(zip(cols, arrs)), columns=cols,
-                             index=pd.Index(index, name=iname))
-            for iname, (index, arrs), cols in zip(index_names, arrays, columns)]
+    def _get(self, keys, columns=None, **kwargs):
+        layouts = [self._partition_layout(key, **kwargs) for key in keys]
+        if columns is not None:
+            requested = [columns] * len(keys)
+        else:
+            requested = [None] * len(keys)
+
+        resolved = []
+        for key, (mode, stored_columns), selection in zip(keys, layouts,
+                                                          requested):
+            if stored_columns is None:
+                raise KeyError("Partition %r does not exist" % (key,))
+            _, labels, storage_keys = self._resolve_columns(
+                key, mode, stored_columns, selection)
+            resolved.append((key, mode, labels, storage_keys))
+
+        index_names = map(pickle.loads, self._read_raw(
+            [extend(key, '.index-name') for key, _, _, _ in resolved],
+            **kwargs))
+
+        nested_keys = [[extend(key, '.index'), storage_keys]
+                       for key, _, _, storage_keys in resolved]
+        arrays = self.partd.get(nested_keys, **kwargs)
+
+        frames = []
+        for iname, (index, column_arrays), (_, _, labels, _) in zip(
+                index_names, arrays, resolved):
+            result = pd.DataFrame(
+                {i: values for i, values in enumerate(column_arrays)})
+            result.columns = labels
+            result.index = pd.Index(index, name=iname)
+            frames.append(result)
+        return frames
 
     def __getstate__(self):
         return {'partd': self.partd}

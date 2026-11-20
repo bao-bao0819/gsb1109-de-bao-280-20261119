@@ -10,7 +10,7 @@ from .compressed import *
 with suppress(ImportError):
     from .numpy import Numpy
 with suppress(ImportError):
-    from .pandas import PandasColumns, PandasBlocks
+    from .pandas import PandasColumns, PandasBlocks, AmbiguousColumnError
 with suppress(ImportError):
     from .zmq import Client, Server
 

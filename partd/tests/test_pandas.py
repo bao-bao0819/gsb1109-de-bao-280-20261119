@@ -5,13 +5,15 @@ import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import os
+import shutil
+import tempfile
 
 try:
     import pyarrow as pa
 except ImportError:
     pa = None
 
-from partd.pandas import PandasColumns, PandasBlocks, serialize, deserialize
+from partd.pandas import PandasColumns, PandasBlocks, AmbiguousColumnError, serialize, deserialize
 
 
 df1 = pd.DataFrame({'a': [1, 2, 3],
@@ -160,3 +162,158 @@ def test_categorical_concat():
 
         result = p.get(["x"])
         pd.testing.assert_frame_equal(result[0], pd.concat([df1, df2]).astype("category"))
+
+
+def _duplicate_amount_frame(amounts, notes, originals, index_values):
+    frame = pd.DataFrame(
+        {'amount_local': amounts, 'note': notes, 'amount_original': originals})
+    frame.columns = ['amount', 'note', 'amount']
+    frame.index = pd.Index(index_values, name='idx')
+    return frame
+
+
+block1 = _duplicate_amount_frame(
+    [1, 2, 3], ['a', 'b', 'c'], [1.5, 2.5, 3.5], [10, 10, 30])
+block2 = _duplicate_amount_frame([4], ['d'], [4.5], [40])
+
+
+def _snapshot(path):
+    files = {}
+    for root, _, names in os.walk(path):
+        for name in names:
+            if name == '.lock':
+                continue
+            full = os.path.join(root, name)
+            with open(full, 'rb') as f:
+                files[os.path.relpath(full, path)] = f.read()
+    return files
+
+
+def test_duplicate_column_names_stored_and_read_by_position():
+    path = tempfile.mkdtemp()
+    try:
+        p = PandasColumns(path)
+        p.append({'r': block1})
+        p.append({'r': block2})
+        # positional storage, never a shared file keyed by the label
+        assert os.path.exists(
+            p.partd.partd.filename(('r', '.layout')))
+        assert os.path.exists(
+            p.partd.partd.filename(('r', '.col', 0)))
+        assert os.path.exists(
+            p.partd.partd.filename(('r', '.col', 2)))
+        del p  # close the instance; an explicit path must persist
+
+        expected = pd.concat([block1, block2])
+
+        # reopen the store from disk and read the whole table back
+        p = PandasColumns(path)
+        full = p.get(['r'])[0]
+        tm.assert_frame_equal(full, expected)
+        assert list(full.columns) == ['amount', 'note', 'amount']
+        assert full.iloc[:, 0].dtype == np.dtype('int64')
+        assert full.iloc[:, 1].dtype == np.dtype('object')
+        assert full.iloc[:, 2].dtype == np.dtype('float64')
+        assert full.index.name == 'idx'
+        tm.assert_index_equal(full.index, expected.index)
+        assert full.index.tolist() == [10, 10, 30, 40]
+
+        # read only the third column
+        third = p.get('r', columns=[2])
+        tm.assert_frame_equal(third, expected.iloc[:, [2]])
+        assert third.iloc[:, 0].dtype == np.dtype('float64')
+        tm.assert_index_equal(third.index, expected.index)
+
+        # third, first, third: repeated positions stay separate columns
+        projected = p.get('r', columns=[2, 0, 2])
+        tm.assert_frame_equal(projected, expected.iloc[:, [2, 0, 2]])
+        assert projected.shape == (4, 3)
+        assert list(projected.columns) == ['amount', 'amount', 'amount']
+        assert [projected.iloc[:, i].dtype
+                for i in range(3)] == [np.dtype('float64'),
+                                        np.dtype('int64'),
+                                        np.dtype('float64')]
+        tm.assert_series_equal(projected.iloc[:, 0], projected.iloc[:, 2],
+                               check_names=False)
+        del p
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_type_swapped_append_is_rejected_without_writing():
+    path = tempfile.mkdtemp()
+    try:
+        p = PandasColumns(path)
+        p.append({'r': block1})
+        p.append({'r': block2})
+        expected = pd.concat([block1, block2])
+        before = _snapshot(path)
+
+        swapped = _duplicate_amount_frame(
+            [9.5], ['z'], [9], [99])  # int/float positions exchanged
+
+        with pytest.raises(ValueError):
+            p.append({'r': swapped})
+
+        # no column or index byte was touched
+        assert _snapshot(path) == before
+        tm.assert_frame_equal(p.get(['r'])[0], expected)
+
+        # a block with the wrong number of columns is rejected as well
+        narrow = pd.DataFrame({'a': [1], 'b': ['x']})
+        narrow.columns = ['amount', 'note']
+        narrow.index = pd.Index([99], name='idx')
+        with pytest.raises(ValueError):
+            p.append({'r': narrow})
+        assert _snapshot(path) == before
+        del p
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_legacy_unique_named_partition_keeps_name_lookups():
+    path = tempfile.mkdtemp()
+    try:
+        p = PandasColumns(path)
+        p.append({'old': df1})
+        p.append({'old': df2})
+        # unique names keep the historical per-label file layout
+        assert not os.path.exists(
+            p.partd.partd.filename(('old', '.layout')))
+        assert os.path.exists(p.partd.partd.filename(('old', 'a')))
+        del p
+
+        p = PandasColumns(path)
+        tm.assert_frame_equal(p.get(['old'])[0],
+                              pd.concat([df1, df2]))
+        tm.assert_frame_equal(
+            p.get('old', columns=['c', 'b']),
+            pd.concat([df1, df2])[['c', 'b']])
+        del p
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_duplicate_name_lookup_is_explicitly_ambiguous():
+    path = tempfile.mkdtemp()
+    try:
+        p = PandasColumns(path)
+        p.append({'r': block1})
+        p.append({'r': block2})
+
+        with pytest.raises(AmbiguousColumnError):
+            p.get('r', columns=['amount'])
+
+        # an unambiguous label still resolves inside the new partition
+        note = p.get('r', columns=['note'])
+        tm.assert_frame_equal(
+            note, pd.concat([block1, block2]).iloc[:, [1]])
+
+        # explicit positional access remains the way to disambiguate
+        local = p.get('r', columns=[0])
+        original = p.get('r', columns=[2])
+        assert local.iloc[:, 0].dtype == np.dtype('int64')
+        assert original.iloc[:, 0].dtype == np.dtype('float64')
+        del p
+    finally:
+        shutil.rmtree(path, ignore_errors=True)

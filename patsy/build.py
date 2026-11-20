@@ -63,9 +63,73 @@ def test__max_allowed_dim():
     pytest.raises(PatsyError, _max_allowed_dim, 2, np.array([[[1]]]), f)
 
 
-def _eval_factor(factor_info, data, NA_action):
+def _align_pandas_factor(value, target_index, factor):
+    # Reindex a pandas Series/DataFrame factor value onto the index of the
+    # main data table. Rows of the main table that have no matching key in
+    # the factor's index become NA (and are then handled by the usual
+    # NA_action rules); entries in the factor's index that have no matching
+    # key in the main table are simply ignored. Duplicated keys in the
+    # factor's index would make the alignment ambiguous, so they are an
+    # error (we refuse to silently pick e.g. the first match).
+    if not isinstance(value, (pandas.Series, pandas.DataFrame)):
+        raise PatsyError(
+            "factor %s was requested to be aligned to the data index, "
+            "but it did not evaluate to a pandas Series or DataFrame"
+            % (factor.name(),),
+            factor,
+        )
+    if not value.index.is_unique:
+        ambiguous = list(value.index[value.index.duplicated()].unique())
+        raise PatsyError(
+            "factor %s cannot be aligned to the data index, because its "
+            "index contains duplicated (ambiguous) keys: %r"
+            % (factor.name(), ambiguous),
+            factor,
+        )
+    return value.reindex(target_index)
+
+
+def test__align_pandas_factor():
+    if not have_pandas:
+        return
+    import pytest
+
+    f = _MockFactor()
+    target = pandas.MultiIndex.from_tuples(
+        [("a", 1), ("b", 2), ("c", 3)], names=["k1", "k2"]
+    )
+    s = pandas.Series(
+        ["x", "y", "z"], index=pandas.MultiIndex.from_tuples(
+            [("c", 3), ("a", 1), ("q", 9)], names=["k1", "k2"]
+        )
+    )
+    aligned = _align_pandas_factor(s, target, f)
+    assert aligned.index.equals(target)
+    assert aligned.loc[("a", 1)] == "y"
+    assert aligned.loc[("c", 3)] == "x"
+    assert pandas.isna(aligned.loc[("b", 2)])
+
+    # Non-pandas values are rejected, not silently passed through:
+    pytest.raises(PatsyError, _align_pandas_factor, np.asarray([1, 2, 3]), target, f)
+
+    # Duplicated keys are ambiguous and rejected:
+    dup = pandas.Series(
+        ["x", "y"], index=pandas.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1)], names=["k1", "k2"]
+        )
+    )
+    try:
+        _align_pandas_factor(dup, target, f)
+        assert False
+    except PatsyError as e:
+        assert "('a', 1)" in str(e)
+
+
+def _eval_factor(factor_info, data, NA_action, align_to_index=None):
     factor = factor_info.factor
     result = factor.eval(factor_info.state, data)
+    if align_to_index is not None:
+        result = _align_pandas_factor(result, align_to_index, factor)
     # Returns either a 2d ndarray, or a DataFrame, plus is_NA mask
     if factor_info.type == "numerical":
         result = atleast_2d_column_default(result, preserve_pandas=True)
@@ -859,7 +923,12 @@ class _CheckMatch(object):
 
 
 def build_design_matrices(
-    design_infos, data, NA_action="drop", return_type="matrix", dtype=np.dtype(float)
+    design_infos,
+    data,
+    NA_action="drop",
+    return_type="matrix",
+    dtype=np.dtype(float),
+    align_factors=(),
 ):
     """Construct several design matrices from :class:`DesignMatrixBuilder`
     objects.
@@ -878,6 +947,21 @@ def build_design_matrices(
     :arg return_type: Either ``"matrix"`` or ``"dataframe"``. See below.
     :arg dtype: The dtype of the returned matrix. Useful if you want to use
       single-precision or extended-precision.
+    :arg align_factors: An optional collection of factor names (as strings,
+      matching ``factor.name()``) marking pandas-valued factors that should
+      be explicitly aligned to the main data index before any further
+      processing. The main data index is ``data.index`` if `data` is a
+      :class:`pandas.DataFrame`, and otherwise the index shared by the
+      non-aligned pandas factors (e.g. the response); if no such index can
+      be found, an error is raised. Each named factor must evaluate to a
+      :class:`pandas.Series` or :class:`pandas.DataFrame`, which is then
+      reindexed onto the main data index. Rows with no matching key become
+      missing values and are handled by the usual ``NA_action`` rules; keys
+      in the factor's index that do not occur in the main data are ignored.
+      A factor index containing duplicated keys is ambiguous and raises an
+      error. Factors not named in `align_factors` (and all non-pandas
+      values) are unaffected and must still match the data index exactly,
+      as described below.
 
     This function returns either a list of :class:`DesignMatrix` objects (for
     ``return_type="matrix"``) or a list of :class:`pandas.DataFrame` objects
@@ -924,6 +1008,8 @@ def build_design_matrices(
 
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
+    .. versionadded:: 1.0.4
+       The ``align_factors`` argument.
 
     """
     if isinstance(NA_action, str):
@@ -935,6 +1021,11 @@ def build_design_matrices(
             "unrecognized output type %r, should be "
             "'matrix' or 'dataframe'" % (return_type,)
         )
+    align_factors = frozenset(align_factors)
+    if align_factors and not have_pandas:
+        raise PatsyError(
+            "align_factors was specified, but pandas is not installed"
+        )
     # Evaluate factors
     factor_info_to_values = {}
     factor_info_to_isNAs = {}
@@ -943,28 +1034,55 @@ def build_design_matrices(
     if have_pandas and isinstance(data, pandas.DataFrame):
         index_checker.check(data.index, "data.index", None)
         rows_checker.check(data.shape[0], "data argument", None)
+
+    def _eval_and_check_factor(factor_info, align_to_index=None):
+        value, is_NA = _eval_factor(
+            factor_info, data, NA_action, align_to_index=align_to_index
+        )
+        factor_info_to_isNAs[factor_info] = is_NA
+        # value may now be a Series, DataFrame, or ndarray
+        name = factor_info.factor.name()
+        origin = factor_info.factor.origin
+        rows_checker.check(value.shape[0], name, origin)
+        if have_pandas and isinstance(value, (pandas.Series, pandas.DataFrame)):
+            index_checker.check(value.index, name, origin)
+        # Strategy: we work with raw ndarrays for doing the actual
+        # combining; DesignMatrixBuilder objects never sees pandas
+        # objects. Then at the end, if a DataFrame was requested, we
+        # convert. So every entry in this dict is either a 2-d array
+        # of floats, or a 1-d array of integers (representing
+        # categories).
+        value = np.asarray(value)
+        factor_info_to_values[factor_info] = value
+
+    # Factors named in align_factors are deferred to a second pass, so that
+    # the reference index can first be established from the data argument
+    # and/or the non-aligned factors.
+    deferred_factor_infos = []
     for design_info in design_infos:
         # We look at evaluators rather than factors here, because it might
         # happen that we have the same factor twice, but with different
         # memorized state.
         for factor_info in design_info.factor_infos.values():
-            if factor_info not in factor_info_to_values:
-                value, is_NA = _eval_factor(factor_info, data, NA_action)
-                factor_info_to_isNAs[factor_info] = is_NA
-                # value may now be a Series, DataFrame, or ndarray
-                name = factor_info.factor.name()
-                origin = factor_info.factor.origin
-                rows_checker.check(value.shape[0], name, origin)
-                if have_pandas and isinstance(value, (pandas.Series, pandas.DataFrame)):
-                    index_checker.check(value.index, name, origin)
-                # Strategy: we work with raw ndarrays for doing the actual
-                # combining; DesignMatrixBuilder objects never sees pandas
-                # objects. Then at the end, if a DataFrame was requested, we
-                # convert. So every entry in this dict is either a 2-d array
-                # of floats, or a 1-d array of integers (representing
-                # categories).
-                value = np.asarray(value)
-                factor_info_to_values[factor_info] = value
+            if (
+                factor_info in factor_info_to_values
+                or factor_info in deferred_factor_infos
+            ):
+                continue
+            if factor_info.factor.name() in align_factors:
+                deferred_factor_infos.append(factor_info)
+                continue
+            _eval_and_check_factor(factor_info)
+    for factor_info in deferred_factor_infos:
+        if index_checker.value is None:
+            raise PatsyError(
+                "cannot align factor %s to the main data index, because no "
+                "reference index is available: the data argument is not a "
+                "pandas DataFrame, and no other factor evaluates to a "
+                "pandas Series or DataFrame" % (factor_info.factor.name(),),
+                factor_info.factor,
+            )
+        _eval_and_check_factor(factor_info, align_to_index=index_checker.value)
     # Handle NAs
     values = list(factor_info_to_values.values())
     is_NAs = list(factor_info_to_isNAs.values())

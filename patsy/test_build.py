@@ -494,6 +494,130 @@ def test_return_type_pandas():
     assert x_df.index.equals(pandas.Index([2]))
 
 
+def test_build_design_matrices_align_factors():
+    if not have_pandas:
+        return
+    from patsy.eval import EvalEnvironment
+    from patsy.highlevel import dmatrices
+
+    # The main table and the external feature table are stored with the same
+    # two-level MultiIndex. The main table has three distinct key pairs.
+    main_index = pandas.MultiIndex.from_tuples(
+        [("a", 1), ("b", 2), ("c", 3)], names=["k1", "k2"]
+    )
+    ns = {
+        "ext_cat": pandas.Series(["u", "v", "u"], index=main_index),
+        "pos_num": np.asarray([10.0, 20.0, 30.0]),
+    }
+    train = pandas.DataFrame({"y": [1.0, 2.0, 3.0]}, index=main_index)
+    lhs, rhs = dmatrices(
+        "y ~ ext_cat + pos_num", train, eval_env=EvalEnvironment([ns])
+    )
+    design_infos = [lhs.design_info, rhs.design_info]
+    assert rhs.design_info.column_names == ["Intercept", "ext_cat[T.v]", "pos_num"]
+
+    # At scoring time: the external categorical feature is reordered, is
+    # missing the main-table key ("b", 2), and has an extra key ("q", 9)
+    # whose category was never seen during training. The positional numeric
+    # factor and the response follow main-table order.
+    score = {
+        "y": pandas.Series([4.0, 5.0, 6.0], index=main_index),
+        "ext_cat": pandas.Series(
+            ["v", "u", "unseen"],
+            index=pandas.MultiIndex.from_tuples(
+                [("c", 3), ("a", 1), ("q", 9)], names=["k1", "k2"]
+            ),
+        ),
+        "pos_num": np.asarray([100.0, 200.0, 300.0]),
+    }
+
+    # The default strict index path refuses the mismatched external index:
+    pytest.raises(PatsyError, build_design_matrices, design_infos, score)
+
+    # Opt-in alignment with NA_action="drop": the ("b", 2) row has no
+    # matching external key, so it is dropped by the usual NA rules; the
+    # extra ("q", 9) key and its unseen category are ignored.
+    y_out, x_out = build_design_matrices(
+        design_infos,
+        score,
+        NA_action="drop",
+        return_type="dataframe",
+        align_factors=["ext_cat"],
+    )
+    expected_index = pandas.MultiIndex.from_tuples(
+        [("a", 1), ("c", 3)], names=["k1", "k2"]
+    )
+    assert y_out.index.equals(expected_index)
+    assert x_out.index.equals(expected_index)
+    assert np.array_equal(np.asarray(y_out).ravel(), [4.0, 6.0])
+    # ("a", 1) has ext_cat "u" -> 0; ("c", 3) has ext_cat "v" -> 1. The
+    # positional factor's rows 0 and 2 survive alongside the response rows.
+    assert np.allclose(np.asarray(x_out), [[1.0, 0.0, 100.0], [1.0, 1.0, 300.0]])
+
+    # Opt-in alignment with NA_action="raise": the unmatched row is an error.
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        design_infos,
+        score,
+        NA_action="raise",
+        align_factors=["ext_cat"],
+    )
+
+    # A duplicated external key (with differing values) is ambiguous: reject
+    # it and point out the offending key, rather than picking one value.
+    dup_score = dict(score)
+    dup_score["ext_cat"] = pandas.Series(
+        ["u", "v", "v"],
+        index=pandas.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("b", 2)], names=["k1", "k2"]
+        ),
+    )
+    try:
+        build_design_matrices(design_infos, dup_score, align_factors=["ext_cat"])
+        assert False
+    except PatsyError as e:
+        assert "('a', 1)" in str(e)
+
+    # Alignment is only enabled for the factors the caller named. Asking to
+    # align a non-pandas (positional, unlabeled) factor is an error, not a
+    # guess at some index:
+    pytest.raises(
+        PatsyError, build_design_matrices, design_infos, score,
+        align_factors=["pos_num"],
+    )
+    # And without any pandas input to provide a reference index, alignment
+    # is impossible:
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        design_infos,
+        {"y": [4.0, 5.0, 6.0], "ext_cat": score["ext_cat"],
+         "pos_num": score["pos_num"]},
+        align_factors=["ext_cat"],
+    )
+
+    # The main table can also be the data argument itself; its index is then
+    # the alignment target.
+    class ScoringData(pandas.DataFrame):
+        def __getitem__(self, key):
+            if key == "ext_cat":
+                return score["ext_cat"]
+            if key == "pos_num":
+                return score["pos_num"]
+            return pandas.DataFrame.__getitem__(self, key)
+
+    y_out2, x_out2 = build_design_matrices(
+        design_infos,
+        ScoringData({"y": [4.0, 5.0, 6.0]}, index=main_index),
+        return_type="dataframe",
+        align_factors=["ext_cat"],
+    )
+    assert y_out2.index.equals(expected_index)
+    assert x_out2.index.equals(expected_index)
+    assert np.allclose(np.asarray(x_out2), [[1.0, 0.0, 100.0], [1.0, 1.0, 300.0]])
+
+
 def test_data_mismatch():
     test_cases_twoway = [
         # Data type mismatch

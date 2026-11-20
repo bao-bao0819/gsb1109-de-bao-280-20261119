@@ -37,7 +37,7 @@ from sqlalchemy.sql.selectable import Select
 
 from ._supports import has_comment_support
 from .config import apply_config, get_core_config
-from .datatypes import ISCHEMA_NAMES, register_extension_types
+from .datatypes import ISCHEMA_NAMES, parse_type, register_extension_types
 
 __version__ = "0.17.0"
 sqlalchemy_version = sqlalchemy.__version__
@@ -519,6 +519,69 @@ class Dialect(PGDialect_psycopg2):
         index_warning()
         return []
 
+    def _is_nested_type(self, data_type: Optional[str]) -> bool:
+        if not data_type:
+            return False
+        upper = data_type.upper()
+        return any(marker in upper for marker in ("STRUCT(", "MAP("))
+
+    def _load_duckdb_column_types(
+        self,
+        connection: "Connection",
+        table_oid: Optional[int] = None,
+    ) -> List[Tuple[int, str, str]]:
+        """Read DuckDB's canonical type strings, which retain nested structure."""
+        query = """
+            SELECT table_oid, column_name, data_type
+            FROM duckdb_columns()
+            WHERE column_name IS NOT NULL
+            """
+        params: Dict[str, Any] = {}
+        if table_oid is not None:
+            query += "AND table_oid = :table_oid\n"
+            params["table_oid"] = table_oid
+        try:
+            rows = connection.execute(text(query), params)
+            return [(oid, column, data_type) for oid, column, data_type in rows]
+        except DBAPI.Error:
+            # `duckdb_columns()` is unavailable in some older releases.
+            return []
+
+    def _apply_nested_types(
+        self,
+        connection: "Connection",
+        columns: List[Dict[str, Any]],
+        table_oid: Optional[int],
+    ) -> None:
+        if table_oid is None:
+            return
+        nested = {
+            column: data_type
+            for _, column, data_type in self._load_duckdb_column_types(
+                connection, table_oid
+            )
+        }
+        for column in columns:
+            data_type = nested.get(column["name"])
+            if self._is_nested_type(data_type):
+                try:
+                    nested_type = parse_type(data_type)  # type: ignore[arg-type]
+                except ValueError:
+                    # Unsupported shapes (e.g. fixed-size arrays) keep their
+                    # previous reflection result.
+                    pass
+                else:
+                    column["type"] = nested_type
+
+    @cache  # type: ignore[call-arg]
+    def get_columns(  # type: ignore[no-untyped-def]
+        self, connection, table_name, schema=None, **kw
+    ):
+        columns = super().get_columns(connection, table_name, schema, **kw)
+        table_oid = self.get_table_oid(connection, table_name, schema)
+        self._apply_nested_types(connection, columns, table_oid)
+        return columns
+
     def initialize(self, connection: "Connection") -> None:
         DefaultDialect.initialize(self, connection)
 
@@ -628,6 +691,11 @@ class Dialect(PGDialect_psycopg2):
         )
 
         columns = self._get_columns_info(rows, domains, enums, schema)  # type: ignore[attr-defined]
+
+        if sqlalchemy.__version__ >= "2.0":
+            for key, column_list in columns.items():
+                oid = self.get_table_oid(connection, key[-1], schema)
+                self._apply_nested_types(connection, column_list, oid)
 
         return columns.items()
 

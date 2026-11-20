@@ -1,11 +1,12 @@
 import decimal
 import json
+import os
 import warnings
 from typing import Any, Dict, Type
 from uuid import uuid4
 
 from packaging.version import Version
-from pytest import importorskip, mark
+from pytest import fixture, importorskip, mark
 from pytest_snapshot.plugin import Snapshot
 from sqlalchemy import (
     Column,
@@ -20,7 +21,7 @@ from sqlalchemy import (
     select,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.engine import Engine, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session
@@ -28,7 +29,7 @@ from sqlalchemy.sql import sqltypes
 from sqlalchemy.types import FLOAT, JSON
 
 from .._supports import duckdb_version, has_uhugeint_support
-from ..datatypes import Map, Struct, types
+from ..datatypes import Map, Struct, USmallInteger, types, parse_type
 
 
 @mark.parametrize("coltype", types)
@@ -178,7 +179,14 @@ def test_all_types_reflection(engine: Engine) -> None:
             name = col.name
             if name.endswith("_enum") and duckdb_version < Version("0.7.1"):
                 continue
-            if "array" in name or "struct" in name or "map" in name or "union" in name:
+            has_nested_shape = "struct" in name or "map" in name
+            unsupported = (
+                name == "union"
+                or name.startswith("fixed_")
+                or name == "struct_of_fixed_array"
+                or ("array" in name and not has_nested_shape)
+            )
+            if unsupported:
                 assert col.type == sqltypes.NULLTYPE, name
             else:
                 assert col.type != sqltypes.NULLTYPE, name
@@ -248,3 +256,233 @@ def test_div_is_floordiv(engine: Engine) -> None:
     stmt = test_table.c.value / test_table.c.eur2usd_rate
 
     assert str(stmt.compile(engine)) == "test_table.value / test_table.eur2usd_rate"
+
+
+# A field name that contains a space, a comma and a double quote at once.
+def _quote(identifier: str) -> str:
+    return '"{}"'.format(identifier.replace('"', '""'))
+
+
+NESTED_FIELD = 'a b,c"d'
+NESTED_TYPE = f"STRUCT({_quote(NESTED_FIELD)} MAP(VARCHAR, USMALLINT[]))[]"
+
+
+@fixture
+def source_and_target(tmp_path: Any) -> Any:
+    source = os.path.join(str(tmp_path), "source.db")
+    target = os.path.join(str(tmp_path), "target.db")
+    return create_engine(f"duckdb:///{source}"), create_engine(
+        f"duckdb:///{target}"
+    )
+
+
+def _create_source(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE telemetry (
+                    id INTEGER,
+                    nested {NESTED_TYPE},
+                    counter USMALLINT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                f"""
+                INSERT INTO telemetry VALUES
+                (1, []::{NESTED_TYPE}, 1),
+                (2, [{{{_quote(NESTED_FIELD)}: MAP{{}}}}]::{NESTED_TYPE}, 2),
+                (3, [{{{_quote(NESTED_FIELD)}: MAP{{'x': []}}}}]::{NESTED_TYPE}, 3),
+                (4, [{{{_quote(NESTED_FIELD)}: MAP{{'x': NULL}}}}]::{NESTED_TYPE}, 4),
+                (5, [{{{_quote(NESTED_FIELD)}: NULL}}]::{NESTED_TYPE}, 5),
+                (6, [{{{_quote(NESTED_FIELD)}: MAP{{'y': [1, 40000, 65535]}}}}]
+                    ::{NESTED_TYPE}, 40000)
+                """
+            )
+        )
+
+
+def test_parse_nested_type_string() -> None:
+    parsed = parse_type(NESTED_TYPE)
+    assert isinstance(parsed, ARRAY)
+    assert parsed.dimensions == 1
+    assert isinstance(parsed.item_type, Struct)
+    assert list(parsed.item_type.fields) == [NESTED_FIELD]
+    map_type = parsed.item_type.fields[NESTED_FIELD]
+    assert isinstance(map_type, Map)
+    assert isinstance(map_type.key_type, String)
+    assert isinstance(map_type.value_type, ARRAY)
+    assert isinstance(map_type.value_type.item_type, USmallInteger)
+
+
+def test_reflected_nested_metadata_roundtrips(
+    source_and_target: Any,
+) -> None:
+    source, target = source_and_target
+    _create_source(source)
+
+    metadata = MetaData()
+    source_table = Table("telemetry", metadata, autoload_with=source)
+
+    nested_column = source_table.columns["nested"]
+    assert isinstance(nested_column.type, ARRAY)
+    struct_type = nested_column.type.item_type
+    assert isinstance(struct_type, Struct)
+    assert list(struct_type.fields) == [NESTED_FIELD]
+    map_type = struct_type.fields[NESTED_FIELD]
+    assert isinstance(map_type, Map)
+    assert isinstance(map_type.value_type, ARRAY)
+    assert isinstance(map_type.value_type.item_type, USmallInteger)
+
+    # Build the target table from the reflected metadata alone, with the
+    # source connection closed first.
+    source.dispose()
+
+    target_metadata = MetaData()
+    target_table = source_table.to_metadata(target_metadata)
+    target_metadata.create_all(target)
+
+    reflected = MetaData()
+    copied_table = Table("telemetry", reflected, autoload_with=target)
+    copied_type = copied_table.columns["nested"].type
+    assert isinstance(copied_type, ARRAY)
+    assert isinstance(copied_type.item_type, Struct)
+    assert list(copied_type.item_type.fields) == [NESTED_FIELD]
+    # A single field, not one per punctuation character.
+    assert len(copied_type.item_type.fields) == 1
+
+
+def test_nested_reflection_survives_copy(source_and_target: Any) -> None:
+    source, target = source_and_target
+    _create_source(source)
+
+    metadata = MetaData()
+    source_table = Table("telemetry", metadata, autoload_with=source)
+
+    with source.connect() as conn:
+        rows = [dict(row) for row in conn.execute(select(source_table)).mappings()]
+
+    source.dispose()
+
+    target_metadata = MetaData()
+    target_table = source_table.to_metadata(target_metadata)
+    target_metadata.create_all(target)
+
+    with target.begin() as conn:
+        conn.execute(target_table.insert(), rows)
+
+    reflected = MetaData()
+    copied_table = Table("telemetry", reflected, autoload_with=target)
+
+    def describe(table: Table) -> Any:
+        column = table.columns["nested"]
+        struct_type = column.type.item_type
+        map_type = struct_type.fields[NESTED_FIELD]
+        return (
+            list(struct_type.fields),
+            isinstance(map_type, Map),
+            isinstance(map_type.value_type, ARRAY),
+            map_type.value_type.item_type.__class__.__name__,
+            map_type.value_type.item_type.min,
+            map_type.value_type.item_type.max,
+        )
+
+    assert describe(source_table) == describe(copied_table)
+
+    with target.connect() as conn:
+        rows = {
+            row["id"]: row
+            for row in conn.execute(select(copied_table)).mappings()
+        }
+        copied = {ident: row["nested"] for ident, row in rows.items()}
+
+    assert copied[1] == []
+    assert copied[2] == [{NESTED_FIELD: {}}]
+    assert copied[3] == [{NESTED_FIELD: {"x": []}}]
+    assert copied[4] == [{NESTED_FIELD: {"x": None}}]
+    assert copied[5] == [{NESTED_FIELD: None}]
+    assert copied[6] == [{NESTED_FIELD: {"y": [1, 40000, 65535]}}]
+
+    # The high-valued unsigned integer survives without narrowing.
+    assert rows[6]["counter"] == 40000
+    assert isinstance(copied_table.columns["counter"].type, USmallInteger)
+
+
+def test_metadata_reflect_reads_nested_columns(source_and_target: Any) -> None:
+    source, target = source_and_target
+    _create_source(source)
+
+    metadata = MetaData()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        metadata.reflect(source)
+
+    table = metadata.tables["telemetry"]
+    nested_type = table.columns["nested"].type
+    assert isinstance(nested_type, ARRAY)
+    assert isinstance(nested_type.item_type, Struct)
+    assert list(nested_type.item_type.fields) == [NESTED_FIELD]
+    assert isinstance(nested_type.item_type.fields[NESTED_FIELD], Map)
+
+
+def test_scalar_columns_keep_existing_reflection(source_and_target: Any) -> None:
+    source, target = source_and_target
+    with source.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE scalars (
+                    id INTEGER,
+                    name VARCHAR,
+                    amount USMALLINT,
+                    tags VARCHAR[]
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO scalars VALUES (1, 'one', 40000, ['a', 'b'])"
+            )
+        )
+    metadata = MetaData()
+    source_table = Table("scalars", metadata, autoload_with=source)
+    assert isinstance(source_table.columns["id"].type, Integer)
+    assert isinstance(source_table.columns["name"].type, String)
+    assert isinstance(source_table.columns["amount"].type, USmallInteger)
+    # Plain (non-struct/map) arrays keep their historical reflected type.
+    assert isinstance(source_table.columns["tags"].type, sqltypes.NullType)
+
+    # Scalars still flow through the same reflect/create/bind/copy chain.
+    scalar_table = Table(
+        "scalars_copy",
+        MetaData(),
+        *[
+            column.copy()
+            for column in source_table.columns
+            if column.name != "tags"
+        ],
+    )
+    with source.connect() as conn:
+        rows = [
+            {key: value for key, value in row.items() if key != "tags"}
+            for row in conn.execute(select(source_table)).mappings()
+        ]
+
+    target_metadata = MetaData()
+    target_table = scalar_table.to_metadata(target_metadata)
+    target_metadata.create_all(target)
+    with target.begin() as conn:
+        conn.execute(target_table.insert(), rows)
+
+    reflected = MetaData()
+    copied_table = Table("scalars_copy", reflected, autoload_with=target)
+    with target.connect() as conn:
+        copied = conn.execute(select(copied_table)).mappings().one()
+    assert copied["id"] == 1
+    assert copied["name"] == "one"
+    assert copied["amount"] == 40000
+    assert isinstance(copied_table.columns["amount"].type, USmallInteger)

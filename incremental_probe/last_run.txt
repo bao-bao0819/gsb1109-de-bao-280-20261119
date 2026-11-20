@@ -1,0 +1,153 @@
+==============================================================================
+ENVIRONMENT
+  python 3.14.5 | pandas 3.0.3 | numpy 2.4.6 | patsy 1.0.3
+  patsy loaded from: /Users/guo/Documents/GSB/1109/batches/de-bao-280-20261119/control/questions/GSB1109-20261119-BAO-DE-146/workspace/patsy/__init__.py
+==============================================================================
+SECTION 1  incremental builder scans (2 formulas x 2 first-block dtypes)
+------------------------------------------------------------------------------
+CONFIG natural/float_first  formula='x + grp'
+  chunk0 grp dtype: float64  | chunk1 grp dtype: category categories=['c', 'a', 'b']
+  -- type-decision scan log --
+     ('guess_categorical', 'chunk0', 'float64', False)
+     ('guess_categorical', 'chunk0', 'float64', False)
+  -- iterator passes (memorize pass + type-examine pass) --
+     pass 0 visited chunks: ['chunk0']
+  FROZEN grp factor : type=numerical categories=None
+  FROZEN columns    : ['Intercept', 'x', 'grp']
+------------------------------------------------------------------------------
+CONFIG natural/object_first  formula='x + grp'
+  chunk0 grp dtype: object   | chunk1 grp dtype: category categories=['c', 'a', 'b']
+  -- type-decision scan log --
+     ('guess_categorical', 'chunk0', 'object', True)
+     ('sniff', 'chunk0', 'object', 'done=False levels=None contrast=None')
+     ('guess_categorical', 'chunk0', 'float64', False)
+     ('sniff', 'chunk1', 'category', "done=True levels=('c', 'a', 'b') contrast=None")
+  -- iterator passes (memorize pass + type-examine pass) --
+     pass 0 visited chunks: ['chunk0', 'chunk1']
+  FROZEN grp factor : type=categorical categories=('c', 'a', 'b')
+  FROZEN columns    : ['Intercept', 'grp[T.a]', 'grp[T.b]', 'x']
+------------------------------------------------------------------------------
+CONFIG explicit_C/float_first  formula="x + C(grp, levels=['c', 'a', 'b'])"
+  chunk0 grp dtype: float64  | chunk1 grp dtype: category categories=['c', 'a', 'b']
+  -- type-decision scan log --
+     ('guess_categorical', 'chunk0', '_CategoricalBox', True)
+     ('sniff', 'chunk0', '_CategoricalBox', "done=True levels=('c', 'a', 'b') contrast=None")
+     ('guess_categorical', 'chunk0', 'float64', False)
+  -- iterator passes (memorize pass + type-examine pass) --
+     pass 0 visited chunks: ['chunk0']
+  FROZEN grp factor : type=categorical categories=('c', 'a', 'b')
+  FROZEN columns    : ['Intercept', "C(grp, levels=['c', 'a', 'b'])[T.a]", "C(grp, levels=['c', 'a', 'b'])[T.b]", 'x']
+------------------------------------------------------------------------------
+CONFIG explicit_C/object_first  formula="x + C(grp, levels=['c', 'a', 'b'])"
+  chunk0 grp dtype: object   | chunk1 grp dtype: category categories=['c', 'a', 'b']
+  -- type-decision scan log --
+     ('guess_categorical', 'chunk0', '_CategoricalBox', True)
+     ('sniff', 'chunk0', '_CategoricalBox', "done=True levels=('c', 'a', 'b') contrast=None")
+     ('guess_categorical', 'chunk0', 'float64', False)
+  -- iterator passes (memorize pass + type-examine pass) --
+     pass 0 visited chunks: ['chunk0']
+  FROZEN grp factor : type=categorical categories=('c', 'a', 'b')
+  FROZEN columns    : ['Intercept', "C(grp, levels=['c', 'a', 'b'])[T.a]", "C(grp, levels=['c', 'a', 'b'])[T.b]", 'x']
+==============================================================================
+SECTION 2  replaying the later training chunk through each frozen builder
+------------------------------------------------------------------------------
+BUILDER natural/float_first (grp frozen as numerical)
+  chunk1       REJECTED (AttributeError)  'DataFrame' object has no attribute 'dtype'
+------------------------------------------------------------------------------
+BUILDER natural/object_first (grp frozen as categorical)
+  chunk1       OK
+[[1.  0.  0.  1.1]
+ [1.  1.  0.  2.2]
+ [1.  0.  1.  3.3]
+ [1.  1.  0.  4.4]]
+------------------------------------------------------------------------------
+BUILDER explicit_C/float_first (grp frozen as categorical)
+  chunk1       OK
+[[1.  0.  0.  1.1]
+ [1.  1.  0.  2.2]
+ [1.  0.  1.  3.3]
+ [1.  1.  0.  4.4]]
+------------------------------------------------------------------------------
+BUILDER explicit_C/object_first (grp frozen as categorical)
+  chunk1       OK
+[[1.  0.  0.  1.1]
+ [1.  1.  0.  2.2]
+ [1.  0.  1.  3.3]
+ [1.  1.  0.  4.4]]
+------------------------------------------------------------------------------
+SECTION 2b  P1 numeric-freeze: intended check vs pandas-3 masked crash
+  dict carrier (ndarray, no DataFrame wrapper):
+  ndarray      REJECTED (PatsyError)   when evaluating numeric factor grp, I got non-numeric data of type 'object'
+  same values as a DataFrame:
+  dataframe    REJECTED (AttributeError)  'DataFrame' object has no attribute 'dtype'
+==============================================================================
+SECTION 3  prediction carriers (reordered known values vs true new label)
+------------------------------------------------------------------------------
+BUILDER natural/float_first (grp frozen as numerical, categories=None)
+  reorder      REJECTED (AttributeError)  'DataFrame' object has no attribute 'dtype'
+  new_label    REJECTED (AttributeError)  'DataFrame' object has no attribute 'dtype'
+------------------------------------------------------------------------------
+BUILDER natural/object_first (grp frozen as categorical, categories=('c', 'a', 'b'))
+  reorder      REJECTED (PatsyError)   mismatching levels: expected ('c', 'a', 'b'), got ('a', 'b')
+  new_label    REJECTED (PatsyError)   Error converting data to categorical: observation with value 'zzz_new' does not match any of the expected levels (expected: ['c', 'a', 'b'])
+------------------------------------------------------------------------------
+BUILDER explicit_C/float_first (grp frozen as categorical, categories=('c', 'a', 'b'))
+  reorder      OK
+[[1.  0.  1.  5.1]
+ [1.  1.  0.  6.2]]
+  new_label    REJECTED (PatsyError)   Error converting data to categorical: observation with value 'zzz_new' does not match any of the expected levels (expected: ['c', 'a', 'b'])
+------------------------------------------------------------------------------
+BUILDER explicit_C/object_first (grp frozen as categorical, categories=('c', 'a', 'b'))
+  reorder      OK
+[[1.  0.  1.  5.1]
+ [1.  1.  0.  6.2]]
+  new_label    REJECTED (PatsyError)   Error converting data to categorical: observation with value 'zzz_new' does not match any of the expected levels (expected: ['c', 'a', 'b'])
+==============================================================================
+SECTION 3b  conflicting explicit C(levels=...) claims: first one freezes
+  block0 claim levels=['c', 'a', 'b'] -> sniff done=True; factor leaves examine_needed
+  block1 claim levels=['a', 'b', 'c'] is never sniffed; frozen levels stay ('c', 'a', 'b')
+  replay-time guard on the conflicting box -> mismatching levels: expected ('c', 'a', 'b'), got ('a', 'b', 'c')
+==============================================================================
+SECTION 4  why a passing full-table run does not certify the incr pipeline
+  concat of float-empty + later strings -> grp dtype: object
+  one-shot dmatrix succeeds; columns: ['Intercept', 'grp[T.b]', 'grp[T.c]', 'x']
+  but the incremental natural/float_first builder (SECTION 2) rejected the
+  same later chunk: type examination is per chunk, freezing happens on chunk0
+==============================================================================
+SECTION 5  upstream schema fix: grp is a declared Categorical on EVERY chunk
+  -- variant A: natural formula, categorical emitted from block 0 --
+  -- type-decision scan log --
+     ('guess_categorical', 'chunk0', 'category', True)
+     ('sniff', 'chunk0', 'category', "done=True levels=('c', 'a', 'b') contrast=None")
+     ('guess_categorical', 'chunk0', 'float64', False)
+  -- iterator passes (memorize pass + type-examine pass) --
+     pass 0 visited chunks: ['chunk0']
+  FROZEN grp factor : type=categorical categories=('c', 'a', 'b')
+  FROZEN columns    : ['Intercept', 'grp[T.a]', 'grp[T.b]', 'x']
+  -- variant B: natural formula, raw blocks passed through normalize_chunk --
+  normalized chunk0 grp dtype: category | categories: ['c', 'a', 'b']
+  -- type-decision scan log --
+     ('guess_categorical', 'chunk0', 'category', True)
+     ('sniff', 'chunk0', 'category', "done=True levels=('c', 'a', 'b') contrast=None")
+     ('guess_categorical', 'chunk0', 'float64', False)
+  -- iterator passes (memorize pass + type-examine pass) --
+     pass 0 visited chunks: ['chunk0']
+  FROZEN grp factor : type=categorical categories=('c', 'a', 'b')
+  FROZEN columns    : ['Intercept', 'grp[T.a]', 'grp[T.b]', 'x']
+  chunk1       OK
+[[1.  0.  0.  1.1]
+ [1.  1.  0.  2.2]
+ [1.  0.  1.  3.3]
+ [1.  1.  0.  4.4]]
+  reorder      OK
+[[1.  0.  1.  5.1]
+ [1.  1.  0.  6.2]]
+  new-label carrier at the upstream gate:
+    labels ['zzz_new'] are outside the frozen schema ('c', 'a', 'b')
+==============================================================================
+SECTION 6  fixed incremental matrices vs ordered full-table baseline
+  chunk1   same column order: True | same values: True
+   columns: ['Intercept', 'grp[T.a]', 'grp[T.b]', 'x']
+  reorder  same column order: True | same values: True
+   columns: ['Intercept', 'grp[T.a]', 'grp[T.b]', 'x']
+  EQUIVALENCE: PASS

@@ -1067,3 +1067,99 @@ def test_info():
 def test_chaining():
     a = Array('u8').append(4).extend([3, 2]).insert(0, 100).reverse()
     assert a.to_list() == [2, 3, 4, 100]
+
+
+def make_u10_frame_with_status_bits():
+    # Four 10-bit samples followed by 3 status bits that don't make up a sample.
+    samples = Array('u10', [100, 200, 300, 400])
+    frame = Tibs.from_joined([samples.to_tibs(), Tibs('0b101')])
+    return frame
+
+
+class TestSliceAssignmentWithTrailingBits:
+    def test_normal_slice_replacement_keeps_trailing_bits(self):
+        frame = make_u10_frame_with_status_bits()
+        a = Array.from_tibs('u10', frame)
+        held_bits = a.bits
+        assert len(a) == 4
+        assert len(a.bits) == 43
+        assert a.trailing_bits == Tibs('0b101')
+
+        # Replace a middle slice with a different number of elements.
+        a[1:3] = [11, 22, 33]
+
+        assert a.to_list() == [100, 11, 22, 33, 400]
+        assert len(a) == 5
+        assert len(a.bits) == 53
+        assert a.trailing_bits == Tibs('0b101')
+        # The reference held from Array.bits sees the new length and untouched status bits.
+        assert len(held_bits) == 53
+        assert held_bits[-3:] == Tibs('0b101')
+
+    def test_failed_extended_slice_assignment_is_atomic(self):
+        frame = make_u10_frame_with_status_bits()
+        a = Array.from_tibs('u10', frame)
+        held_bits = a.bits
+        original = a.to_tibs()
+
+        # A reverse-step extended slice; the final replacement value can't fit in 10 bits.
+        with pytest.raises(ValueError):
+            a[::-1] = [10, 20, 30, 1024]
+
+        # Everything before the failure is preserved: samples, bit length and status bits,
+        # including what can be seen through the held bits reference.
+        assert a.to_list() == [100, 200, 300, 400]
+        assert len(a.bits) == 43
+        assert a.trailing_bits == Tibs('0b101')
+        assert a.to_tibs() == original
+        assert held_bits == original
+
+    def test_retry_after_failure_gives_a_continuous_frame(self):
+        frame = make_u10_frame_with_status_bits()
+        a = Array.from_tibs('u10', frame)
+        held_bits = a.bits
+
+        with pytest.raises(ValueError):
+            a[::-1] = [10, 20, 30, 1024]
+
+        # Retry from the same data with all-legal values of the same dtype.
+        a[::-1] = [10, 20, 30, 40]
+
+        # Reverse stepping maps each value one-to-one onto the selected items.
+        assert a.to_list() == [40, 30, 20, 10]
+        assert len(a.bits) == 43
+        assert a.trailing_bits == Tibs('0b101')
+        assert held_bits == a.to_tibs()
+        assert held_bits[-3:] == Tibs('0b101')
+
+    def test_reverse_step_extended_slice_maps_selected_items(self):
+        frame = make_u10_frame_with_status_bits()
+        a = Array.from_tibs('u10', frame)
+
+        a[3:0:-1] = [7, 8, 9]  # Selects items 3, 2 and 1 in that order.
+
+        assert a.to_list() == [100, 9, 8, 7]
+        assert a.trailing_bits == Tibs('0b101')
+
+    def test_extended_slice_count_mismatch_does_not_mutate(self):
+        frame = make_u10_frame_with_status_bits()
+        a = Array.from_tibs('u10', frame)
+        original = a.to_tibs()
+
+        with pytest.raises(ValueError):
+            a[0:4:2] = [1, 2, 3]
+
+        assert a.to_tibs() == original
+        assert a.trailing_bits == Tibs('0b101')
+
+    def test_integer_position_and_aligned_array_unchanged(self):
+        frame = make_u10_frame_with_status_bits()
+        a = Array.from_tibs('u10', frame)
+        a[2] = 511
+        assert a[2] == 511
+        assert a.to_list() == [100, 200, 511, 400]
+        assert a.trailing_bits == Tibs('0b101')
+
+        aligned = Array('u8', [1, 2, 3, 4])
+        aligned[::2] = [9, 8]
+        assert aligned.to_list() == [9, 2, 8, 4]

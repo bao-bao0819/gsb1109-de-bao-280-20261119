@@ -4,6 +4,9 @@
 
 * Allowing upper-case 0B, 0X and 0O prefixes as they are allowable in Python.
 * Internal changes to make integration with bitstring easier.
+* Extended slice assignment to an `Array` (a slice with a step other than 1) is now atomic. If any
+  replacement value can't be encoded, or the number of values doesn't match the slice, the `Array`
+  data and any trailing bits are left unchanged instead of being partially overwritten.
 
 ### October 2025: version 0.8.1
 

@@ -242,8 +242,12 @@ class Array:
             if not isinstance(value, Sized):
                 value = list(value)
             if len(value) == items_in_slice:
-                for s, v in zip(range(start, stop, step), value):
-                    x = self._create_element(v)
+                # Pack all of the replacement values first so that an unencodable value raises
+                # before any of the data is modified, leaving the Array and any held bits
+                # reference unchanged and the trailing bits intact.
+                indices = range(start, stop, step)
+                packed = [self._create_element(v) for v in value]
+                for s, x in zip(indices, packed):
                     self._bitstore[s * self._item_size:s * self._item_size + len(x)] = x
             else:
                 raise ValueError(f"Can't assign {len(value)} values to an extended slice of length {items_in_slice}.")

@@ -1,4 +1,4 @@
-from numbers import Number
+from numbers import Integral, Number
 
 from shapely.geometry import shape as shapely_shape
 from shapely.geometry.base import BaseGeometry
@@ -45,9 +45,42 @@ class VectorTile:
             raise ValueError(f"A layer name can not be empty. {name!r} was provided.")
         if name in self.seen_layer_names:
             raise ValueError(f"The layer name {name!r} already exists in the vector tile.")
+        layer_options = get_encode_options(layer_options=options, default_options=self.default_options)
+
+        prepared_features = []
+        for feature in features:
+            # skip missing or empty geometries
+            geometry_spec = feature.get("geometry")
+            if geometry_spec is None:
+                continue
+            shape = self._load_geometry(geometry_spec, layer_options=layer_options)
+
+            if shape is None:
+                raise NotImplementedError("Can't do geometries that are not wkt, wkb, or shapely geometries")
+
+            if shape.is_empty:
+                continue
+
+            if layer_options["quantize_bounds"]:
+                shape = self.quantize(shape, layer_options=layer_options)
+            if layer_options["check_winding_order"]:
+                shape = self.enforce_winding_order(shape, layer_options=layer_options)
+
+            if shape is not None and not shape.is_empty:
+                prepared_features.append((feature, shape))
+
+        # Resolve every source key for the layer before emitting any feature.
+        # This makes allocation atomic: a conflicting or exhausted batch leaves
+        # the persistent mapping untouched.
+        feature_id_mapping = layer_options["feature_id_mapping"]
+        feature_ids = None
+        if feature_id_mapping is not None:
+            sources = [self._feature_source(feature) for feature, _ in prepared_features]
+            feature_ids = feature_id_mapping.allocate([source for source in sources if source is not None])
+
         self.seen_layer_names.add(name)
         self.layer = self.tile.layers.add()
-        self.layer_options = get_encode_options(layer_options=options, default_options=self.default_options)
+        self.layer_options = layer_options
         self.layer.name = name
         self.layer.version = 2
         self.layer.extent = self.layer_options["extents"]
@@ -58,48 +91,32 @@ class VectorTile:
         self.seen_values_idx = {}
         self.seen_values_bool_idx = {}
 
-        for feature in features:
-            # skip missing or empty geometries
-            geometry_spec = feature.get("geometry")
-            if geometry_spec is None:
-                continue
-            shape = self._load_geometry(geometry_spec)
+        for feature, shape in prepared_features:
+            self.add_feature(feature, shape, feature_ids=feature_ids)
 
-            if shape is None:
-                raise NotImplementedError("Can't do geometries that are not wkt, wkb, or shapely geometries")
-
-            if shape.is_empty:
-                continue
-
-            if self.layer_options["quantize_bounds"]:
-                shape = self.quantize(shape)
-            if self.layer_options["check_winding_order"]:
-                shape = self.enforce_winding_order(shape)
-
-            if shape is not None and not shape.is_empty:
-                self.add_feature(feature, shape)
-
-    def enforce_winding_order(self, shape, n_try=1):
+    def enforce_winding_order(self, shape, n_try=1, layer_options=None):
+        layer_options = self.layer_options if layer_options is None else layer_options
         if shape.geom_type == "MultiPolygon":
             # If we are a multipolygon, we need to ensure that the winding orders of the constituent polygons are
             # correct. In particular, the winding order of the interior rings need to be the opposite of the exterior
             # ones, and all interior rings need to follow the exterior one. This is how the end of one polygon and
             # the beginning of another are signaled.
-            shape = self.enforce_multipolygon_winding_order(shape=shape, n_try=n_try)
+            shape = self.enforce_multipolygon_winding_order(shape=shape, n_try=n_try, layer_options=layer_options)
 
         elif shape.geom_type == "Polygon":
             # Ensure that polygons are also oriented with the appropriate winding order. Their exterior rings must
             # have a clockwise order, which is translated into a clockwise order in MVT's tile-local coordinates with
             # the Y axis in "screen" (i.e: +ve down) configuration. Note that while the Y axis flips, we also invert
             # the Y coordinate to get the tile-local value, which means the clockwise orientation is unchanged.
-            shape = self.enforce_polygon_winding_order(shape=shape, n_try=n_try)
+            shape = self.enforce_polygon_winding_order(shape=shape, n_try=n_try, layer_options=layer_options)
 
         # other shapes just get passed through
         return shape
 
-    def quantize(self, shape):
-        minx, miny, maxx, maxy = self.layer_options["quantize_bounds"]
-        extents = self.layer_options["extents"]
+    def quantize(self, shape, layer_options=None):
+        layer_options = self.layer_options if layer_options is None else layer_options
+        minx, miny, maxx, maxy = layer_options["quantize_bounds"]
+        extents = layer_options["extents"]
 
         def fn(x, y, z=None):
             xfac = extents / (maxx - minx)
@@ -110,30 +127,31 @@ class VectorTile:
 
         return transform(fn, shape)
 
-    def handle_shape_validity(self, shape, n_try):
+    def handle_shape_validity(self, shape, n_try, layer_options=None):
+        layer_options = self.layer_options if layer_options is None else layer_options
         if shape.is_valid:
             return shape
 
-        if n_try >= self.layer_options["max_geometry_validate_tries"]:
+        if n_try >= layer_options["max_geometry_validate_tries"]:
             # ensure that we don't recurse indefinitely with an invalid geometry handler that doesn't validate
             # geometries
             return None
 
-        if self.layer_options["on_invalid_geometry"]:
-            shape = self.layer_options["on_invalid_geometry"](shape)
+        if layer_options["on_invalid_geometry"]:
+            shape = layer_options["on_invalid_geometry"](shape)
             if shape is not None and not shape.is_empty:
                 # This means that we have a handler that might have altered the geometry. We'll run through the process
                 # again, but keep track of which attempt we are on to terminate the recursion.
-                shape = self.enforce_winding_order(shape=shape, n_try=n_try + 1)
+                shape = self.enforce_winding_order(shape=shape, n_try=n_try + 1, layer_options=layer_options)
 
         return shape
 
-    def enforce_multipolygon_winding_order(self, shape, n_try):
+    def enforce_multipolygon_winding_order(self, shape, n_try, layer_options=None):
         assert shape.geom_type == "MultiPolygon"
 
         parts = []
         for part in shape.geoms:
-            part = self.enforce_polygon_winding_order(shape=part, n_try=n_try)
+            part = self.enforce_polygon_winding_order(shape=part, n_try=n_try, layer_options=layer_options)
             if part is not None and not part.is_empty:
                 if part.geom_type == "MultiPolygon":
                     parts.extend(part.geoms)
@@ -144,11 +162,12 @@ class VectorTile:
             return None
 
         oriented_shape = parts[0] if len(parts) == 1 else MultiPolygon(parts)
-        oriented_shape = self.handle_shape_validity(oriented_shape, n_try)
+        oriented_shape = self.handle_shape_validity(oriented_shape, n_try, layer_options=layer_options)
         return oriented_shape
 
-    def enforce_polygon_winding_order(self, shape, n_try):
+    def enforce_polygon_winding_order(self, shape, n_try, layer_options=None):
         assert shape.geom_type == "Polygon"
+        layer_options = self.layer_options if layer_options is None else layer_options
 
         def fn(point):
             x, y = point
@@ -160,16 +179,17 @@ class VectorTile:
         if len(shape.interiors) > 0:
             rings = [self.apply_map(fn, ring.coords) for ring in shape.interiors]
 
-        sign = 1.0 if self.layer_options["y_coord_down"] else -1.0
+        sign = 1.0 if layer_options["y_coord_down"] else -1.0
         oriented_shape = orient(Polygon(exterior, rings), sign=sign)
-        oriented_shape = self.handle_shape_validity(oriented_shape, n_try)
+        oriented_shape = self.handle_shape_validity(oriented_shape, n_try, layer_options=layer_options)
         return oriented_shape
 
     @staticmethod
     def apply_map(fn, x):
         return list(map(fn, x))
 
-    def _load_geometry(self, geometry_spec):
+    def _load_geometry(self, geometry_spec, layer_options=None):
+        layer_options = self.layer_options if layer_options is None else layer_options
         if isinstance(geometry_spec, BaseGeometry):
             geom = geometry_spec
         elif isinstance(geometry_spec, dict):
@@ -183,12 +203,26 @@ class VectorTile:
                 except Exception:
                     return None
 
-        if self.layer_options["transformer"] is None:
+        if layer_options["transformer"] is None:
             return geom
         else:
-            return transform(self.layer_options["transformer"], geom)
+            return transform(layer_options["transformer"], geom)
 
-    def add_feature(self, feature, shape):
+    @staticmethod
+    def _feature_source(feature):
+        """Return the source key used to look up a stable feature ID.
+
+        ``feature["source"]`` takes precedence. When it is absent, an existing
+        numeric ``feature["id"]`` is treated as a native source ID.
+        """
+        if "source" in feature:
+            return feature["source"]
+        fid = feature.get("id")
+        if isinstance(fid, Integral) and not isinstance(fid, bool) and fid >= 0:
+            return fid
+        return None
+
+    def add_feature(self, feature, shape, feature_ids=None):
         geom_encoder = GeometryEncoder(self.layer_options["y_coord_down"], self.layer_options["extents"])
         geometry = geom_encoder.encode(shape)
 
@@ -198,9 +232,15 @@ class VectorTile:
             return
         f = self.layer.features.add()
 
-        fid = feature.get("id")
-        if fid is not None and isinstance(fid, Number) and fid >= 0:
-            f.id = fid
+        source = self._feature_source(feature)
+        if feature_ids is not None and source is not None:
+            fid = feature_ids[source]
+            if isinstance(fid, Number) and fid >= 0:
+                f.id = fid
+        else:
+            fid = feature.get("id")
+            if fid is not None and isinstance(fid, Number) and fid >= 0:
+                f.id = fid
 
         # properties
         properties = feature.get("properties")

@@ -44,6 +44,7 @@ DEFAULT_ENCODE_OPTIONS = {
     "on_invalid_geometry": None,
     "check_winding_order": True,
     "max_geometry_validate_tries": 5,
+    "feature_id_mapping": None,
 }
 
 DEFAULT_DECODE_OPTIONS = {"y_coord_down": False, "transformer": None, "geojson": True}
@@ -113,10 +114,19 @@ def get_encode_options(layer_options, default_options):
     # Checks on final values
     extents = result["extents"]
     max_geometry_validate_tries = result["max_geometry_validate_tries"]
+    feature_id_mapping = result["feature_id_mapping"]
     if extents <= 0:
         raise ValueError(f"The extents must be positive. {extents} provided.")
     if max_geometry_validate_tries <= 0:
         raise ValueError(f"The max_geometry_validate_tries must be positive. {max_geometry_validate_tries} provided.")
+    if feature_id_mapping is not None:
+        from mapbox_vector_tile.feature_id import FeatureIdMapping
+
+        if not isinstance(feature_id_mapping, FeatureIdMapping):
+            raise ValueError(
+                "The feature_id_mapping must be a FeatureIdMapping instance. "
+                f"{type(feature_id_mapping).__name__} provided."
+            )
 
     return result
 

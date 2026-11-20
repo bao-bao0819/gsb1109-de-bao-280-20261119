@@ -1,6 +1,27 @@
+import contextlib
 import warnings
 
 from mapbox_vector_tile import decoder, encoder
+from mapbox_vector_tile.feature_id import (
+    FeatureIdConflictError,
+    FeatureIdError,
+    FeatureIdMapping,
+    FeatureIdRangeError,
+    FeatureIdRangeExhaustedError,
+    FeatureIdValueError,
+)
+from mapbox_vector_tile.utils import get_encode_options
+
+__all__ = [
+    "decode",
+    "encode",
+    "FeatureIdConflictError",
+    "FeatureIdError",
+    "FeatureIdMapping",
+    "FeatureIdRangeError",
+    "FeatureIdRangeExhaustedError",
+    "FeatureIdValueError",
+]
 
 
 def decode(tile, per_layer_options=None, default_options=None, **kwargs):
@@ -78,21 +99,41 @@ def encode(layers, per_layer_options=None, default_options=None, **kwargs):
             * `check_winding_order`: it forces the check of the winding order for polygons. Default to True.
             * `max_geometry_validate_tries`: the number of tries when trying to enforce the good winding order. Default
             to 5.
+            * `feature_id_mapping`: an optional
+            :class:`mapbox_vector_tile.feature_id.FeatureIdMapping` that assigns stable numeric feature IDs
+            to source keys across batches. When set, each feature may carry a `source` key (a string or a
+            native integer ID); the mapping assigns or reuses its numeric ID. Features without a `source`
+            keep the existing `id` behavior. Assignment is atomic per tile: on conflict or range exhaustion
+            the mapping is left unchanged. Default to `None`.
     """
     if kwargs:
         warnings.warn("`encode` signature has changed, use `default_options` instead", DeprecationWarning, stacklevel=2)
         default_options = {**kwargs, **(default_options or {})}
     vector_tile = encoder.VectorTile(default_options=default_options)
+
     if per_layer_options is None:
         per_layer_options = {}
-    if isinstance(layers, list):
-        for layer in layers:
+
+    layer_specs = layers if isinstance(layers, list) else [layers]
+
+    # Assign feature IDs for every layer as one transaction. A conflict or an
+    # exhausted range in a later layer must not leave earlier layer mappings
+    # partially updated.
+    mappings = []
+    for layer in layer_specs:
+        options = get_encode_options(
+            layer_options=per_layer_options.get(layer["name"]), default_options=default_options
+        )
+        mapping = options["feature_id_mapping"]
+        if mapping is not None and all(mapping is not existing for existing in mappings):
+            mappings.append(mapping)
+
+    with contextlib.ExitStack() as stack:
+        for mapping in mappings:
+            stack.enter_context(mapping.transaction())
+        for layer in layer_specs:
             layer_name = layer["name"]
             layer_options = per_layer_options.get(layer_name, None)
             vector_tile.add_layer(features=layer["features"], name=layer_name, options=layer_options)
-    else:
-        layer_name = layers["name"]
-        layer_options = per_layer_options.get(layer_name, None)
-        vector_tile.add_layer(features=layers["features"], name=layer_name, options=layer_options)
 
     return vector_tile.tile.SerializeToString()

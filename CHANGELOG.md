@@ -2,6 +2,10 @@
 
 _In development_
 
+- Add `FeatureIdMapping` for stable, persistable feature IDs across publishing batches. String source keys receive
+  IDs from a configurable range, native numeric IDs stay distinct and reserved, conflicts report both sources, and
+  allocation is atomic across a tile. Existing encodes without the `feature_id_mapping` option are unchanged.
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

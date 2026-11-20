@@ -270,6 +270,53 @@ mapbox_vector_tile.encode([
     ], default_options={"quantize_bounds": (0.0, 0.0, 10.0, 10.0), "extents":50})
 ```
 
+### Stable feature IDs across publishing batches
+
+Tiles are often published in batches, and the source of a feature is identified by a key rather than by an MVT
+numeric ID. A `FeatureIdMapping` keeps the assignment between source keys and numeric IDs for one scope (normally a
+layer), so an ID stays stable when a feature is temporarily absent from a batch and a decoded ID can be traced back
+to its source.
+
+```python
+from mapbox_vector_tile.feature_id import FeatureIdMapping
+
+# Inclusive range of numeric IDs available to newly allocated string keys.
+mapping = FeatureIdMapping("water", 1, 1000)
+mapping.allocate(["river-7", "lake-3"])       # {"lake-3": 1, "river-7": 2}
+
+mapping.id_for("river-7")                     # 2
+mapping.lookup(2)                             # "river-7"
+mapping.kind_for(2)                           # "string"
+mapping.save("water-ids.json")                # atomic, stable JSON
+mapping = FeatureIdMapping.load("water-ids.json")
+```
+
+Pass the mapping to the encoder with the `feature_id_mapping` option. Each feature may then carry a `source` key,
+which is either a string or a native MVT numeric ID:
+
+```python
+pbf = mapbox_vector_tile.encode(
+    {"name": "water", "features": [
+        {"geometry": "POINT (1 1)", "properties": {}, "source": "river-7"},
+        {"geometry": "POINT (2 2)", "properties": {}, "source": 42},
+    ]},
+    default_options={"feature_id_mapping": mapping},
+)
+```
+
+A few properties matter in practice:
+
+- Existing source keys keep their IDs; new string keys receive the lowest free IDs in the range, in sorted order, so
+  reordering a batch produces the same assignments.
+- A native integer source uses that value as its numeric ID and reserves it. The string `"42"` and the integer `42`
+  are different sources, even though they look alike.
+- A batch is validated in full before anything is committed. If a native ID conflicts with an ID already assigned to
+  another source, `FeatureIdConflictError` reports both sources, and neither fresh allocations nor earlier layers are
+  partially updated. An ID whose feature is temporarily absent is never reused.
+- `FeatureIdMapping` objects for different scopes are independent. Features without a `source` (and encodes without a
+  `feature_id_mapping`) keep the previous behavior: a non-negative numeric `id` is written as-is and omitted
+  otherwise.
+
 ## Decoding
 
 Decode method takes in a valid google.protobuf.message Tile and returns decoded string in the following format:

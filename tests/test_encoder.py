@@ -1103,6 +1103,7 @@ class OptionsTestCase(unittest.TestCase):
                 "max_geometry_validate_tries": 5,
                 "on_invalid_geometry": None,
                 "quantize_bounds": None,
+                "feature_id_mapping": None,
             },
         )
         self.assertEqual(
@@ -1115,6 +1116,7 @@ class OptionsTestCase(unittest.TestCase):
                 "on_invalid_geometry": None,
                 "transformer": None,
                 "y_coord_down": False,
+                "feature_id_mapping": None,
             },
         )
         self.assertEqual(
@@ -1127,6 +1129,7 @@ class OptionsTestCase(unittest.TestCase):
                 "on_invalid_geometry": None,
                 "transformer": None,
                 "y_coord_down": False,
+                "feature_id_mapping": None,
             },
         )
         self.assertEqual(
@@ -1138,6 +1141,7 @@ class OptionsTestCase(unittest.TestCase):
                 "max_geometry_validate_tries": 5,
                 "on_invalid_geometry": None,
                 "quantize_bounds": None,
+                "feature_id_mapping": None,
             },
         )
         self.assertEqual(get_encode_options(layer_options=None, default_options=None), DEFAULT_ENCODE_OPTIONS)

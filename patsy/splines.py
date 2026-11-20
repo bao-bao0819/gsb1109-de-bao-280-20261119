@@ -35,8 +35,9 @@ def _eval_bspline_basis(x, knots, degree):
     # XX FIXME: when points fall outside of the boundaries, splev and R seem
     # to handle them differently. I don't know why yet. So until we understand
     # this and decide what to do with it, I'm going to play it safe and
-    # disallow such points.
-    if np.min(x) < np.min(knots) or np.max(x) > np.max(knots):
+    # disallow such points. (NaNs are ignored here; they're missing values,
+    # and are handled by the usual missing-data machinery instead.)
+    if np.nanmin(x) < np.min(knots) or np.nanmax(x) > np.max(knots):
         raise NotImplementedError(
             "some data points fall outside the "
             "outermost knots, and I'm not sure how "
@@ -83,7 +84,7 @@ def test__R_compat_quantile():
 
 
 class BS(object):
-    """bs(x, df=None, knots=None, degree=3, include_intercept=False, lower_bound=None, upper_bound=None)
+    """bs(x, df=None, knots=None, degree=3, include_intercept=False, lower_bound=None, upper_bound=None, clamp_boundaries=False)
 
     Generates a B-spline basis for ``x``, allowing non-linear fits. The usual
     usage is something like::
@@ -107,6 +108,13 @@ class BS(object):
       multiple spline terms and/or an intercept term.
     :arg lower_bound: The lower exterior knot location.
     :arg upper_bound: The upper exterior knot location.
+    :arg clamp_boundaries: If ``True``, then points that fall outside the
+      lower/upper bounds are clamped to the nearest boundary before the
+      spline basis is evaluated, instead of raising an error. This only
+      affects the spline basis itself; any other terms in the formula (e.g.
+      a plain ``x`` term) still see the original, unclamped values. Missing
+      values are left as missing and handled by the usual missing-data
+      machinery. The default is ``False``.
 
     A spline with ``degree=0`` is piecewise constant with breakpoints at each
     knot, and the default knot positions are quantiles of the input. So if you
@@ -135,9 +143,10 @@ class BS(object):
       raise an error if ``degree=0``, while patsy's will not), they should
       produce identical output given identical input and parameter settings.
 
-    .. warning:: I'm not sure on what the proper handling of points outside
-      the lower/upper bounds is, so for now attempting to evaluate a spline
-      basis at such points produces an error. Patches gratefully accepted.
+    .. note:: By default, attempting to evaluate a spline basis at points
+      outside the lower/upper bounds produces an error. Pass
+      ``clamp_boundaries=True`` to instead evaluate such points at the
+      nearest boundary.
 
     .. versionadded:: 0.2.0
     """
@@ -156,6 +165,7 @@ class BS(object):
         include_intercept=False,
         lower_bound=None,
         upper_bound=None,
+        clamp_boundaries=False,
     ):
         args = {
             "df": df,
@@ -164,6 +174,7 @@ class BS(object):
             "include_intercept": include_intercept,
             "lower_bound": lower_bound,
             "upper_bound": upper_bound,
+            "clamp_boundaries": clamp_boundaries,
         }
         self._tmp["args"] = args
         # XX: check whether we need x values before saving them
@@ -269,8 +280,17 @@ class BS(object):
         include_intercept=False,
         lower_bound=None,
         upper_bound=None,
+        clamp_boundaries=False,
     ):
-        basis = _eval_bspline_basis(x, self._all_knots, self._degree)
+        basis_x = x
+        if clamp_boundaries:
+            # The memorized outermost knots are the lower/upper bounds.
+            # np.clip leaves NaNs alone, so missing values stay missing and
+            # are handled by the usual missing-data machinery.
+            lower_bound = self._all_knots[0]
+            upper_bound = self._all_knots[-1]
+            basis_x = np.clip(np.asarray(x, dtype=float), lower_bound, upper_bound)
+        basis = _eval_bspline_basis(basis_x, self._all_knots, self._degree)
         if not include_intercept:
             basis = basis[:, 1:]
         if have_pandas:
@@ -416,6 +436,141 @@ def test_bs_errors():
     # knots < lower_bound
     pytest.raises(ValueError, bs, x, knots=[-20, 0])
     pytest.raises(ValueError, bs, x, knots=[-4, 0], lower_bound=-3)
+
+
+def test_bs_clamp_boundaries():
+    import pytest
+    from patsy.highlevel import dmatrix
+    from patsy.build import build_design_matrices
+    from patsy import PatsyError
+
+    def bs_state(design_info):
+        for factor_info in design_info.factor_infos.values():
+            if factor_info.factor.name().startswith("bs("):
+                (transform,) = factor_info.state["transforms"].values()
+                return transform
+        assert False, "no bs factor found"
+
+    # Two designs built from the same formula text, but fit on training data
+    # covering different ranges, so they memorize different boundaries.
+    formula = "bs(x, df=5, clamp_boundaries=True) + x"
+    train1 = {"x": np.linspace(0, 10, 21)}
+    train2 = {"x": np.linspace(100, 200, 21)}
+    design1 = dmatrix(formula, train1)
+    design2 = dmatrix(formula, train2)
+    info1 = design1.design_info
+    info2 = design2.design_info
+    knots1 = bs_state(info1)._all_knots.copy()
+    knots2 = bs_state(info2)._all_knots.copy()
+    lo1, hi1 = knots1[0], knots1[-1]
+    lo2, hi2 = knots2[0], knots2[-1]
+    assert (lo1, hi1) == (0, 10)
+    assert (lo2, hi2) == (100, 200)
+    # Enabling the mode does not change the number or order of columns.
+    plain1 = dmatrix("bs(x, df=5) + x", train1)
+    plain_info1 = plain1.design_info
+    assert len(info1.column_names) == len(plain_info1.column_names)
+    assert info1.column_names[0] == "Intercept"
+    assert info1.column_names[-1] == "x"
+    assert all(name.startswith("bs(") for name in info1.column_names[1:-1])
+
+    # A scoring batch with in-boundary, on-boundary, out-of-boundary (both
+    # sides, for both designs), and missing values.
+    batch_x = np.array(
+        [5.0, 0.0, 10.0, -3.0, 15.0, 150.0, 100.0, 200.0, 90.0, 210.0, np.nan]
+    )
+    batch = {"x": batch_x}
+    kept_x = batch_x[:-1]
+
+    # Score both designs jointly, then swap the order.
+    mat1, mat2 = build_design_matrices([info1, info2], batch)
+    mat2_swapped, mat1_swapped = build_design_matrices([info2, info1], batch)
+    mat1 = np.asarray(mat1)
+    mat2 = np.asarray(mat2)
+    assert np.array_equal(mat1, np.asarray(mat1_swapped))
+    assert np.array_equal(mat2, np.asarray(mat2_swapped))
+    # The missing row is dropped from the joint matrices.
+    assert mat1.shape[0] == len(kept_x)
+    assert mat2.shape[0] == len(kept_x)
+    # The plain x term keeps the original, unclamped values.
+    assert np.array_equal(mat1[:, -1], kept_x)
+    assert np.array_equal(mat2[:, -1], kept_x)
+
+    # Each design clamps to its own memorized boundaries: every out-of-bound
+    # row is identical to the row scored at the corresponding endpoint.
+    def endpoint_row(info, value):
+        (mat,) = build_design_matrices([info], {"x": [value]})
+        return np.asarray(mat)[0]
+
+    lo1_row = endpoint_row(info1, lo1)
+    hi1_row = endpoint_row(info1, hi1)
+    lo2_row = endpoint_row(info2, lo2)
+    hi2_row = endpoint_row(info2, hi2)
+    for value, row1, row2 in zip(kept_x, mat1, mat2):
+        # Compare everything except the unclamped plain x column.
+        if value < lo1:
+            assert np.array_equal(row1[:-1], lo1_row[:-1])
+        elif value > hi1:
+            assert np.array_equal(row1[:-1], hi1_row[:-1])
+        if value < lo2:
+            assert np.array_equal(row2[:-1], lo2_row[:-1])
+        elif value > hi2:
+            assert np.array_equal(row2[:-1], hi2_row[:-1])
+
+    # In-boundary values are not modified: clamped and unclamped designs
+    # agree exactly inside the training range (boundaries included).
+    in_bound = {"x": np.array([5.0, 0.0, 10.0])}
+    (clamped_in,) = build_design_matrices([info1], in_bound)
+    (plain_in,) = build_design_matrices([plain_info1], in_bound)
+    assert np.allclose(np.asarray(clamped_in), np.asarray(plain_in))
+
+    # Clamping does not update the memorized knots.
+    assert np.array_equal(bs_state(info1)._all_knots, knots1)
+    assert np.array_equal(bs_state(info2)._all_knots, knots2)
+
+    # Clamping does not fill in missing values: they are still detected and
+    # handled by the NA machinery.
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [info1],
+        {"x": [1.0, np.nan]},
+        NA_action="raise",
+    )
+
+    # With the mode disabled, out-of-bound points are still rejected, even
+    # when scored jointly with a clamp-enabled design. (The factor evaluation
+    # machinery wraps the original NotImplementedError in a PatsyError.)
+    for infos in ([plain_info1], [info1, plain_info1], [plain_info1, info2]):
+        with pytest.raises(PatsyError) as excinfo:
+            build_design_matrices(infos, batch)
+        assert isinstance(excinfo.value.__cause__, NotImplementedError)
+
+    # Also works with include_intercept=True, preserving column order.
+    design_ii = dmatrix(
+        "bs(x, df=4, include_intercept=True, clamp_boundaries=True) + x", train1
+    )
+    info_ii = design_ii.design_info
+    assert info_ii.column_names[-1] == "x"
+    assert len(info_ii.column_names) == 1 + 4 + 1
+    (mat_ii,) = build_design_matrices([info_ii], {"x": [-3.0, 5.0, 15.0]})
+    mat_ii = np.asarray(mat_ii)
+    lo_ii_row = endpoint_row(info_ii, 0.0)
+    hi_ii_row = endpoint_row(info_ii, 10.0)
+    assert np.array_equal(mat_ii[0][:-1], lo_ii_row[:-1])
+    assert np.array_equal(mat_ii[2][:-1], hi_ii_row[:-1])
+    # The plain x column is still unclamped.
+    assert np.array_equal(mat_ii[:, -1], [-3.0, 5.0, 15.0])
+
+    # The stateful protocol itself honors the flag: same learned knots, and
+    # clamping happens only when requested at transform time.
+    t = BS()
+    t.memorize_chunk(np.linspace(0, 10, 21), df=5)
+    t.memorize_finish()
+    pytest.raises(NotImplementedError, t.transform, [-3.0], df=5)
+    clamped = t.transform([-3.0], df=5, clamp_boundaries=True)
+    at_bound = t.transform([0.0], df=5)
+    assert np.allclose(clamped, at_bound)
 
 
 # differences between bs and ns (since the R code is a pile of copy-paste):

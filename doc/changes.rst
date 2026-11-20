@@ -14,6 +14,10 @@ v1.0.3
 * Added official support for Python 3.14.
 * Fixed constraint tokenizer compatibility with Python 3.15 pre-releases.
 * Updates to CI tooling and doc building.
+* :func:`bs` gained a ``clamp_boundaries=`` option: when enabled, points
+  outside the memorized lower/upper bounds are evaluated at the nearest
+  boundary instead of raising an error. Missing values are still passed
+  through to the usual missing-data machinery.
 
 v1.0.2
 ------

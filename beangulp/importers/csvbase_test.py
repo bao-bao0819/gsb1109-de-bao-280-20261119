@@ -3,17 +3,22 @@ import decimal
 import re
 import unittest
 
+from unittest import mock
+
 from beancount.core import data
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
 from beangulp.importers.csvbase import (
     _chomp,
+    AmbiguousDateError,
     Column,
     Columns,
     Date,
     Amount,
     CSVMeta,
     CSVReader,
+    InconsistentDateError,
+    MonthDay,
     Order,
     Importer,
     CreditOrDebit,
@@ -98,6 +103,18 @@ class TestDateColumn(unittest.TestCase):
         func = column.getter(None)
         value = func(("",))
         self.assertIsNone(value)
+
+    def test_multiple_formats(self):
+        column = Date(0, frmt=("%Y-%m-%d", "%m/%d"))
+        func = column.getter(None)
+        self.assertEqual(func(("2021-05-16",)), datetime.date(2021, 5, 16))
+        self.assertEqual(func(("05/16",)), MonthDay(5, 16))
+
+    def test_invalid_date(self):
+        column = Date(0, frmt=("%Y-%m-%d", "%m/%d"))
+        func = column.getter(None)
+        with self.assertRaisesRegex(ValueError, "Cannot parse date '16.05.2021'"):
+            func(("16.05.2021",))
 
 
 class TestColumnsColumn(unittest.TestCase):
@@ -794,6 +811,138 @@ class TestImporter(cmptest.TestCase):
         with self.assertRaisesRegex(RuntimeError, msg) as ctx:
             importer.extract(filename, [])
         self.assertIsInstance(ctx.exception.__cause__, decimal.InvalidOperation)
+
+
+class TestPartialDates(cmptest.TestCase):
+    period = (datetime.date(2023, 12, 1), datetime.date(2025, 1, 31))
+
+    def make_importer(self, grouper=None, statement_period=period):
+        class CSVImporter(Base):
+            date = Date(0, frmt=("%Y-%m-%d", "%m/%d"))
+            narration = Column(1)
+            amount = Amount(2)
+            section = Column(3)
+            names = False
+
+        return CSVImporter(
+            "Assets:CSV", "EUR", statement_period=statement_period, grouper=grouper
+        )
+
+    @docfile
+    def test_resolve_anchored_group(self, filename):
+        """\
+        2024-12-31, Anchor A, 1.00, 1
+        01/02, Partial, 2.00, 1
+        2025-01-03, Anchor B, 3.00, 1
+        """
+        importer = self.make_importer()
+        entries = importer.extract(filename, [])
+        self.assertEqualEntries(
+            entries,
+            """
+        2024-12-31 * "Anchor A"
+          Assets:CSV  1.00 EUR
+        2025-01-02 * "Partial"
+          Assets:CSV  2.00 EUR
+        2025-01-03 * "Anchor B"
+          Assets:CSV  3.00 EUR
+        """,
+        )
+
+    @docfile
+    def test_ambiguous_group(self, filename):
+        """\
+        2024-12-31, Anchor A, 1.00, 1
+        01/02, Partial, 2.00, 1
+        2025-01-03, Anchor B, 3.00, 1
+        01/02, Other, 4.00, 2
+        """
+        importer = self.make_importer(grouper=lambda row: row.section)
+        with self.assertRaises(AmbiguousDateError) as ctx:
+            importer.extract(filename, [])
+        error = ctx.exception
+        # The second group is resolved independently: both years are
+        # within the statement period and the anchors of the first
+        # group cannot be borrowed.
+        self.assertEqual(
+            error.candidates, [datetime.date(2024, 1, 2), datetime.date(2025, 1, 2)]
+        )
+        self.assertEqual(error.lineno, 4)
+        self.assertIn("Other", str(error))
+        self.assertIn("2024-01-02", str(error))
+        self.assertIn("2025-01-02", str(error))
+
+    @docfile
+    def test_unanchored_group(self, filename):
+        """\
+        01/02, Partial, 2.00, 1
+        """
+        importer = self.make_importer()
+        with self.assertRaises(AmbiguousDateError) as ctx:
+            importer.extract(filename, [])
+        # A year must not be picked arbitrarily.
+        self.assertEqual(
+            ctx.exception.candidates,
+            [datetime.date(2024, 1, 2), datetime.date(2025, 1, 2)],
+        )
+
+    @docfile
+    def test_inconsistent_group(self, filename):
+        """\
+        2025-01-03, Anchor, 1.00, 1
+        2024-12-31, Early, 2.00, 1
+        01/02, Partial, 3.00, 1
+        """
+        importer = self.make_importer()
+        with self.assertRaises(InconsistentDateError) as ctx:
+            importer.extract(filename, [])
+        error = ctx.exception
+        # The conflicting rows are reported.
+        self.assertEqual([lineno for lineno, row in error.rows], [1, 2])
+        self.assertIn("2025-01-03", str(error))
+        self.assertIn("2024-12-31", str(error))
+
+    @docfile
+    def test_missing_statement_period(self, filename):
+        """\
+        01/02, Partial, 2.00, 1
+        """
+        importer = self.make_importer(statement_period=None)
+        with self.assertRaisesRegex(ValueError, "statement period"):
+            importer.extract(filename, [])
+
+    @docfile
+    def test_file_date(self, filename):
+        """\
+        2024-12-31, Anchor A, 1.00, 1
+        01/02, Partial, 2.00, 1
+        2025-01-03, Anchor B, 3.00, 1
+        01/02, Other, 4.00, 2
+        """
+        importer = self.make_importer(grouper=lambda row: row.section)
+        # The archival date uses the dates confirmed during the
+        # parse. The ambiguous row in the second group is checked but
+        # does not contribute a date.
+        self.assertEqual(importer.date(filename), datetime.date(2025, 1, 3))
+
+    @docfile
+    def test_file_date_independent_of_system_year(self, filename):
+        """\
+        2024-12-31, Anchor A, 1.00, 1
+        01/02, Partial, 2.00, 1
+        2025-01-03, Anchor B, 3.00, 1
+        01/02, Other, 4.00, 2
+        """
+        importer = self.make_importer(grouper=lambda row: row.section)
+        expected = importer.date(filename)
+
+        class FakeDate(datetime.date):
+            @classmethod
+            def today(cls):
+                return cls(2031, 7, 15)
+
+        with mock.patch.object(datetime, "date", FakeDate):
+            self.assertEqual(importer.date(filename), expected)
 
 
 class TestChomp(unittest.TestCase):

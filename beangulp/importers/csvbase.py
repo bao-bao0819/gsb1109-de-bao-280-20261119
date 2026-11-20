@@ -6,7 +6,8 @@ from enum import Enum
 import re
 
 from collections import defaultdict
-from itertools import islice, tee
+from itertools import groupby, islice, tee
+from typing import NamedTuple
 from beancount.core import data
 
 import beangulp
@@ -15,6 +16,80 @@ EMPTY = frozenset()
 
 NA = object()
 """Marker to indicate that a value was not specified."""
+
+
+class MonthDay(NamedTuple):
+    """A month and day without an associated year.
+
+    Values of this type result from parsing date fields that do not
+    specify a year. The year can be resolved providing a statement
+    period and information about the ordering of the rows in the
+    input file. See CSVReader for details.
+
+    """
+
+    month: int
+    day: int
+
+    def __str__(self):
+        return f"{self.month:02d}/{self.day:02d}"
+
+
+def _has_year(frmt):
+    """Check whether a date format specification includes the year."""
+    return any(code in frmt for code in ("%Y", "%y", "%G"))
+
+
+def _candidates(monthday, start, end):
+    """Generate the dates matching a MonthDay within a statement period.
+
+    Only the caller provided period is considered. The current date
+    plays no role in determining the candidate years.
+
+    """
+    for year in range(start.year, end.year + 1):
+        try:
+            candidate = datetime.date(year, monthday.month, monthday.day)
+        except ValueError:
+            # Not a valid date in this year, e.g. February 29th.
+            continue
+        if start <= candidate <= end:
+            yield candidate
+
+
+class DateResolutionError(ValueError):
+    """Base class for errors occurred resolving partial dates."""
+
+
+class AmbiguousDateError(DateResolutionError):
+    """The year of a partial date cannot be uniquely determined.
+
+    Attributes:
+      lineno: Line number of the offending row in the input file.
+      row: The offending row.
+      candidates: The dates consistent with the statement period and
+        the ordering of the rows in the input file.
+
+    """
+
+    def __init__(self, message, lineno, row, candidates):
+        super().__init__(message)
+        self.lineno = lineno
+        self.row = row
+        self.candidates = candidates
+
+
+class InconsistentDateError(DateResolutionError):
+    """Rows cannot be ordered chronologically within the statement period.
+
+    Attributes:
+      rows: The conflicting rows as a list of (lineno, row) pairs.
+
+    """
+
+    def __init__(self, message, rows):
+        super().__init__(message)
+        self.rows = rows
 
 
 def _chomp(iterable, head, tail):
@@ -141,9 +216,17 @@ class Date(Column):
     provided format specification. The format specification is the
     same understood by datetime.datetime.strptime().
 
+    Multiple format specifications can be provided as a sequence.
+    They are tried in order and the first matching one is used.
+    Formats that do not include the year result in MonthDay values.
+    The year of these partial dates can be resolved by the CSVReader
+    when a statement period is provided. This is useful to import
+    statements where the year is only implied by the context.
+
     Args:
       name: Column name or index.
-      frmt: Date format specification.
+      frmt: Date format specification or a sequence of date format
+        specifications.
       default: Value to return if the field is empty, if specified.
 
     """
@@ -151,9 +234,21 @@ class Date(Column):
     def __init__(self, name, frmt="%Y-%m-%d", default=NA):
         super().__init__(name, default=default)
         self.frmt = frmt
+        self.frmts = (frmt,) if isinstance(frmt, str) else tuple(frmt)
+        self.partial = any(not _has_year(frmt) for frmt in self.frmts)
 
     def parse(self, value):
-        return datetime.datetime.strptime(value.strip(), self.frmt).date()
+        value = value.strip()
+        for frmt in self.frmts:
+            try:
+                parsed = datetime.datetime.strptime(value, frmt)
+            except ValueError:
+                continue
+            if _has_year(frmt):
+                return parsed.date()
+            return MonthDay(parsed.month, parsed.day)
+        formats = ", ".join(repr(frmt) for frmt in self.frmts)
+        raise ValueError(f"Cannot parse date {value!r} using formats {formats}")
 
 
 class Amount(Column):
@@ -266,17 +361,37 @@ class CSVReader(metaclass=CSVMeta):
     """Comment character."""
     order = None
     """Order of entries in the CSV file. If None the order will be inferred from the file content."""
+    statement_period = None
+    """Optional statement period as a (start, end) pair of dates.
+
+    The statement period is required to resolve partial dates, dates
+    without a year, in the input file. Candidate years for partial
+    dates are derived exclusively from the statement period; the
+    current date is never consulted.
+    """
+    grouper = None
+    """Optional callable mapping a row to a group key.
+
+    Consecutive rows with the same group key form a group. Groups
+    are assumed to be independently ordered by date and partial
+    dates are resolved independently within each group. If None, all
+    the rows in the file form a single group.
+    """
 
     # This is populated by the CSVMeta metaclass.
     columns = {}
 
-    def __init__(self):
+    def __init__(self, statement_period=None, grouper=None):
         if hasattr(self, 'skiplines'):
             # Warn about use of deprecated class attribute, eventually.
             # warnings.warn('skiplines is deprecated, use header instead', DeprecationWarning)
             self.header = self.skiplines
+        if statement_period is not None:
+            self.statement_period = statement_period
+        if grouper is not None:
+            self.grouper = grouper
 
-    def read(self, filepath):
+    def read(self, filepath, strict=True):
         """Read CSV file according to class defined columns specification.
 
         Use the first rown in the data file to resolve columns
@@ -284,8 +399,18 @@ class CSVReader(metaclass=CSVMeta):
         accessors to access the data fields as defined by the class
         columns specification.
 
+        Partial dates, dates without a year, are resolved using the
+        configured statement period assuming rows within each group
+        are sorted by date. Rows for which the year cannot be
+        uniquely determined raise an AmbiguousDateError, unless
+        strict is False, in which case they are returned unresolved.
+        Rows that cannot possibly be ordered chronologically raise
+        an InconsistentDateError.
+
         Args:
           filepath: Filesystem path to the input file.
+          strict: Whether to raise an AmbiguousDateError when the
+            year of a partial date cannot be uniquely determined.
 
         Yields:
           Namedtuple-like objects.
@@ -317,9 +442,157 @@ class CSVReader(metaclass=CSVMeta):
                 attrs[name] = property(column.getter(names))
             row = type("Row", (tuple,), attrs)
 
-            # Return data rows.
-            for x in reader:
-                yield row(x)
+            # Read data rows.
+            rows = [row(fields) for fields in reader]
+
+        # Resolve partial dates.
+        partial = {
+            name: column
+            for name, column in self.columns.items()
+            if isinstance(column, Date) and column.partial
+        }
+        resolved = self._resolve(rows, partial, strict) if partial else {}
+
+        # Return data rows, overriding resolved partial dates.
+        for index, r in enumerate(rows):
+            values = resolved.get(index)
+            if values:
+                attrs = {
+                    name: property(lambda self, value=value: value)
+                    for name, value in values.items()
+                }
+                yield type("Row", (row,), attrs)(r)
+            else:
+                yield r
+
+    def _resolve(self, rows, partial, strict):
+        """Resolve partial dates.
+
+        Args:
+          rows: The data rows read from the input file.
+          partial: A dict mapping column names to the Date column
+            descriptors that can produce partial dates.
+          strict: Whether to raise an AmbiguousDateError when the
+            year of a partial date cannot be uniquely determined.
+
+        Returns:
+          A dict mapping row indexes to dicts mapping column names to
+          the resolved dates.
+
+        """
+        # Compute the line number of the first data line.
+        offset = int(self.header) + bool(self.names) + 1
+
+        # Split the rows into groups. Empty lines do not contribute
+        # to the grouping.
+        indexed = [(index, row) for index, row in enumerate(rows) if row]
+        if self.grouper is None:
+            groups = [indexed]
+        else:
+            groups = [
+                list(group)
+                for _, group in groupby(indexed, key=lambda item: self.grouper(item[1]))
+            ]
+
+        resolved = {}
+        for group in groups:
+            for name in partial:
+                self._resolve_column(group, name, offset, resolved, strict)
+        return resolved
+
+    def _resolve_column(self, group, name, offset, resolved, strict):
+        """Resolve partial dates in one column within one group of rows."""
+        values = [(index, row, getattr(row, name)) for index, row in group]
+        if not any(isinstance(value, MonthDay) for _, _, value in values):
+            return
+        if self.statement_period is None:
+            raise ValueError(
+                f"A statement period is required to resolve partial dates "
+                f"in column {name!r}"
+            )
+        start, end = self.statement_period
+
+        # Compute the candidate dates for each row. Full dates are
+        # their own only candidate and constrain the resolution of
+        # the partial dates. Values that are not dates do not
+        # constrain the resolution.
+        candidates = []
+        for index, row, value in values:
+            if isinstance(value, MonthDay):
+                choices = list(_candidates(value, start, end))
+                if not choices:
+                    lineno = offset + index
+                    raise InconsistentDateError(
+                        f"No date matching {value} on line {lineno} falls "
+                        f"within the statement period from {start} to {end}",
+                        [(lineno, tuple(row))],
+                    )
+                candidates.append(choices)
+            elif isinstance(value, datetime.date):
+                candidates.append([value])
+            else:
+                candidates.append(None)
+
+        # Forward pass: compute the componentwise minimal assignment
+        # consistent with the rows being sorted by date.
+        forward = []
+        previous = None
+        previous_row = None
+        for (index, row, value), choices in zip(values, candidates):
+            if choices is None:
+                forward.append(previous)
+                continue
+            feasible = [d for d in choices if previous is None or d >= previous]
+            if not feasible:
+                involved = []
+                if previous_row is not None:
+                    involved.append((offset + previous_row[0], tuple(previous_row[1])))
+                involved.append((offset + index, tuple(row)))
+                raise InconsistentDateError(
+                    f"Rows cannot be ordered chronologically within the "
+                    f"statement period from {start} to {end}: "
+                    + "; ".join(f"line {lineno} {row!r}" for lineno, row in involved),
+                    involved,
+                )
+            forward.append(feasible[0])
+            previous = feasible[0]
+            previous_row = (index, row)
+
+        # Backward pass: compute the componentwise maximal
+        # assignment. One is guaranteed to exist because the forward
+        # pass found one.
+        backward = [None] * len(values)
+        following = None
+        for pos in range(len(values) - 1, -1, -1):
+            choices = candidates[pos]
+            if choices is None:
+                backward[pos] = following
+                continue
+            feasible = [d for d in choices if following is None or d <= following]
+            backward[pos] = feasible[-1]
+            following = feasible[-1]
+
+        # The assignment is unique where the minimal and maximal
+        # solutions agree.
+        for pos, (index, row, value) in enumerate(values):
+            if not isinstance(value, MonthDay):
+                continue
+            first, last = forward[pos], backward[pos]
+            if first == last:
+                resolved.setdefault(index, {})[name] = first
+            elif strict:
+                lineno = offset + index
+                choices = [d for d in candidates[pos] if first <= d <= last]
+                raise AmbiguousDateError(
+                    f"Cannot determine the year of date {value} on line "
+                    f"{lineno} {tuple(row)!r}: candidates "
+                    + ", ".join(str(d) for d in choices)
+                    + f" are all consistent with the statement period "
+                    f"from {start} to {end}",
+                    lineno,
+                    tuple(row),
+                    choices,
+                )
 
 
 class Importer(beangulp.Importer, CSVReader):
@@ -335,11 +608,16 @@ class Importer(beangulp.Importer, CSVReader):
       account: Importer default account.
       currency: Importer default currency.
       flag: Importer default flag for new transactions.
+      statement_period: Optional (start, end) pair of dates bounding
+        the statement period. Required to resolve partial dates.
+      grouper: Optional callable mapping a row to a group key.
+        Consecutive rows with the same key form a group within which
+        partial dates are resolved independently.
 
     """
 
-    def __init__(self, account, currency, flag="*"):
-        super().__init__()
+    def __init__(self, account, currency, flag="*", statement_period=None, grouper=None):
+        super().__init__(statement_period=statement_period, grouper=grouper)
         self.importer_account = account
         self.currency = currency
         self.flag = flag
@@ -347,9 +625,21 @@ class Importer(beangulp.Importer, CSVReader):
     def date(self, filepath):
         """Implement beangulp.Importer::date()
 
-        Return the last date seen in the source file.
+        Return the last date seen in the source file. Only dates
+        confirmed while parsing the file contribute to the result:
+        partial dates whose year cannot be uniquely determined are
+        skipped, but all rows are still checked for consistency. The
+        current date plays no role in the result.
         """
-        return max(row.date for row in self.read(filepath) if row)
+        dates = []
+        for row in self.read(filepath, strict=False):
+            if not row:
+                continue
+            value = row.date
+            if value is None or isinstance(value, MonthDay):
+                continue
+            dates.append(value)
+        return max(dates) if dates else None
 
     def account(self, filepath):
         """Implement beangulp.Importer::account()"""

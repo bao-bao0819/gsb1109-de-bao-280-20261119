@@ -327,3 +327,152 @@ def test_vars_order_when_generic_presented_in_bases() -> None:
         "kind": "base",
         "payload": {"kind": "base"},
     }
+
+
+def _make_same_named_entry(field_name: str) -> type:
+    """Build a fresh class whose module/qualname match prior entries."""
+    namespace: dict[str, Any] = {}
+    exec(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class Entry:\n"
+        f"    {field_name}: int\n",
+        namespace,
+    )
+    entry = namespace["Entry"]
+    entry.__module__ = "tests.same_named_entries"
+    entry.__qualname__ = "Entry"
+    return entry
+
+
+@dataclass
+class Envelope(Generic[T]):
+    payload: T
+
+
+@dataclass
+class EnvelopeWithLabel(Envelope[T], Generic[T]):
+    label: str = "x"
+
+
+def _make_record_with_entry(entry: type, name: str) -> type:
+    """Build a record holding ``EnvelopeWithLabel[entry]``.
+
+    The record is assembled dynamically so each factory call can pass a
+    distinct class that shares its module and qualname with the previous one.
+    """
+    namespace: dict[str, Any] = {
+        "EnvelopeWithLabel": EnvelopeWithLabel,
+        "entry": entry,
+        "DataClassDictMixin": DataClassDictMixin,
+        "dataclass": dataclass,
+    }
+    exec(
+        "@dataclass\n"
+        f"class {name}(DataClassDictMixin):\n"
+        "    envelope: EnvelopeWithLabel[entry]\n",
+        namespace,
+    )
+    return namespace[name]
+
+
+def _assert_same_named_generic_entries_are_isolated(old_first: bool) -> None:
+    old_entry = _make_same_named_entry("amount")
+    new_entry = _make_same_named_entry("status")
+    assert old_entry.__module__ == new_entry.__module__
+    assert old_entry.__qualname__ == new_entry.__qualname__
+    assert old_entry is not new_entry
+
+    if old_first:
+        old_record = _make_record_with_entry(old_entry, "OldRecord")
+        first = old_record(
+            envelope=EnvelopeWithLabel(
+                payload=old_entry(amount=1), label="first"
+            )
+        )
+        reloaded = old_record.from_dict(first.to_dict())
+        assert type(reloaded.envelope.payload) is old_entry
+        new_record = _make_record_with_entry(new_entry, "NewRecord")
+    else:
+        new_record = _make_record_with_entry(new_entry, "NewRecord")
+        first = new_record(
+            envelope=EnvelopeWithLabel(
+                payload=new_entry(status=1), label="first"
+            )
+        )
+        assert type(
+            new_record.from_dict(first.to_dict()).envelope.payload
+        ) is new_entry
+        old_record = _make_record_with_entry(old_entry, "OldRecord")
+
+    old_obj = old_record(
+        envelope=EnvelopeWithLabel(
+            payload=old_entry(amount=5), label="old"
+        )
+    )
+    new_obj = new_record(
+        envelope=EnvelopeWithLabel(
+            payload=new_entry(status=7), label="new"
+        )
+    )
+
+    for _ in range(3):
+        assert old_obj.to_dict() == {
+            "envelope": {"payload": {"amount": 5}, "label": "old"}
+        }
+        assert new_obj.to_dict() == {
+            "envelope": {"payload": {"status": 7}, "label": "new"}
+        }
+
+        old_loaded = old_record.from_dict(
+            {"envelope": {"payload": {"amount": 9}, "label": "old"}}
+        )
+        assert type(old_loaded.envelope.payload) is old_entry
+        assert old_loaded.envelope.payload.amount == 9
+        assert not hasattr(old_loaded.envelope.payload, "status")
+
+        new_loaded = new_record.from_dict(
+            {"envelope": {"payload": {"status": 11}, "label": "new"}}
+        )
+        assert type(new_loaded.envelope.payload) is new_entry
+        assert new_loaded.envelope.payload.status == 11
+        assert not hasattr(new_loaded.envelope.payload, "amount")
+
+
+@pytest.mark.parametrize("old_first", [True, False])
+def test_same_named_generic_entries_are_isolated(old_first: bool) -> None:
+    _assert_same_named_generic_entries_are_isolated(old_first)
+
+
+def test_same_named_entry_has_its_own_converter() -> None:
+    old_entry = _make_same_named_entry("amount")
+    old_record = _make_record_with_entry(old_entry, "OldRecord")
+    old_obj = old_record(
+        envelope=EnvelopeWithLabel(payload=old_entry(amount=1))
+    )
+    assert old_obj.to_dict() == {
+        "envelope": {"payload": {"amount": 1}, "label": "x"}
+    }
+
+    new_entry = _make_same_named_entry("status")
+    new_record = _make_record_with_entry(new_entry, "NewRecord")
+    new_obj = new_record(
+        envelope=EnvelopeWithLabel(payload=new_entry(status=2))
+    )
+
+    # The new entry is a different class of the same name, so it must have
+    # gotten its own converter instead of reusing the old entry's one.
+    assert hasattr(new_entry, "__mashumaro_to_dict__")
+    assert hasattr(new_entry, "__mashumaro_from_dict__")
+    assert new_obj.to_dict() == {
+        "envelope": {"payload": {"status": 2}, "label": "x"}
+    }
+
+    # Converting one record must not turn its entry into the other class.
+    reloaded_new = new_record.from_dict(new_obj.to_dict())
+    assert type(reloaded_new.envelope.payload) is new_entry
+    assert reloaded_new.envelope.payload.status == 2
+
+    reloaded_old = old_record.from_dict(old_obj.to_dict())
+    assert type(reloaded_old.envelope.payload) is old_entry
+    assert reloaded_old.envelope.payload.amount == 1

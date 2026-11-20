@@ -1,8 +1,11 @@
 import dataclasses
 import enum
 import inspect
+import itertools
+import threading
 import types
 import typing
+import weakref
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from contextlib import suppress
 
@@ -88,6 +91,12 @@ DataClassDictMixinPath = (
 )
 
 T = typing_extensions.TypeVar("T")
+
+# State used to give same-named but distinct classes distinct converter names.
+_type_arg_plain_name_owners: dict[tuple[str, str], weakref.ref] = {}
+_type_arg_tokens: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_type_arg_token_counter = itertools.count(1)
+_type_arg_name_lock = threading.Lock()
 
 
 # An origin can be a bare typing special form (for example, typing.Literal),
@@ -807,8 +816,72 @@ def is_variable_length_tuple(typ: TypeForm) -> bool:
     return len(type_args) == 2 and type_args[1] is Ellipsis
 
 
+def _claim_type_arg_plain_name(typ: type) -> int | None:
+    """Reserve ``module.qualname`` for ``typ`` or return a suffix.
+
+    Generated generic converter names are derived from the type arguments.
+    Names alone are not unique: a model factory can produce several classes
+    with the same module and qualname (per-tenant/reloaded models), and two
+    such classes must not share the converter of a common generic wrapper.
+    The first live class with a given name keeps the plain name so ordinary
+    types are unaffected; subsequent distinct classes get a stable token.
+    """
+    key = (typ.__module__, typ.__qualname__)
+    with _type_arg_name_lock:
+        owner_ref = _type_arg_plain_name_owners.get(key)
+        owner = owner_ref() if owner_ref is not None else None
+        if owner is typ:
+            return None
+        if owner is None:
+            try:
+                _type_arg_plain_name_owners[key] = weakref.ref(typ)
+            except TypeError:
+                pass
+            return None
+        try:
+            return _type_arg_tokens[typ]
+        except KeyError:
+            token = next(_type_arg_token_counter)
+            try:
+                _type_arg_tokens[typ] = token
+            except TypeError:
+                pass
+            return token
+
+
+def _type_arg_name_for_hash_with_flag(typ: Any) -> tuple[str, bool]:
+    origin = get_type_origin(typ)
+    if origin is not typ:
+        args = get_args(typ)
+        if not args:
+            return type_name(typ), False
+        names = []
+        ambiguous = False
+        for arg in args:
+            arg_name, arg_ambiguous = _type_arg_name_for_hash_with_flag(arg)
+            names.append(arg_name)
+            ambiguous = ambiguous or arg_ambiguous
+        if not ambiguous:
+            return type_name(typ), False
+        origin_name = _type_arg_name_for_hash_with_flag(origin)[0]
+        return f"{origin_name}[{','.join(names)}]", True
+    name = type_name(typ)
+    if not isinstance(typ, type) or is_type_var(typ):
+        return name, False
+    token = _claim_type_arg_plain_name(typ)
+    if token is None:
+        return name, False
+    return f"{name}@{token}", True
+
+
+def _type_arg_name_for_hash(typ: Any) -> str:
+    return _type_arg_name_for_hash_with_flag(typ)[0]
+
+
 def hash_type_args(type_args: Iterable[Any]) -> str:
-    return md5(",".join(map(type_name, type_args)).encode()).hexdigest()
+    return md5(
+        ",".join(map(_type_arg_name_for_hash, type_args)).encode()
+    ).hexdigest()
 
 
 def iter_all_subclasses(cls: type[T]) -> Iterator[type[T]]:

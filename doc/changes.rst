@@ -8,6 +8,17 @@ All Patsy releases are archived at Zenodo:
 .. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.592075.svg
    :target: https://doi.org/10.5281/zenodo.592075
 
+v1.1.0 (unreleased)
+-------------------
+
+* Added the ``return_drop_info`` argument to :func:`dmatrix`,
+  :func:`dmatrices`, and :func:`build_design_matrices`. When enabled, the
+  NA ``drop`` path additionally returns a :class:`DropInfo` object that
+  records, by original row position, which rows were kept or dropped and
+  which factors were missing for each dropped row. Positions are computed
+  during the build, so they stay correct even with duplicate pandas index
+  labels; the default return values are unchanged.
+
 v1.0.3
 ------
 

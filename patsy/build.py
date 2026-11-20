@@ -23,7 +23,7 @@ from patsy.redundancy import pick_contrasts_for_term
 from patsy.eval import EvalEnvironment
 from patsy.contrasts import code_contrast_matrix, Treatment
 from patsy.compat import OrderedDict
-from patsy.missing import NAAction
+from patsy.missing import NAAction, DropInfo
 
 if have_pandas:
     import pandas
@@ -858,8 +858,46 @@ class _CheckMatch(object):
                 raise PatsyError(msg, origin)
 
 
+def _drop_info_from_factor_is_NAs(factor_infos, is_NAs, num_rows, data_index):
+    # factor_infos and is_NAs are parallel lists describing the evaluated
+    # factors. Positions are computed here, at build time, directly from the
+    # per-factor missingness masks -- never reconstructed afterwards from
+    # index labels or by re-evaluating factors.
+    if num_rows is None:
+        # No factors and no DataFrame: the number of rows is unknown (and
+        # build_design_matrices will raise about this below).
+        return DropInfo(None, np.zeros(0, dtype=int), np.zeros(0, dtype=int), ())
+    is_NAs = [np.asarray(is_NA, dtype=bool) for is_NA in is_NAs]
+    total_mask = np.zeros(num_rows, dtype=bool)
+    for is_NA in is_NAs:
+        total_mask |= is_NA
+    kept_positions = np.flatnonzero(~total_mask)
+    dropped_positions = np.flatnonzero(total_mask)
+    drop_reasons = []
+    for position in dropped_positions:
+        drop_reasons.append(
+            tuple(
+                factor_info
+                for factor_info, is_NA in zip(factor_infos, is_NAs)
+                if is_NA[position]
+            )
+        )
+    return DropInfo(
+        num_rows,
+        kept_positions,
+        dropped_positions,
+        drop_reasons,
+        data_index=data_index,
+    )
+
+
 def build_design_matrices(
-    design_infos, data, NA_action="drop", return_type="matrix", dtype=np.dtype(float)
+    design_infos,
+    data,
+    NA_action="drop",
+    return_type="matrix",
+    dtype=np.dtype(float),
+    return_drop_info=False,
 ):
     """Construct several design matrices from :class:`DesignMatrixBuilder`
     objects.
@@ -878,12 +916,23 @@ def build_design_matrices(
     :arg return_type: Either ``"matrix"`` or ``"dataframe"``. See below.
     :arg dtype: The dtype of the returned matrix. Useful if you want to use
       single-precision or extended-precision.
+    :arg return_drop_info: If True, then instead of returning just the list
+      of design matrices, return a tuple ``(matrices, drop_info)``, where
+      ``drop_info`` is a :class:`DropInfo` object recording which rows of
+      the original data (by integer position) were kept or dropped by the
+      NA ``drop`` action, and which factors were missing for each dropped
+      row. The matrices themselves are identical to those returned when
+      this option is not used. This requires `NA_action` to be a built-in
+      :class:`NAAction` (e.g. ``"drop"`` or ``"raise"``); with
+      ``NA_action="raise"``, missing values still raise the usual
+      :class:`PatsyError`.
 
     This function returns either a list of :class:`DesignMatrix` objects (for
     ``return_type="matrix"``) or a list of :class:`pandas.DataFrame` objects
     (for ``return_type="dataframe"``). In both cases, all returned design
     matrices will have ``.design_info`` attributes containing the appropriate
-    :class:`DesignInfo` objects.
+    :class:`DesignInfo` objects. (If ``return_drop_info=True``, then this
+    list is returned as the first element of a tuple, as described above.)
 
     Note that unlike :func:`design_matrix_builders`, this function takes only
     a simple data argument, not any kind of iterator. That's because this
@@ -924,6 +973,8 @@ def build_design_matrices(
 
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
+    .. versionadded:: 1.1.0
+       The ``return_drop_info`` argument.
 
     """
     if isinstance(NA_action, str):
@@ -966,14 +1017,28 @@ def build_design_matrices(
                 value = np.asarray(value)
                 factor_info_to_values[factor_info] = value
     # Handle NAs
+    factor_infos = list(factor_info_to_values)
     values = list(factor_info_to_values.values())
-    is_NAs = list(factor_info_to_isNAs.values())
-    origins = [factor_info.factor.origin for factor_info in factor_info_to_values]
+    is_NAs = [factor_info_to_isNAs[factor_info] for factor_info in factor_infos]
+    origins = [factor_info.factor.origin for factor_info in factor_infos]
     pandas_index = index_checker.value
     num_rows = rows_checker.value
     # num_rows is None iff evaluator_to_values (and associated sets like
     # 'values') are empty, i.e., we have no actual evaluators involved
     # (formulas like "~ 1").
+    if return_drop_info:
+        if not isinstance(NA_action, NAAction):
+            raise PatsyError(
+                "return_drop_info=True is only supported with the built-in "
+                "NA actions ('drop' and 'raise'); cannot track dropped rows "
+                "for a custom NA_action object like %r" % (NA_action,)
+            )
+        # Computed before handle_NA runs, directly from the per-factor
+        # missingness masks. For on_NA="raise" with missing values present,
+        # handle_NA below still raises the usual PatsyError.
+        drop_info = _drop_info_from_factor_is_NAs(
+            factor_infos, is_NAs, num_rows, pandas_index
+        )
     if return_type == "dataframe" and num_rows is not None:
         if pandas_index is None:
             pandas_index = np.arange(num_rows)
@@ -1019,6 +1084,8 @@ def build_design_matrices(
                 matrix, columns=di.column_names, index=pandas_index
             )
             matrices[i].design_info = di
+    if return_drop_info:
+        return matrices, drop_info
     return matrices
 
 

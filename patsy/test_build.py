@@ -796,3 +796,155 @@ def test_DesignInfo_subset():
     min_di_subset = min_di.subset(["c", "a"])
     assert min_di_subset.column_names == ["c", "a"]
     assert min_di_subset.terms is None
+
+
+def test_build_drop_info():
+    from patsy.missing import DropInfo
+
+    train_data = {"x": [1.0, 2.0], "c": np.asarray(["c1", "c2"], dtype=object)}
+
+    def iter_maker():
+        yield train_data
+
+    builder = design_matrix_builders([make_termlist("x", "c")], iter_maker, 0)[0]
+
+    # Row 1 has a missing numerical factor, row 2 a missing categorical
+    # factor, row 3 has both missing at once:
+    data = {
+        "x": [1.0, np.nan, 3.0, np.nan],
+        "c": np.asarray(["c1", "c2", None, None], dtype=object),
+    }
+    (mat,), drop_info = build_design_matrices([builder], data, return_drop_info=True)
+    (default_mat,) = build_design_matrices([builder], data)
+    assert isinstance(drop_info, DropInfo)
+    # The matrix itself is unchanged by requesting drop info:
+    assert np.array_equal(mat, default_mat)
+    assert drop_info.num_rows_in == 4
+    assert drop_info.num_rows_out == 1
+    assert np.array_equal(drop_info.kept_positions, [0])
+    assert np.array_equal(drop_info.dropped_positions, [1, 2, 3])
+    # No index was involved, so there are no label annotations:
+    assert drop_info.data_index is None
+    assert drop_info.kept_labels is None
+    assert drop_info.dropped_labels is None
+    # All simultaneously-missing factors are recorded, identified by their
+    # FactorInfo objects:
+    factor_infos = {fi.factor.name(): fi for fi in builder.factor_infos.values()}
+    assert drop_info.drop_reasons[0] == (factor_infos["x"],)
+    assert drop_info.drop_reasons[1] == (factor_infos["c"],)
+    assert set(drop_info.drop_reasons[2]) == {factor_infos["x"], factor_infos["c"]}
+    assert drop_info.drop_reason_names == (("x",), ("c",), ("x", "c"))
+    # Positional lookups:
+    assert drop_info.row_for_position(0) == 0
+    assert drop_info.row_for_position(1) is None
+    assert drop_info.reasons_for_position(0) is None
+    assert drop_info.reasons_for_position(3) == drop_info.drop_reasons[2]
+
+    # NA_action="raise" still raises the original error:
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [builder],
+        data,
+        NA_action="raise",
+        return_drop_info=True,
+    )
+    # ... and with no NAs present, "raise" gives an all-kept DropInfo:
+    clean_data = {"x": [1.0, 2.0], "c": np.asarray(["c1", "c2"], dtype=object)}
+    (mat,), drop_info = build_design_matrices(
+        [builder], clean_data, NA_action="raise", return_drop_info=True
+    )
+    assert np.array_equal(drop_info.kept_positions, [0, 1])
+    assert drop_info.dropped_positions.shape == (0,)
+    assert drop_info.drop_reasons == ()
+
+    # Custom NA_action objects are not supported:
+    class CustomNAAction(object):
+        def is_numerical_NA(self, arr):
+            return np.zeros(np.asarray(arr).shape[0], dtype=bool)
+
+        def is_categorical_NA(self, obj):
+            return False
+
+        def handle_NA(self, values, is_NAs, origins):
+            return values
+
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [builder],
+        clean_data,
+        NA_action=CustomNAAction(),
+        return_drop_info=True,
+    )
+
+    # Data-independent designs still can't guess a row count:
+    def iter_maker1():
+        yield {"x": [1.0]}
+
+    intercept_builder = design_matrix_builders([make_termlist()], iter_maker1, 0)[0]
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [intercept_builder],
+        {},
+        return_drop_info=True,
+    )
+
+
+def test_build_drop_info_same_expression_different_state():
+    # Two factors that display identically ("unseen_to_nan(x)") but which
+    # memorized different state in different training batches. Their
+    # missingness judgments differ, and the drop report must be able to
+    # tell them apart.
+    from patsy.highlevel import dmatrix
+    from patsy.state import stateful_transform
+
+    class UnseenToNan(object):
+        def __init__(self):
+            self._seen = set()
+
+        def memorize_chunk(self, data):
+            self._seen.update(np.asarray(data, dtype=float).ravel().tolist())
+
+        def memorize_finish(self):
+            pass
+
+        def transform(self, data):
+            return np.array(
+                [
+                    value if value in self._seen else np.nan
+                    for value in np.asarray(data, dtype=float).ravel()
+                ]
+            )
+
+    unseen_to_nan = stateful_transform(UnseenToNan)
+    env = {"unseen_to_nan": unseen_to_nan}
+
+    # Same expression, trained on two different batches:
+    di_a = dmatrix("unseen_to_nan(x) + 0", data=dict(env, x=[1.0, 2.0])).design_info
+    di_b = dmatrix("unseen_to_nan(x) + 0", data=dict(env, x=[2.0, 3.0])).design_info
+    (fi_a,) = di_a.factor_infos.values()
+    (fi_b,) = di_b.factor_infos.values()
+    assert fi_a.factor.name() == fi_b.factor.name() == "unseen_to_nan(x)"
+    assert fi_a is not fi_b
+
+    new_data = dict(env, x=[1.0, 2.0, 3.0])
+    mats, drop_info = build_design_matrices(
+        [di_a, di_b], new_data, return_drop_info=True
+    )
+    default_mats = build_design_matrices([di_a, di_b], new_data)
+    assert len(mats) == 2
+    for mat, default_mat in zip(mats, default_mats):
+        assert np.array_equal(mat, default_mat)
+    # di_a never saw 3.0; di_b never saw 1.0. Only the middle row survives:
+    assert np.array_equal(drop_info.kept_positions, [1])
+    assert np.array_equal(drop_info.dropped_positions, [0, 2])
+    # Both reasons display the same, but point at the distinct FactorInfo
+    # objects that actually memorized the differing states:
+    assert drop_info.drop_reason_names == (
+        ("unseen_to_nan(x)",),
+        ("unseen_to_nan(x)",),
+    )
+    assert drop_info.reasons_for_position(0) == (fi_b,)
+    assert drop_info.reasons_for_position(2) == (fi_a,)

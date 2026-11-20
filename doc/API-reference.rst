@@ -235,6 +235,9 @@ Missing values
 .. autoclass:: NAAction
    :members:
 
+.. autoclass:: DropInfo
+   :members:
+
 Linear constraints
 ------------------
 

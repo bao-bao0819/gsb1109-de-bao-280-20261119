@@ -19,6 +19,7 @@ from patsy.design_info import DesignMatrix, DesignInfo
 from patsy.eval import EvalEnvironment
 from patsy.desc import ModelDesc
 from patsy.build import design_matrix_builders, build_design_matrices
+from patsy.missing import DropInfo
 from patsy.util import have_pandas, asarray_or_pandas, atleast_2d_column_default
 
 if have_pandas:
@@ -130,11 +131,12 @@ def incr_dbuilders(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
     return design_infos
 
 
-# This always returns a length-two tuple,
-#   response, predictors
+# This always returns a length-three tuple,
+#   response, predictors, drop_info
 # where
 #   response is a DesignMatrix (possibly with 0 columns)
 #   predictors is a DesignMatrix
+#   drop_info is a DropInfo object if return_drop_info=True, else None
 # The input 'formula_like' could be like:
 #   (np.ndarray, np.ndarray)
 #   (DesignMatrix, DesignMatrix)
@@ -147,7 +149,9 @@ def incr_dbuilders(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
 #   DesignInfo
 #   (DesignInfo, DesignInfo)
 #   any object with a special method __patsy_get_model_desc__
-def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
+def _do_highlevel_design(
+    formula_like, data, eval_env, NA_action, return_type, return_drop_info=False
+):
     if return_type == "dataframe" and not have_pandas:
         raise PatsyError("pandas.DataFrame was requested, but pandas is not installed")
     if return_type not in ("matrix", "dataframe"):
@@ -163,9 +167,17 @@ def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
         formula_like, data_iter_maker, eval_env, NA_action
     )
     if design_infos is not None:
-        return build_design_matrices(
-            design_infos, data, NA_action=NA_action, return_type=return_type
+        result = build_design_matrices(
+            design_infos,
+            data,
+            NA_action=NA_action,
+            return_type=return_type,
+            return_drop_info=return_drop_info,
         )
+        if return_drop_info:
+            matrices, drop_info = result
+            return (matrices[0], matrices[1], drop_info)
+        return (result[0], result[1], None)
     else:
         # No builders, but maybe we can still get matrices
         if isinstance(formula_like, tuple):
@@ -224,10 +236,33 @@ def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
                 lhs.index = rhs.index
             if rhs_orig_index is None and lhs_orig_index is not None:
                 rhs.index = lhs.index
-        return (lhs, rhs)
+        drop_info = None
+        if return_drop_info:
+            # No NA handling happens on this code path, so every row is
+            # kept.
+            num_rows = lhs.shape[0]
+            if rhs_orig_index is not None:
+                data_index = rhs_orig_index
+            else:
+                data_index = lhs_orig_index
+            drop_info = DropInfo(
+                num_rows,
+                np.arange(num_rows),
+                np.zeros(0, dtype=int),
+                (),
+                data_index=data_index,
+            )
+        return (lhs, rhs, drop_info)
 
 
-def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="matrix"):
+def dmatrix(
+    formula_like,
+    data={},
+    eval_env=0,
+    NA_action="drop",
+    return_type="matrix",
+    return_drop_info=False,
+):
     """Construct a single design matrix given a formula_like and data.
 
     :arg formula_like: An object that can be used to construct a design
@@ -247,6 +282,12 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
       :class:`NAAction` object. See :class:`NAAction` for details on what
       values count as 'missing' (and how to alter this).
     :arg return_type: Either ``"matrix"`` or ``"dataframe"``. See below.
+    :arg return_drop_info: If True, then return a tuple
+      ``(matrix, drop_info)``, where ``drop_info`` is a :class:`DropInfo`
+      object recording which rows of the original data (by integer
+      position) were kept or dropped by the NA ``drop`` action, and which
+      factors were missing for each dropped row. The matrix itself is
+      identical to the one returned when this option is not used.
 
     The `formula_like` can take a variety of forms. You can use any of the
     following:
@@ -280,6 +321,9 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
     * A :class:`DesignMatrix`, if ``return_type="matrix"`` (the default)
     * A :class:`pandas.DataFrame`, if ``return_type="dataframe"``.
 
+    (Or, if ``return_drop_info=True``, a tuple of one of the above together
+    with a :class:`DropInfo` object.)
+
     The actual contents of the design matrix is identical in both cases, and
     in both cases a :class:`DesignInfo` object will be available in a
     ``.design_info`` attribute on the return value. However, for
@@ -289,34 +333,47 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
 
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
+    .. versionadded:: 1.1.0
+       The ``return_drop_info`` argument.
     """
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
-    (lhs, rhs) = _do_highlevel_design(
-        formula_like, data, eval_env, NA_action, return_type
+    (lhs, rhs, drop_info) = _do_highlevel_design(
+        formula_like, data, eval_env, NA_action, return_type, return_drop_info
     )
     if lhs.shape[1] != 0:
         raise PatsyError(
             "encountered outcome variables for a model that does not expect them"
         )
+    if return_drop_info:
+        return (rhs, drop_info)
     return rhs
 
 
 def dmatrices(
-    formula_like, data={}, eval_env=0, NA_action="drop", return_type="matrix"
+    formula_like,
+    data={},
+    eval_env=0,
+    NA_action="drop",
+    return_type="matrix",
+    return_drop_info=False,
 ):
     """Construct two design matrices given a formula_like and data.
 
     This function is identical to :func:`dmatrix`, except that it requires
     (and returns) two matrices instead of one. By convention, the first matrix
     is the "outcome" or "y" data, and the second is the "predictor" or "x"
-    data.
+    data. If ``return_drop_info=True``, then a tuple ``(lhs, rhs, drop_info)``
+    is returned instead, where ``drop_info`` is a :class:`DropInfo` object
+    describing how the rows of both matrices map back onto the original data.
 
     See :func:`dmatrix` for details.
     """
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
-    (lhs, rhs) = _do_highlevel_design(
-        formula_like, data, eval_env, NA_action, return_type
+    (lhs, rhs, drop_info) = _do_highlevel_design(
+        formula_like, data, eval_env, NA_action, return_type, return_drop_info
     )
     if lhs.shape[1] == 0:
         raise PatsyError("model is missing required outcome variables")
+    if return_drop_info:
+        return (lhs, rhs, drop_info)
     return (lhs, rhs)

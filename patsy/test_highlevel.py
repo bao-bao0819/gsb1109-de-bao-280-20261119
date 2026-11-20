@@ -997,3 +997,144 @@ def test_NAActioon_pandas_string_index():
     dm2 = dmatrix(di, data2, 0, return_type="dataframe")
     assert np.allclose(dm2, [[1.0, 6.0, 4.0], [1.0, 7.0, 5.0]])
     assert list(dm2.columns) == ["Intercept", "x", "z"]
+
+
+def test_drop_info():
+    from patsy.missing import DropInfo
+
+    return_types = ["matrix"]
+    if have_pandas:
+        return_types.append("dataframe")
+
+    # Plain dict data: no index labels involved at all.
+    data = {
+        "y": [1.0, np.nan, 3.0],
+        "x": [10.0, 20.0, 30.0],
+        "c": ["a", "b", None],
+    }
+    for return_type in return_types:
+        lhs, rhs, drop_info = dmatrices(
+            "y ~ x + c", data=data, return_type=return_type, return_drop_info=True
+        )
+        lhs0, rhs0 = dmatrices("y ~ x + c", data=data, return_type=return_type)
+        assert isinstance(drop_info, DropInfo)
+        # Requesting drop info does not change the matrices:
+        assert np.array_equal(np.asarray(lhs), np.asarray(lhs0))
+        assert np.array_equal(np.asarray(rhs), np.asarray(rhs0))
+        assert drop_info.num_rows_in == 3
+        assert drop_info.num_rows_out == 1
+        assert np.array_equal(drop_info.kept_positions, [0])
+        assert np.array_equal(drop_info.dropped_positions, [1, 2])
+        assert drop_info.drop_reason_names == (("y",), ("c",))
+        assert drop_info.data_index is None
+        assert drop_info.kept_labels is None
+        # Default calls are unaffected (same return types as before):
+        assert isinstance(dmatrix("x", data=data, return_type=return_type), type(rhs0))
+        pair = dmatrices("y ~ x", data=data, return_type=return_type)
+        assert len(pair) == 2
+
+    # Explicit matrices pass straight through; nothing is dropped:
+    mat, drop_info = dmatrix([[1, 2], [3, 4]], return_drop_info=True)
+    assert np.array_equal(mat, [[1, 2], [3, 4]])
+    assert drop_info.num_rows_in == 2
+    assert np.array_equal(drop_info.kept_positions, [0, 1])
+    assert drop_info.dropped_positions.shape == (0,)
+    assert drop_info.drop_reasons == ()
+
+
+def test_drop_info_pandas_duplicate_index():
+    if not have_pandas:
+        return
+    from patsy.missing import DropInfo
+
+    # The index has duplicate labels: position 1 and 2 both carry label 1,
+    # positions 3 and 4 both carry label 2. The response is missing at one
+    # of the duplicated positions (1), and the continuous and categorical
+    # factors are simultaneously missing at another (2).
+    df = pandas.DataFrame(
+        {
+            "y": [1.0, np.nan, 3.0, 4.0, 5.0],
+            "x": [10.0, 20.0, np.nan, 40.0, 50.0],
+            "c": ["a", "b", None, "b", "a"],
+        },
+        index=[0, 1, 1, 2, 2],
+    )
+
+    for return_type in ["matrix", "dataframe"]:
+        lhs, rhs, drop_info = dmatrices(
+            "y ~ x + c", data=df, return_type=return_type, return_drop_info=True
+        )
+        lhs0, rhs0 = dmatrices("y ~ x + c", data=df, return_type=return_type)
+        assert isinstance(drop_info, DropInfo)
+        # Matrices are identical to the default entry point:
+        assert np.array_equal(np.asarray(lhs), np.asarray(lhs0))
+        assert np.array_equal(np.asarray(rhs), np.asarray(rhs0))
+        # Positions, not labels, identify rows:
+        assert drop_info.num_rows_in == 5
+        assert np.array_equal(drop_info.kept_positions, [0, 3, 4])
+        assert np.array_equal(drop_info.dropped_positions, [1, 2])
+        # Labels only annotate the original data (and are ambiguous here):
+        assert list(drop_info.kept_labels) == [0, 2, 2]
+        assert list(drop_info.dropped_labels) == [1, 1]
+        # All simultaneously missing factors are recorded:
+        assert drop_info.drop_reason_names == (("y",), ("x", "c"))
+        reasons_2 = drop_info.reasons_for_position(2)
+        assert {fi.factor.name() for fi in reasons_2} == {"x", "c"}
+        assert drop_info.reasons_for_position(0) is None
+        # Original positions recover matrix rows and join back to the data:
+        assert drop_info.row_for_position(0) == 0
+        assert drop_info.row_for_position(1) is None
+        assert drop_info.row_for_position(2) is None
+        assert drop_info.row_for_position(3) == 1
+        assert drop_info.row_for_position(4) == 2
+        kept_rows = df.iloc[drop_info.kept_positions]
+        assert np.array_equal(kept_rows["y"], np.asarray(lhs).ravel())
+        x_column = rhs.design_info.column_names.index("x")
+        assert np.array_equal(kept_rows["x"], np.asarray(rhs)[:, x_column])
+        if return_type == "dataframe":
+            assert lhs.index.equals(pandas.Index([0, 2, 2]))
+            assert rhs.index.equals(pandas.Index([0, 2, 2]))
+
+        # Intercept-only RHS: rows dropped because of the LHS do not leak
+        # into the intercept matrix, and both sides share one mapping:
+        lhs1, rhs1, drop_info1 = dmatrices(
+            "y ~ 1", data=df, return_type=return_type, return_drop_info=True
+        )
+        assert np.array_equal(drop_info1.kept_positions, [0, 2, 3, 4])
+        assert np.array_equal(drop_info1.dropped_positions, [1])
+        assert drop_info1.drop_reason_names == (("y",),)
+        assert np.asarray(rhs1).shape == (4, 1)
+        assert np.all(np.asarray(rhs1) == 1)
+        assert np.array_equal(
+            np.asarray(lhs1).ravel(), df["y"].iloc[drop_info1.kept_positions]
+        )
+
+        # Single-matrix entry point:
+        mat, drop_info2 = dmatrix(
+            "x + c", data=df, return_type=return_type, return_drop_info=True
+        )
+        mat0 = dmatrix("x + c", data=df, return_type=return_type)
+        assert np.array_equal(np.asarray(mat), np.asarray(mat0))
+        assert np.array_equal(drop_info2.kept_positions, [0, 1, 3, 4])
+        assert np.array_equal(drop_info2.dropped_positions, [2])
+        assert drop_info2.drop_reason_names == (("x", "c"),)
+
+        # The raise path is unchanged:
+        pytest.raises(
+            PatsyError,
+            dmatrices,
+            "y ~ x + c",
+            data=df,
+            return_type=return_type,
+            NA_action="raise",
+            return_drop_info=True,
+        )
+
+    # Explicit pandas objects passed through directly: no dropping happens,
+    # and the index is attached as an annotation of the original data.
+    y_df = pandas.DataFrame({"y": [1.0, 2.0]}, index=[7, 7])
+    x_df = pandas.DataFrame({"x": [3.0, 4.0]}, index=[7, 7])
+    lhs, rhs, drop_info = dmatrices((y_df, x_df), return_drop_info=True)
+    assert drop_info.num_rows_in == 2
+    assert np.array_equal(drop_info.kept_positions, [0, 1])
+    assert list(drop_info.kept_labels) == [7, 7]

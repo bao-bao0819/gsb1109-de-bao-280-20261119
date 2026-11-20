@@ -41,7 +41,7 @@ from patsy import PatsyError
 from patsy.util import safe_isnan, safe_scalar_isnan, no_pickling, assert_no_pickling
 
 # These are made available in the patsy.* namespace
-__all__ = ["NAAction"]
+__all__ = ["NAAction", "DropInfo"]
 
 _valid_NA_types = ["None", "NaN"]
 _valid_NA_responses = ["raise", "drop"]
@@ -186,6 +186,156 @@ class NAAction(object):
         return [v[good_mask] if v.ndim == 1 else v[good_mask, ...] for v in values]
 
     __getstate__ = no_pickling
+
+
+class DropInfo(object):
+    """Records how the ``drop`` NA action mapped the rows of the original
+    data onto the rows of the returned design matrices.
+
+    A :class:`DropInfo` is returned (alongside the design matrices) when
+    calling :func:`build_design_matrices`, :func:`dmatrix`, or
+    :func:`dmatrices` with ``return_drop_info=True``. It allows the rows of
+    the returned matrices to be joined back onto the original data, and
+    records exactly which factors were missing for each dropped row.
+
+    All row references are *positional*: they are integer offsets into the
+    original data (i.e. what you would pass to ``numpy.take`` or
+    ``pandas.DataFrame.iloc``), counted before any rows were dropped. They
+    are computed while the matrices are being built -- they are never
+    reconstructed from pandas index labels, so they remain unambiguous even
+    when the original data has a duplicate index. If the original data did
+    have a pandas index, it is available as :attr:`data_index` purely as an
+    annotation of the original data.
+
+    .. versionadded:: 1.1.0
+
+    Attributes:
+
+    .. attribute:: num_rows_in
+
+       The number of rows in the original data, before dropping.
+
+    .. attribute:: kept_positions
+
+       A 1-d integer ndarray. ``kept_positions[i]`` is the position in the
+       original data of the row that became row ``i`` of the returned
+       matrices. All matrices returned from the same build share this
+       mapping, including intercept-only matrices.
+
+    .. attribute:: dropped_positions
+
+       A 1-d integer ndarray, in ascending order, giving the positions in
+       the original data of every row that was dropped.
+
+    .. attribute:: drop_reasons
+
+       A tuple parallel to :attr:`dropped_positions`. Each entry is a tuple
+       of :class:`FactorInfo` objects identifying every factor whose value
+       was missing at that position. If a single row had several missing
+       factors, all of them are listed. The entries are
+       :class:`FactorInfo` objects (not names), so two factors that display
+       identically but memorized different state (e.g. from different
+       training batches) are still reported as distinct entries.
+
+    .. attribute:: data_index
+
+       The pandas :class:`~pandas.Index` of the original data, if one was
+       involved in the build, otherwise ``None``. This is only an
+       annotation of the original data: index labels may be duplicated, so
+       always use the positional attributes above to join results back onto
+       your data.
+    """
+
+    def __init__(
+        self, num_rows_in, kept_positions, dropped_positions, drop_reasons, data_index=None
+    ):
+        self.num_rows_in = num_rows_in
+        self.kept_positions = np.asarray(kept_positions, dtype=int)
+        self.dropped_positions = np.asarray(dropped_positions, dtype=int)
+        self.drop_reasons = tuple(drop_reasons)
+        self.data_index = data_index
+        if self.kept_positions.ndim != 1 or self.dropped_positions.ndim != 1:
+            raise ValueError("kept_positions and dropped_positions must be 1-d")
+        if len(self.drop_reasons) != self.dropped_positions.shape[0]:
+            raise ValueError(
+                "drop_reasons must have one entry per dropped position"
+            )
+        if num_rows_in is not None:
+            if (
+                self.kept_positions.shape[0] + self.dropped_positions.shape[0]
+                != num_rows_in
+            ):
+                raise ValueError(
+                    "kept and dropped positions do not add up to num_rows_in"
+                )
+
+    @property
+    def num_rows_out(self):
+        """The number of rows in each returned design matrix."""
+        return self.kept_positions.shape[0]
+
+    @property
+    def kept_labels(self):
+        """The index labels of the kept rows, or None if the original data
+        had no pandas index.
+
+        These are only an annotation of the original data; labels may be
+        duplicated. Use :attr:`kept_positions` to join back reliably."""
+        if self.data_index is None:
+            return None
+        return self.data_index.take(self.kept_positions)
+
+    @property
+    def dropped_labels(self):
+        """The index labels of the dropped rows, or None if the original
+        data had no pandas index. See :attr:`kept_labels`."""
+        if self.data_index is None:
+            return None
+        return self.data_index.take(self.dropped_positions)
+
+    @property
+    def drop_reason_names(self):
+        """Like :attr:`drop_reasons`, but with each :class:`FactorInfo`
+        replaced by its display name.
+
+        Convenient for reporting, but note that distinct factors (e.g. the
+        same expression memorized in different training batches) may share
+        a single name; use :attr:`drop_reasons` itself to tell them apart.
+        """
+        return tuple(
+            tuple(factor_info.factor.name() for factor_info in reasons)
+            for reasons in self.drop_reasons
+        )
+
+    def row_for_position(self, position):
+        """Returns the row index in the returned matrices corresponding to
+        the given original data position, or None if that row was dropped.
+        """
+        matches = np.flatnonzero(self.kept_positions == position)
+        if matches.shape[0] == 0:
+            return None
+        return int(matches[0])
+
+    def reasons_for_position(self, position):
+        """Returns the tuple of :class:`FactorInfo` objects whose missing
+        values caused the given original data position to be dropped, or
+        None if that row was kept."""
+        matches = np.flatnonzero(self.dropped_positions == position)
+        if matches.shape[0] == 0:
+            return None
+        return self.drop_reasons[int(matches[0])]
+
+    def __repr__(self):
+        return (
+            "DropInfo(num_rows_in=%r, num_rows_out=%r, "
+            "dropped_positions=%r, drop_reason_names=%r)"
+            % (
+                self.num_rows_in,
+                self.num_rows_out,
+                self.dropped_positions,
+                self.drop_reason_names,
+            )
+        )
 
 
 def test_NAAction_basic():

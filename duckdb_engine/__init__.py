@@ -247,6 +247,10 @@ class Dialect(PGDialect_psycopg2):
     name = "duckdb"
     driver = "duckdb_engine"
     _has_events = False
+    # DuckDB does not enforce PostgreSQL's 63-byte identifier limit;
+    # reflected CHECK constraint names (which DuckDB derives from the
+    # constraint expression) routinely exceed it
+    max_identifier_length = 9999
     supports_statement_cache = False
     supports_comments = has_comment_support()
     supports_sane_rowcount = False

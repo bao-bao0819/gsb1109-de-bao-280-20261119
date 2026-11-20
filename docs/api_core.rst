@@ -25,3 +25,9 @@ apispec.utils
 
 .. automodule:: apispec.utils
     :members:
+
+apispec.pagination
+------------------
+
+.. automodule:: apispec.pagination
+    :members:

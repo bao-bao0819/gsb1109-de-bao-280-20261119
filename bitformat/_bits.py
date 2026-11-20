@@ -9,7 +9,7 @@ from typing import Any, TextIO
 from bitformat._common import Colour, DtypeKind
 from bitformat._options import Options
 from bitformat._tibs import Mutibs, Tibs, TibsLike, mutibs_from_any, tibs_from_any
-from bitformat._dtypes import Dtype, DtypeArray, DtypeSingle, DtypeTuple, Register
+from bitformat._dtypes import Dtype, DtypeArray, DtypeSingle, DtypeTuple, DtypeScaled, Register
 
 __all__ = ["Tibs", "Mutibs", "TibsLike", "tibs_from_any", "mutibs_from_any"]
 
@@ -32,6 +32,14 @@ def _convert_bytes_to_printable(data: bytes) -> str:
 def _chars_per_dtype(dtype: Dtype, bits_per_group: int) -> int:
     if isinstance(dtype, (DtypeSingle, DtypeArray)):
         return Register().kind_to_def[dtype.kind].bitlength2chars_fn(bits_per_group)
+    if isinstance(dtype, DtypeScaled):
+        if not dtype.has_known_size():
+            raise ValueError(f"Cannot determine a print width for the unevaluated dtype '{dtype}'.")
+        lo, hi = dtype._raw_range()
+        widest = max(len(str(lo * dtype.scale + dtype.offset)), len(str(hi * dtype.scale + dtype.offset)))
+        if dtype.missing is not None:
+            widest = max(widest, len(str(None)))
+        return widest
     assert isinstance(dtype, DtypeTuple)
     return sum(_chars_per_dtype(d, bits_per_group) for d in dtype) + 2 + 2 * (dtype.items - 1)
 
@@ -48,7 +56,7 @@ def _format_tibs(bits: Tibs | Mutibs, bits_per_group: int, sep: str, dtype: Dtyp
                  colour_end: str, width: int | None = None) -> tuple[str, int]:
     get_fn = dtype.unpack
     chars_per_group = _chars_per_dtype(dtype, bits_per_group)
-    if isinstance(dtype, (DtypeSingle, DtypeArray)):
+    if isinstance(dtype, (DtypeSingle, DtypeArray, DtypeScaled)):
         kind = dtype.kind
         if kind is DtypeKind.BYTES:
             get_fn = lambda b: _convert_bytes_to_printable(b.bytes)

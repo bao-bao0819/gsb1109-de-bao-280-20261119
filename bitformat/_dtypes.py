@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import abc
 import functools
+from fractions import Fraction
 from typing import Any, Callable, Iterable, Sequence, overload, Self
 import bitformat
 from ._common import Expression, Endianness, DtypeKind, override, final, parser_str, ExpressionError
 from lark import Transformer, UnexpectedInput
 import lark
-from bitformat._tibs import Mutibs, Tibs, TibsLike, tibs_from_any
+from bitformat._tibs import Mutibs, Tibs, TibsLike, tibs_from_any, tibs_to_padded_bytes
 
-__all__ = ["Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "DtypeDefinition", "Register", "DtypeTransformer"]
+__all__ = ["Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "DtypeScaled", "DtypeDefinition", "Register", "DtypeTransformer",
+           "ScaledIntError", "ScaledIntRangeError", "ScaledIntPrecisionError", "ScaledIntMissingError"]
 
 
 class DtypeTransformer(Transformer):
@@ -51,6 +53,25 @@ class DtypeTransformer(Transformer):
         size = items[1]
         endianness = Endianness.UNSPECIFIED if items[2] is None else items[2]
         return DtypeSingle.from_params(kind, size, endianness)
+
+    @staticmethod
+    def scaled_param(items) -> Fraction | Expression:
+        item = items[0]
+        if isinstance(item, Expression):
+            return item
+        try:
+            return Fraction(str(item))
+        except (ValueError, ZeroDivisionError) as e:
+            raise ValueError(f"Invalid rational number '{item}' in scaled integer dtype: {e}")
+
+    @staticmethod
+    def dtype_scaled(items) -> DtypeScaled:
+        assert len(items) in (3, 4)
+        size = items[0]
+        scale = items[1]
+        offset = items[2]
+        missing = items[3] if len(items) == 4 else None
+        return DtypeScaled.from_params(size, scale, offset, missing)
 
     @staticmethod
     def dtype_items(items) -> int:
@@ -483,6 +504,320 @@ class DtypeSingle(Dtype):
 
         """
         return self._size
+
+
+class ScaledIntError(ValueError):
+    """Base class for errors raised when packing or unpacking a :class:`DtypeScaled`."""
+
+
+class ScaledIntRangeError(ScaledIntError):
+    """The raw code needed to represent a value lies outside the range of the signed integer field."""
+
+
+class ScaledIntPrecisionError(ScaledIntError):
+    """A value cannot be exactly represented with the declared scale and offset.
+
+    Raised instead of silently rounding the value to the nearest representable one.
+    """
+
+
+class ScaledIntMissingError(ScaledIntError):
+    """A value can only be represented by the reserved missing code, or no missing code is declared.
+
+    Only ``None`` may be written as a missing value; ordinary values that would collide
+    with the reserved raw code are rejected with this error.
+    """
+
+
+def _as_exact_rational(value: Any, name: str) -> Fraction:
+    """Convert a value to an exact Fraction, rejecting types that would lose information."""
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, bool):
+        raise TypeError(f"The {name} of a scaled integer cannot be a bool.")
+    if isinstance(value, int):
+        return Fraction(value)
+    if isinstance(value, float):
+        # Interpret floats via their shortest decimal representation, so 0.5 -> 1/2.
+        return Fraction(str(value))
+    if isinstance(value, str):
+        try:
+            return Fraction(value)
+        except (ValueError, ZeroDivisionError):
+            raise ValueError(f"Cannot interpret the string '{value}' as a rational number for the {name} of a scaled integer.")
+    raise TypeError(f"The {name} of a scaled integer must be an int, float, str or Fraction, not '{type(value).__name__}'.")
+
+
+def _scaled_bits_to_int(bits: Tibs) -> int:
+    """Interpret the whole of a Tibs as a two's complement signed integer."""
+    length = len(bits)
+    if length <= 128:
+        return bits.to_i()
+    padding = -length % 8
+    u = int.from_bytes(tibs_to_padded_bytes(bits), "big") >> padding
+    return u - (1 << length) if bits[0] else u
+
+
+def _scaled_int_to_bits(value: int, length: int) -> Tibs:
+    """Create a Tibs of the given length from a two's complement signed integer."""
+    if length <= 128:
+        return Tibs.from_i(value, length=length)
+    u = (1 << length) + value if value < 0 else value
+    byte_length = (length + 7) // 8
+    offset = byte_length * 8 - length
+    return Tibs.from_bytes(u.to_bytes(byte_length, "big"), offset=offset, length=length)
+
+
+class DtypeScaled(Dtype):
+    """A data type of a single scaled signed integer value.
+
+    The raw bits are interpreted as a two's complement signed integer ``raw``, and the
+    value represented is ``raw * scale + offset``, where ``scale`` and ``offset`` are
+    exact rational numbers. An optional reserved raw code can be declared to represent
+    a missing value, which unpacks as ``None``.
+
+    .. code-block:: pycon
+
+        >>> d = Dtype('si8(1/2, 0)')        # 8-bit signed int, units of 1/2, no offset
+        >>> d.unpack('0b00000101')
+        Fraction(5, 2)
+        >>> d2 = Dtype('si8(1/4, 16, -128)')  # units of 1/4, offset 16, -128 means missing
+        >>> d2.unpack('0b10000000') is None
+        True
+
+    Unpacking always returns an exact :class:`fractions.Fraction` (or ``None`` for the
+    reserved missing code). Packing is strict: values that are out of range, that cannot
+    be exactly represented, or that would collide with the reserved missing code raise
+    a :class:`ScaledIntError` rather than being silently rounded.
+
+    The size, scale, offset and missing code can also be given as expressions, for
+    example ``'si8({s}, {o})'``, which are evaluated when the dtype is used to parse
+    or pack with the appropriate keyword arguments.
+
+    """
+
+    _size: Expression
+    _scale: Fraction | Expression
+    _offset: Fraction | Expression
+    _missing: int | Expression | None
+    _bit_length: int | None
+
+    @classmethod
+    @override
+    def from_params(cls, size: int | Expression, scale: Any, offset: Any = 0,
+                    missing: int | Expression | None = None) -> Self:
+        """Create a new DtypeScaled from its parameters.
+
+        It's usually clearer to use the Dtype constructor directly with a dtype string, but
+        this builder can be used to avoid string parsing.
+
+        :param size: The number of bits of the underlying signed integer, or an Expression.
+        :param scale: The exact rational scale, as an int, float, str, Fraction or Expression.
+        :param offset: The exact rational offset, as an int, float, str, Fraction or Expression.
+        :param missing: An optional reserved raw code used to represent a missing value.
+
+        ``DtypeScaled.from_params(8, Fraction(1, 2), 0)`` is equivalent to ``Dtype('si8(1/2, 0)')``.
+
+        """
+        x = super().__new__(cls)
+        x._size = size if isinstance(size, Expression) else Expression.from_int(int(size))
+        x._bit_length = None
+        if x._size.has_const_value and x._size.const_value is not None:
+            if x._size.const_value < 1:
+                raise ValueError(f"The size of a scaled integer must be at least 1 bit, not {x._size.const_value}.")
+            x._bit_length = x._size.const_value
+        x._scale = cls._param_to_rational_or_expression(scale, "scale")
+        if isinstance(x._scale, Fraction) and x._scale == 0:
+            raise ValueError("The scale of a scaled integer cannot be zero.")
+        x._offset = cls._param_to_rational_or_expression(offset, "offset")
+        if missing is not None and not isinstance(missing, Expression):
+            missing = int(missing)
+            if x._bit_length is not None:
+                lo, hi = x._raw_range()
+                if not lo <= missing <= hi:
+                    raise ValueError(f"The missing code {missing} doesn't fit in a {x._bit_length} bit signed integer. "
+                                     f"The allowed range is [{lo}, {hi}].")
+        x._missing = missing
+        return x
+
+    @staticmethod
+    def _param_to_rational_or_expression(value: Any, name: str) -> Fraction | Expression:
+        if isinstance(value, Expression):
+            if value.has_const_value:
+                return _as_exact_rational(value.const_value, name)
+            return value
+        return _as_exact_rational(value, name)
+
+    def _raw_range(self) -> tuple[int, int]:
+        """The inclusive range of raw codes for the underlying signed integer."""
+        assert self._bit_length is not None
+        return -(1 << (self._bit_length - 1)), (1 << (self._bit_length - 1)) - 1
+
+    def _is_concrete(self) -> bool:
+        """Whether the dtype has no unevaluated expressions and a known size."""
+        return (self._bit_length is not None
+                and not isinstance(self._scale, Expression)
+                and not isinstance(self._offset, Expression)
+                and not isinstance(self._missing, Expression))
+
+    def _require_concrete(self) -> None:
+        if not self._is_concrete():
+            raise ValueError(f"The scaled integer dtype '{self}' contains unevaluated expressions, "
+                             f"so it can't be used directly. Evaluate it first, for example by parsing "
+                             f"with the appropriate keyword arguments.")
+
+    @property
+    def kind(self) -> DtypeKind:
+        return DtypeKind.SCALED_INT
+
+    @property
+    def size(self) -> Expression:
+        """The size of the data type as an Expression.
+
+        This is the number of bits of the underlying signed integer.
+        """
+        return self._size
+
+    @property
+    def scale(self) -> Fraction | Expression:
+        """The exact rational scale, or an unevaluated Expression."""
+        return self._scale
+
+    @property
+    def offset(self) -> Fraction | Expression:
+        """The exact rational offset, or an unevaluated Expression."""
+        return self._offset
+
+    @property
+    def missing(self) -> int | Expression | None:
+        """The reserved raw code representing a missing value, or None if there isn't one."""
+        return self._missing
+
+    @override
+    @final
+    def pack(self, value: Any, /) -> bitformat.Tibs:
+        """Create and return a new Tibs from a value.
+
+        The value should be exactly representable as ``raw * scale + offset`` for some
+        raw signed integer code that fits in the dtype's size. Packing ``None`` writes
+        the reserved missing code. No rounding is ever performed; instead one of the
+        :class:`ScaledIntError` subclasses is raised.
+
+        """
+        self._require_concrete()
+        n = self._bit_length
+        if value is None:
+            if self._missing is None:
+                raise ScaledIntMissingError(f"Cannot pack None with '{self}' as it declares no missing code.")
+            return _scaled_int_to_bits(self._missing, n)
+        v = _as_exact_rational(value, "value")
+        q = (v - self._offset) / self._scale
+        if q.denominator != 1:
+            raise ScaledIntPrecisionError(f"The value {v} cannot be exactly represented by '{self}' as it would need "
+                                          f"the non-integer raw code {q}. It will not be silently rounded.")
+        raw = q.numerator
+        lo, hi = self._raw_range()
+        if not lo <= raw <= hi:
+            raise ScaledIntRangeError(f"The value {v} needs the raw code {raw} which is out of range for '{self}'. "
+                                      f"The allowed range is [{lo}, {hi}].")
+        if self._missing is not None and raw == self._missing:
+            raise ScaledIntMissingError(f"The value {v} can only be represented by the reserved missing code "
+                                        f"{self._missing} of '{self}'. Only None may be written as a missing value.")
+        return _scaled_int_to_bits(raw, n)
+
+    def _get_fn(self, b: TibsLike, start: int, length: int) -> Fraction | None:
+        """Return the scaled value from a slice of the bits, or None for the missing code."""
+        self._require_concrete()
+        raw = _scaled_bits_to_int(tibs_from_any(b)[start:start + length])
+        if self._missing is not None and raw == self._missing:
+            return None
+        return Fraction(raw) * self._scale + self._offset
+
+    @override
+    @final
+    def _unpack(self, b: TibsLike, /) -> tuple[int, Fraction | None]:
+        b = tibs_from_any(b)
+        self._require_concrete()
+        if self._bit_length > len(b):
+            raise ValueError(f"{self!r} is {self._bit_length} bits long, but only got {len(b)} bits to unpack.")
+        return self._bit_length, self._get_fn(b, 0, self._bit_length)
+
+    @override
+    @final
+    def _unpack_no_checks(self, b: Tibs | Mutibs) -> Fraction | None:
+        return self._get_fn(b, 0, len(b))
+
+    @override
+    @final
+    def _get_bit_length(self) -> int | None:
+        return self._bit_length
+
+    @override
+    @final
+    def has_known_size(self) -> bool:
+        # The size is only reported as known when the dtype is fully concrete, so that
+        # fields will evaluate any expressions before using the dtype.
+        return self._is_concrete()
+
+    @override
+    @final
+    def has_dynamic_size(self) -> bool:
+        return False
+
+    @override
+    @final
+    def evaluate(self, **kwargs) -> Self:
+        if self._is_concrete():
+            return self
+        size = self._size.evaluate(**kwargs)
+        scale = self._scale.evaluate(**kwargs) if isinstance(self._scale, Expression) else self._scale
+        offset = self._offset.evaluate(**kwargs) if isinstance(self._offset, Expression) else self._offset
+        missing = self._missing.evaluate(**kwargs) if isinstance(self._missing, Expression) else self._missing
+        return DtypeScaled.from_params(size, scale, offset, missing)
+
+    @override
+    def info(self) -> str:
+        if self._bit_length is not None:
+            len_str = f"{self._bit_length} bit"
+        else:
+            len_str = f"{self._size} sized"
+        s = f"{len_str} scaled signed int with scale {self._param_str(self._scale)} and offset {self._param_str(self._offset)}"
+        if self._missing is not None:
+            s += f", missing code {self._param_str(self._missing)}"
+        return s
+
+    @staticmethod
+    def _param_str(p: Fraction | Expression | int | None) -> str:
+        if isinstance(p, Expression):
+            return str(p)
+        if isinstance(p, Fraction):
+            return str(p.numerator) if p.denominator == 1 else f"{p.numerator}/{p.denominator}"
+        return str(p)
+
+    @override
+    @final
+    def __str__(self) -> str:
+        params = [self._param_str(self._scale), self._param_str(self._offset)]
+        if self._missing is not None:
+            params.append(self._param_str(self._missing))
+        return f"si{self._size}({', '.join(params)})"
+
+    @override
+    @final
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, str):
+            other = Dtype.from_string(other)
+        if isinstance(other, DtypeScaled):
+            return (self._size == other._size
+                    and self._scale == other._scale
+                    and self._offset == other._offset
+                    and self._missing == other._missing)
+        return False
+
+    @override
+    @final
+    def __hash__(self) -> int:
+        return hash((self._size, self._scale, self._offset, self._missing))
 
 
 class DtypeArray(Dtype):

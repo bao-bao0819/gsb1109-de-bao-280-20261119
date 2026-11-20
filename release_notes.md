@@ -1,5 +1,13 @@
 # Release Notes
 
+### Unreleased
+
+* New `si` scaled-integer dtype, e.g. `'si8(1/4, 16, -128)'`. The raw signed integer is interpreted as
+  `raw * scale + offset` with exact rational scale and offset, and an optional reserved raw code represents
+  a missing value (which unpacks as `None`). Packing is strict and never silently rounds: out-of-range,
+  not-exactly-representable and missing-code-colliding values raise `ScaledIntRangeError`,
+  `ScaledIntPrecisionError` and `ScaledIntMissingError` respectively.
+
 ### November 2025; version 0.9.
 
 * Allowing upper-case 0B, 0X and 0O prefixes as they are allowable in Python.

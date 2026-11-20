@@ -53,6 +53,7 @@ class DtypeKind(Enum):
     BITS = 'bits'  # doc: A bitformat ``Tibs`` object.
     BOOL = 'bool'  # doc: A single bit boolean value.
     PAD = 'pad'  # doc: Padding can be used to skip over a section of data.
+    SCALED_INT = 'si'  # doc: A signed int scaled by an exact rational scale and offset, with an optional reserved code for missing values.
 
     def __str__(self):
         return self.value

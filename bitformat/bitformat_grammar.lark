@@ -1,7 +1,14 @@
 start: field_type
 
-// This should reflect the DtypeKind enum.
+// This should reflect the DtypeKind enum (except for 'si' which has its own rule below).
 dtype_kind: /u|i|f|bool|bytes|hex|bin|oct|bits|pad/
+
+// A signed integer of the given bit length that is scaled by an exact rational
+// scale and offset, with an optional reserved raw code for missing values.
+// For example "si8(1/2, 0)" or "si8(1/4, 16, -128)".
+dtype_scaled: "si" dtype_size "(" scaled_param "," scaled_param ["," scaled_param] [","] ")"
+scaled_param: SCALED_NUMBER | expression
+SCALED_NUMBER: /-?\d+(\.\d+)?(\/\d+)?/
 
 // Endian modifiers for dtypes
 dtype_modifier: /le|be/
@@ -14,11 +21,11 @@ dtype_size: INT | expression
 dtype_items: INT | expression
 
 // dtype is the abstract base class for the dtypes below.
-?dtype: dtype_tuple | dtype_single | dtype_array
+?dtype: dtype_tuple | dtype_single | dtype_array | dtype_scaled
 
 // When in a Field, the tuple dtype needs start with 'tuple('.
 // This is so that it isn't confused with a Format.
-?field_dtype: field_dtype_tuple | dtype_single | dtype_array
+?field_dtype: field_dtype_tuple | dtype_single | dtype_array | dtype_scaled
 
 // A dtype with a single type and optional size, for example "u8".
 dtype_single: dtype_kind [dtype_size] ["_" dtype_modifier]

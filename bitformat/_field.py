@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ._bits import Tibs
-from ._dtypes import Dtype, DtypeSingle, DtypeTuple
+from ._dtypes import Dtype, DtypeSingle, DtypeTuple, DtypeScaled
 from ast import literal_eval
 from ._common import override, Indenter, Colour, DtypeKind, validate_name, ExpressionError
 from typing import Any, Iterable, Self
@@ -187,6 +187,18 @@ class Field(FieldType):
 
     def _set_value_no_const_check(self, value: Any, kwargs: dict[str, Any]) -> None:
         if value is None:
+            if isinstance(self._dtype, DtypeScaled):
+                # A missing value can only be written as the reserved raw code of the scaled dtype.
+                # If the dtype declares no missing code then packing None will raise.
+                concrete = self._concrete_dtype
+                if concrete is None:
+                    try:
+                        concrete = self._dtype.evaluate(**kwargs)
+                    except ExpressionError:
+                        raise ValueError(f"Field '{self}' cannot compute a concrete dtype with kwargs {kwargs}, so can't set the value.")
+                    self._concrete_dtype = concrete
+                self._bits = concrete.pack(None)
+                return
             raise ValueError("Cannot set the value of a Field to None. Perhaps you could use clear()?")
         if self._concrete_dtype is not None:
             self._bits = self._concrete_dtype.pack(value)
@@ -203,6 +215,9 @@ class Field(FieldType):
         if self._const and value is not None:
             raise ValueError(f"Cannot set the value of a const Field '{self}'.")
         if value is not None:
+            self._set_value_no_const_check(value, kwargs)
+        elif not self._const and isinstance(self._dtype, DtypeScaled):
+            # For scaled dtypes None is a real value (a missing reading), written as the reserved code.
             self._set_value_no_const_check(value, kwargs)
 
     def _get_dtype(self) -> Dtype:

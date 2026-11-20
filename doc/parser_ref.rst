@@ -38,6 +38,10 @@ The source of truth for the string parsing is contained in the `Lark grammar fil
       - ``(`` ``Dtype1`` ``,`` ``...`` ``)``
     * -
       - e.g. ``'(bool, u7)'``, ``'([u8; 5], (bool, bool))'``
+    * - :class:`DtypeScaled` (Dtype)
+      - ``si`` ``size_expression`` ``(`` ``scale`` ``,`` ``offset`` ``<, missing_code>`` ``)``
+    * -
+      - e.g. ``'si8(1/2, 0)'``, ``'si8(1/4, 16, -128)'``, ``'si8({s}, {o})'``
     * - :class:`Field` (FieldType)
       - ``<name_str:>`` ``Dtype``
     * -

@@ -33,7 +33,8 @@ __author__ = "Scott Griffiths"
 from ._version import VERSION as __version__
 from ._bits import Tibs, Mutibs, TibsLike
 from ._array import Array
-from ._dtypes import Register, Dtype, DtypeSingle, DtypeArray, DtypeTuple
+from ._dtypes import (Register, Dtype, DtypeSingle, DtypeArray, DtypeTuple, DtypeScaled,
+                      ScaledIntError, ScaledIntRangeError, ScaledIntPrecisionError, ScaledIntMissingError)
 from ._fieldtype import FieldType
 from ._field import Field
 from ._format import Format
@@ -48,8 +49,9 @@ from ._reader import Reader
 from ._dtype_definitions import dtype_definitions as _dtype_definitions
 
 
-__all__ = ["Tibs", "Mutibs", "TibsLike", "Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "Format", "FieldType", "Field", "Array", "Expression",
-           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind"]
+__all__ = ["Tibs", "Mutibs", "TibsLike", "Dtype", "DtypeSingle", "DtypeArray", "DtypeTuple", "DtypeScaled", "Format", "FieldType", "Field", "Array", "Expression",
+           "Options", "Repeat", "While", "Register", "Endianness", "If", "Pass", "Let", "Reader", "DtypeKind",
+           "ScaledIntError", "ScaledIntRangeError", "ScaledIntPrecisionError", "ScaledIntMissingError"]
 
 
 def _init():

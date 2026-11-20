@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from beancount import loader
 from beancount import parser
+from beancount.core import account
 from beancount.core import amount
 from beancount.core import convert
 from beancount.core import data
@@ -391,11 +392,70 @@ class _PostingsTableRow:
         # The current posting being evaluated.
         self.posting = None
 
+        # The resolved effective department of the posting and where it
+        # comes from. See _resolve_department().
+        self.department = None
+        self.department_source = None
+
     def __hash__(self):
         # The context hash is used in caching column accessor functions.
         # Instead than hashing the row context content, use the rowid as
         # hash.
         return self.rowid
+
+
+# Sentinel used to distinguish an absent metadata key from a key
+# explicitly set to an empty value.
+_UNSET = object()
+
+
+def _meta_department(meta):
+    """Get the department metadata value of a directive.
+
+    Return _UNSET when the metadata has no department key so that an
+    absent key can be told apart from a key explicitly declared with an
+    empty value.
+    """
+    if meta is None:
+        return _UNSET
+    return meta.get('department', _UNSET)
+
+
+def _resolve_department(posting, entry, accounts):
+    """Resolve the effective department of a posting.
+
+    Return a (value, source) tuple. The source is one of:
+
+    - 'posting': the posting metadata explicitly declares a department.
+    - 'transaction': the transaction metadata explicitly declares a
+      department, overriding any account default.
+    - 'default': the department is inherited from the nearest account
+      on the account path whose open directive declares a department
+      and is still in effect at the transaction date.
+    - 'cleared': the posting or transaction metadata explicitly
+      declares an empty department, suppressing any inherited value.
+    - 'missing': no department is declared anywhere and no account
+      default is in effect at the transaction date.
+
+    """
+    value = _meta_department(posting.meta)
+    if value is not _UNSET:
+        return (value, 'posting') if value else (None, 'cleared')
+    value = _meta_department(entry.meta)
+    if value is not _UNSET:
+        return (value, 'transaction') if value else (None, 'cleared')
+    date = entry.date
+    name = posting.account
+    while name:
+        open_entry, close_entry = accounts.get(name, (None, None))
+        if (open_entry is not None
+                and open_entry.date <= date
+                and (close_entry is None or date < close_entry.date)):
+            value = _meta_department(open_entry.meta)
+            if value is not _UNSET and value:
+                return value, 'default'
+        name = account.parent(name)
+    return None, 'missing'
 
 
 class PostingsTable(_BeancountTable):
@@ -405,6 +465,7 @@ class PostingsTable(_BeancountTable):
 
     def __iter__(self):
         entries = self.prepare()
+        accounts = get_account_open_close(entries)
         context = _PostingsTableRow()
         for entry in entries:
             if isinstance(entry, data.Transaction):
@@ -412,6 +473,7 @@ class PostingsTable(_BeancountTable):
                 for posting in entry.postings:
                     context.rowid += 1
                     context.posting = posting
+                    context.department, context.department_source = _resolve_department(posting, entry, accounts)
                     yield context
 
     @columns.register(str)
@@ -583,6 +645,27 @@ class PostingsTable(_BeancountTable):
     @columns.register(dict)
     def meta(context):
         return context.posting.meta
+
+    @columns.register(str)
+    def department(context):
+        """The effective department of the posting.
+
+        This is the department explicitly declared on the posting or on
+        the parent transaction, when present, or the default declared
+        by the nearest account on the account path whose open directive
+        is in effect at the transaction date. It is None when the
+        department is explicitly cleared or no value can be resolved.
+        """
+        return context.department
+
+    @columns.register(str)
+    def department_source(context):
+        """How the effective department of the posting is determined.
+
+        One of 'posting', 'transaction', 'default', 'cleared' or
+        'missing'. See the 'department' column.
+        """
+        return context.department_source
 
     @columns.register(data.Transaction)
     def entry(context):

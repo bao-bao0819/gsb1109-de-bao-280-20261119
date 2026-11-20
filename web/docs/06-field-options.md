@@ -275,7 +275,9 @@ assert User.from_dict({"UserID": 3}) == User(3)
 assert User(4).to_dict() == {"userId": 4}
 ```
 
-Aliases are tried in declaration order. If an input contains more than one of them, the first matching alias wins. The first alias is also the primary alias used when serializing by alias and as the property name in generated JSON Schema. An empty sequence uses the Python field name.
+Aliases are declaration-ordered input names. When an input contains more than one alias for the same field, every present key is converted with the field's own deserialization rules and the converted values must be equal. For example, an `int` field accepts `{"new_quantity": 1, "old_quantity": "01"}` because both keys become `1`, while a `str` field rejects `{"new_code": "007", "old_code": "7"}` because the leading zeros are significant. If the converted values differ, `ConflictingFieldValues` reports the field and all its input keys. A key whose value cannot be converted raises `InvalidFieldValue` naming that key, even when another key holds a valid value. The first alias is the primary alias used when serializing by alias and as the property name in generated JSON Schema, so successful output contains only that name. An empty sequence uses the Python field name.
+
+Every input key must belong to exactly one field. If one key is accepted by two different fields, model compilation raises `AmbiguousFieldAliasError` naming the key and both fields before any data is read.
 
 Set `allow_deserialization_not_by_alias=True` when the Python field name should also be accepted. It is tried after all declared aliases. With `forbid_extra_keys=True`, every declared alias and the optional Python field name count as expected keys.
 

@@ -303,7 +303,7 @@ Discriminator(
 Annotated[int, Alias("externalName"), Alias("legacyName")]
 ```
 
-[`Annotated`](https://docs.python.org/3/library/typing.html#typing.Annotated) preserves the underlying static type while carrying Mashumaro's runtime metadata. Multiple `Alias` annotations are tried in order during deserialization; the first is used for alias serialization and generated JSON Schema.
+[`Annotated`](https://docs.python.org/3/library/typing.html#typing.Annotated) preserves the underlying static type while carrying Mashumaro's runtime metadata. Multiple `Alias` annotations declare accepted input keys; every present key is converted with the field's rules and the results must agree. The first alias is used for alias serialization and generated JSON Schema.
 
 ## Field helper
 

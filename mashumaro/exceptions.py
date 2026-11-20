@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from typing_extensions import TypeForm
@@ -110,12 +111,16 @@ class InvalidFieldValue(ValueError):
         field_value: Any,
         holder_class: type,
         msg: str | None = None,
+        key: str | None = None,
     ):
         self.field_name = field_name
         self.field_type = field_type
         self.field_value = field_value
         self.holder_class = holder_class
         self.msg = msg
+        self.key = key
+        self.key_name = key
+        self.input_key = key
 
     @property
     def field_type_name(self) -> str:
@@ -131,9 +136,78 @@ class InvalidFieldValue(ValueError):
             f"in {self.holder_class_name} has invalid value "
             f"{self.field_value!r}"
         )
+        if self.key is not None:
+            s += f" for input key {self.key!r}"
         if self.msg:
             s += f": {self.msg}"
         return s
+
+
+class ConflictingFieldValues(InvalidFieldValue):
+    """Several input keys for one field convert to different values.
+
+    ``key_to_value`` maps each present input key to the value produced by
+    applying the field's own deserialization rules to it.  Because the
+    comparison happens after conversion, equivalent representations (for
+    example ``"01"`` and ``1`` for an ``int`` field) are accepted instead of
+    being reported as a conflict.
+    """
+
+    def __init__(
+        self,
+        field_name: str,
+        field_type: Any,
+        key_to_value: Mapping[str, Any],
+        holder_class: type,
+    ):
+        self.key_to_value = dict(key_to_value)
+        self.keys = tuple(self.key_to_value)
+        keys_str = ", ".join(repr(k) for k in self.keys)
+        values_str = ", ".join(
+            f"{k!r}: {v!r}" for k, v in self.key_to_value.items()
+        )
+        msg = (
+            f"input keys {keys_str} have conflicting values after "
+            f"conversion ({values_str})"
+        )
+        super().__init__(
+            field_name,
+            field_type,
+            self.key_to_value,
+            holder_class,
+            msg=msg,
+        )
+
+
+class AmbiguousFieldAliasError(ValueError):
+    """One input key is accepted by more than one field of a model.
+
+    Raised while the deserialization method is built, before any payload is
+    read, so the model can never silently dispatch the key to one field.
+    """
+
+    def __init__(
+        self,
+        input_key: str,
+        field_names: Sequence[str],
+        holder_class: type,
+    ):
+        self.input_key = input_key
+        self.key = input_key
+        self.key_name = input_key
+        self.field_names = tuple(field_names)
+        self.holder_class = holder_class
+
+    @property
+    def holder_class_name(self) -> str:
+        return type_name(self.holder_class, short=True)
+
+    def __str__(self) -> str:
+        names = ", ".join(f'"{name}"' for name in self.field_names)
+        return (
+            f'Input key "{self.input_key}" in {self.holder_class_name} '
+            f"is ambiguous: it is accepted by fields {names}"
+        )
 
 
 class MissingDiscriminatorError(LookupError):

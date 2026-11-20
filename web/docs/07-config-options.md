@@ -115,7 +115,9 @@ class Config(BaseConfig):
     }
 ```
 
-Each value may be a string or an ordered sequence of strings. During deserialization, aliases are tried in order and the first key present in the input wins. The first alias is the primary name used for alias serialization and generated JSON Schema. An empty sequence uses the Python field name.
+Each value may be a string or an ordered sequence of strings. During deserialization every key present for a field is converted with that field's own rules, and the converted values must agree; otherwise `ConflictingFieldValues` reports the field and the input keys. This lets an `int` field accept both `"01"` and `1` while a text field keeps `"007"` distinct from `"7"`. The first alias is the primary name used for alias serialization and generated JSON Schema, so output uses only that key. An empty sequence uses the Python field name.
+
+A key may be claimed by only one field. If two fields accept the same input key, compilation raises `AmbiguousFieldAliasError` naming the key and both fields before any payload is read.
 
 A per-field metadata alias overrides an `Annotated` alias, which overrides this mapping. Alias sources are not combined.
 
@@ -149,7 +151,7 @@ class Config(BaseConfig):
     allow_deserialization_not_by_alias = True
 ```
 
-This is valuable for gradual API migrations. With multiple aliases, the Python field name is tried after every declared alias. If several accepted keys are present, the first declared alias wins.
+This is valuable for gradual API migrations. With multiple aliases, the Python field name is accepted after every declared alias. When several accepted keys are present they follow the same per-field conversion and consistency rules described above.
 
 ## Omission rules
 

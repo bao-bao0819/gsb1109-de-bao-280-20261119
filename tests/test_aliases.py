@@ -10,7 +10,13 @@ from mashumaro.config import (
     TO_DICT_ADD_OMIT_NONE_FLAG,
     BaseConfig,
 )
-from mashumaro.exceptions import ExtraKeysError, MissingField
+from mashumaro.exceptions import (
+    AmbiguousFieldAliasError,
+    ConflictingFieldValues,
+    ExtraKeysError,
+    InvalidFieldValue,
+    MissingField,
+)
 from mashumaro.types import Alias
 
 
@@ -494,3 +500,223 @@ def test_multiple_aliases_field_name_listed_as_alias():
 
     assert DataClass.from_dict({"x": 1}) == DataClass(1)
     assert DataClass.from_dict({"id": 2}) == DataClass(2)
+
+
+@dataclass
+class _Order(DataClassDictMixin):
+    quantity: Annotated[int, Alias("new_quantity"), Alias("old_quantity")]
+    product_code: Annotated[
+        str, Alias("new_product_code"), Alias("old_product_code")
+    ]
+    note: Annotated[
+        Optional[str], Alias("new_note"), Alias("old_note")
+    ] = None
+    legacy_only: Annotated[int, Alias("old_legacy")] = 7
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+def test_multiple_keys_converted_with_field_rules_before_comparison():
+    # The old quantity key carries the string "01" while the new one carries
+    # the number 1. Both are ints after the field's own conversion, so the
+    # payload is accepted rather than rejected because raw values differ.
+    order = _Order.from_dict(
+        {
+            "new_quantity": 1,
+            "old_quantity": "01",
+            "new_product_code": "007",
+            "old_product_code": "007",
+        }
+    )
+    assert order.quantity == 1
+    assert order.product_code == "007"
+
+
+def test_multiple_keys_serialize_only_canonical_new_key():
+    order = _Order.from_dict(
+        {
+            "new_quantity": 1,
+            "old_quantity": "01",
+            "new_product_code": "007",
+            "old_product_code": "007",
+        }
+    )
+    assert order.to_dict() == {
+        "new_quantity": 1,
+        "new_product_code": "007",
+        "new_note": None,
+        "old_legacy": 7,
+    }
+
+
+def test_multiple_keys_text_field_leading_zeros_stay_distinct():
+    # product_code is a str field, so "007" and "7" are different values
+    # even though the quantity field accepts "01" and 1 as equal.
+    with pytest.raises(ConflictingFieldValues) as exc_info:
+        _Order.from_dict(
+            {
+                "new_quantity": 1,
+                "old_quantity": "01",
+                "new_product_code": "007",
+                "old_product_code": "7",
+            }
+        )
+    exc = exc_info.value
+    assert exc.field_name == "product_code"
+    assert set(exc.keys) == {"new_product_code", "old_product_code"}
+    assert exc.key_to_value == {
+        "new_product_code": "007",
+        "old_product_code": "7",
+    }
+
+
+def test_multiple_keys_bad_value_is_reported_with_its_key():
+    with pytest.raises(InvalidFieldValue) as exc_info:
+        _Order.from_dict(
+            {
+                "new_quantity": 1,
+                "old_quantity": "not-a-number",
+                "new_product_code": "007",
+                "old_product_code": "007",
+            }
+        )
+    exc = exc_info.value
+    assert exc.field_name == "quantity"
+    assert exc.key == "old_quantity"
+    assert exc.field_value == "not-a-number"
+
+
+def test_bad_value_is_not_masked_by_valid_value_of_another_key():
+    # The first key holds a valid value, but every present key is converted
+    # before a value is selected, so the bad second key must still fail.
+    with pytest.raises(InvalidFieldValue) as exc_info:
+        _Order.from_dict(
+            {
+                "new_quantity": 1,
+                "old_quantity": object(),
+                "new_product_code": "007",
+                "old_product_code": "007",
+            }
+        )
+    exc = exc_info.value
+    assert exc.field_name == "quantity"
+    assert exc.key == "old_quantity"
+
+
+def test_single_new_key_order_and_single_old_key_order():
+    assert _Order.from_dict(
+        {
+            "new_quantity": 1,
+            "new_product_code": "007",
+        }
+    ) == _Order(quantity=1, product_code="007")
+    assert _Order.from_dict(
+        {
+            "old_quantity": "01",
+            "old_product_code": "007",
+        }
+    ) == _Order(quantity=1, product_code="007")
+
+
+def test_multiple_keys_default_applies_only_when_both_absent():
+    assert _Order.from_dict(
+        {"new_quantity": 1, "new_product_code": "007"}
+    ).legacy_only == 7
+    assert _Order.from_dict(
+        {
+            "new_quantity": 1,
+            "new_product_code": "007",
+            "old_legacy": 8,
+        }
+    ).legacy_only == 8
+
+
+def test_nested_order_fields_use_their_own_keys():
+    @dataclass
+    class Line(DataClassDictMixin):
+        quantity: Annotated[int, Alias("new_quantity"), Alias("old_quantity")]
+
+    @dataclass
+    class Document(DataClassDictMixin):
+        line: Line = field(metadata={"alias": ["new_line", "old_line"]})
+
+    # Both outer keys are present and equivalent; each nested record is
+    # decoded according to the Line field names, not the Document ones.
+    document = Document.from_dict(
+        {
+            "new_line": {"new_quantity": 1, "old_quantity": "01"},
+            "old_line": {"new_quantity": 1, "old_quantity": "01"},
+        }
+    )
+    assert document.line == Line(quantity=1)
+
+    with pytest.raises(ConflictingFieldValues) as exc_info:
+        Document.from_dict(
+            {
+                "new_line": {"new_quantity": 1, "old_quantity": "01"},
+                "old_line": {"new_quantity": 2, "old_quantity": "02"},
+            }
+        )
+    assert exc_info.value.field_name == "line"
+
+
+def test_ambiguous_config_raises_at_compile_time_before_reading_data():
+    with pytest.raises(AmbiguousFieldAliasError) as exc_info:
+
+        @dataclass
+        class Ambiguous(DataClassDictMixin):
+            first: int = 0
+            second: int = 0
+
+            class Config(BaseConfig):
+                aliases = {
+                    "first": ["shared"],
+                    "second": ["shared"],
+                }
+
+    exc = exc_info.value
+    assert exc.input_key == "shared"
+    assert set(exc.field_names) == {"first", "second"}
+
+
+def test_ambiguous_config_does_not_double_dispatch():
+    with pytest.raises(AmbiguousFieldAliasError) as exc_info:
+
+        @dataclass
+        class Ambiguous(DataClassDictMixin):
+            first: int = 0
+            second: int = 0
+
+            class Config(BaseConfig):
+                aliases = {
+                    "first": ["new_first", "shared"],
+                    "second": ["new_second", "shared"],
+                }
+
+    assert exc_info.value.input_key == "shared"
+    assert set(exc_info.value.field_names) == {"first", "second"}
+
+
+def test_extra_keys_and_defaults_kept_with_multiple_keys():
+    @dataclass
+    class DataClass(DataClassDictMixin):
+        x: Annotated[int, Alias("new_x"), Alias("old_x")] = 5
+
+        class Config(BaseConfig):
+            forbid_extra_keys = True
+
+    assert DataClass.from_dict({"new_x": 1, "old_x": "01"}) == DataClass(1)
+    assert DataClass.from_dict({}) == DataClass(5)
+    with pytest.raises(ExtraKeysError) as exc_info:
+        DataClass.from_dict({"new_x": 1, "extra": 2})
+    assert exc_info.value.extra_keys == {"extra"}
+
+    @dataclass
+    class NoStrictKeys(DataClassDictMixin):
+        x: Annotated[int, Alias("new_x"), Alias("old_x")] = 5
+
+    # Undeclared extra keys continue to be ignored when not forbidden.
+    assert NoStrictKeys.from_dict(
+        {"new_x": 1, "old_x": "01", "extra": 2}
+    ) == NoStrictKeys(1)

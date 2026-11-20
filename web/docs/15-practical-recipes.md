@@ -74,6 +74,22 @@ assert Customer("Alice").to_dict() == {"displayName": "Alice"}
 The first alias is the canonical output name. Later aliases are accepted only
 on input, so compatibility can be wider for readers than for writers.
 
+During a transition a single payload may contain both the new and old keys.
+Every present key is converted with the field's own rules before comparison,
+so equivalent representations are accepted while genuine disagreements and
+unconvertible values are still reported:
+
+```python
+assert Customer.from_dict(
+    {"displayName": "Alice", "name": "Alice"}
+) == Customer("Alice")
+```
+
+A numerically converted field treats `"01"` and `1` as the same value. A text
+field keeps leading zeros, so `"007"` and `"7"` conflict if both keys are
+present. `ConflictingFieldValues` names the field and every input key involved,
+and `InvalidFieldValue` names the key whose value could not be converted.
+
 ## Give logical types distinct wire contracts
 
 When several values share the same runtime type but have different wire

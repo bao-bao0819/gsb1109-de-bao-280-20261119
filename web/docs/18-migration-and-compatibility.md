@@ -111,7 +111,7 @@ class Config(BaseConfig):
     allow_deserialization_not_by_alias = True
 ```
 
-The first alias, `displayName`, is the canonical output name. The remaining aliases are accepted in order during deserialization, and `display_name` is accepted as the final fallback because `allow_deserialization_not_by_alias` is enabled.
+The first alias, `displayName`, is the canonical output name. The remaining aliases are accepted during deserialization, and `display_name` is accepted as the final fallback because `allow_deserialization_not_by_alias` is enabled. When a transition payload contains both a new and an old key, each value is converted with the field's own rules and the results must be equal; conflicting results raise `ConflictingFieldValues` and unconvertible values raise `InvalidFieldValue` identifying the actual key. Output uses only the first alias.
 
 ### Change a field representation
 

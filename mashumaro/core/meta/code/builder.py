@@ -63,8 +63,10 @@ from mashumaro.core.meta.types.unpack import (
 )
 from mashumaro.dialect import Dialect
 from mashumaro.exceptions import (  # noqa: F401
+    AmbiguousFieldAliasError,
     BadDialect,
     BadHookSignature,
+    ConflictingFieldValues,
     ExtraKeysError,
     InvalidFieldValue,
     MissingDiscriminatorError,
@@ -468,11 +470,16 @@ class CodeBuilder:
                 )
 
                 filtered_fields.append((fname, aliases, ftype))
+            self.__validate_field_keys(filtered_fields, config)
             if filtered_fields:
                 if config.forbid_extra_keys:
                     allowed_keys = set()
-                    for f in filtered_fields:
-                        allowed_keys |= set(f[1]) if f[1] else {f[0]}
+                    for fname, aliases, ftype in filtered_fields:
+                        allowed_keys |= set(
+                            self.get_field_unpack_keys(
+                                fname, aliases, config
+                            )
+                        )
 
                     # If a discriminator with a field is set via config,
                     # we should allow this field to be present in the input
@@ -1232,6 +1239,45 @@ class CodeBuilder:
             return (alias,)
         return tuple(alias)
 
+    def get_field_unpack_keys(
+        self,
+        fname: str,
+        aliases: tuple[str, ...],
+        config: type[BaseConfig] | None = None,
+    ) -> tuple[str, ...]:
+        if config is None:
+            config = self.get_config()
+        # Keys to try, in order: each alias, then the field name itself when
+        # there are no aliases or deserialization not by alias is allowed.
+        if aliases:
+            keys = list(aliases)
+            if config.allow_deserialization_not_by_alias:
+                keys.append(fname)
+        else:
+            keys = [fname]
+        # Drop duplicates (for example the field name repeated as an alias)
+        # while preserving order, so we never emit a redundant lookup.
+        return tuple(dict.fromkeys(keys))
+
+    def __validate_field_keys(
+        self,
+        filtered_fields: list[tuple[str, tuple[str, ...], type]],
+        config: type[BaseConfig],
+    ) -> None:
+        # A single input key must map to exactly one field, otherwise the
+        # payload cannot be interpreted without guessing.  This is checked
+        # before any data is read so the error is raised when the method is
+        # compiled (or at first use with lazy compilation).
+        owners: dict[str, list[str]] = {}
+        for fname, aliases, ftype in filtered_fields:
+            for key in self.get_field_unpack_keys(fname, aliases, config):
+                field_names = owners.setdefault(key, [])
+                if fname not in field_names:
+                    field_names.append(fname)
+        for key, field_names in owners.items():
+            if len(field_names) > 1:
+                raise AmbiguousFieldAliasError(key, field_names, self.cls)
+
     @typing.no_type_check
     def iter_serialization_strategies(
         self, metadata: typing.Mapping, ftype: type
@@ -1352,6 +1398,98 @@ class FieldUnpackerCodeBlockBuilder:
         else:
             self.lines.append(f"__{fname} = {unpacked_value}")
 
+    def _add_value_conversion(
+        self,
+        fname: str,
+        field_type: str,
+        unpacked_value: str,
+        could_be_none: bool,
+        target: str,
+        input_key: str,
+    ) -> None:
+        if could_be_none:
+            with self.indent("if value is not None:"):
+                with self.indent("try:"):
+                    self.add_line(f"{target} = {unpacked_value}")
+                with self.indent("except:"):
+                    self.add_line(
+                        "raise InvalidFieldValue("
+                        f"'{fname}',{field_type},value,cls,"
+                        f"key='{input_key}')"
+                    )
+            with self.indent("else:"):
+                self.add_line(f"{target} = None")
+        else:
+            with self.indent("try:"):
+                self.add_line(f"{target} = {unpacked_value}")
+            with self.indent("except:"):
+                self.add_line(
+                    "raise InvalidFieldValue("
+                    f"'{fname}',{field_type},value,cls,"
+                    f"key='{input_key}')"
+                )
+
+    def _build_with_multiple_keys(
+        self,
+        fname: str,
+        field_type: str,
+        unpacked_value: str,
+        could_be_none: bool,
+        has_default: bool,
+        keys: list[str],
+    ) -> None:
+        # Every present key is converted with the field's own rules before
+        # any comparison happens.  This way a bad value in one key is never
+        # masked by a valid value in another, and equivalent wire forms
+        # (e.g. "01" and 1 for an int field) are accepted.
+        prefix = f"__mashumaro_{fname}_multi_key"
+        items = f"{prefix}_items"
+        candidate = f"{prefix}_candidate"
+        self.add_line(f"{items} = []")
+        for key in keys:
+            self.add_line(f"value = d.get('{key}', MISSING)")
+            with self.indent("if value is not MISSING:"):
+                self._add_value_conversion(
+                    fname,
+                    field_type,
+                    unpacked_value,
+                    could_be_none,
+                    candidate,
+                    key,
+                )
+                self.add_line(f"{items}.append(('{key}', {candidate}))")
+        result = f"{prefix}_result"
+        if has_default:
+            with self.indent(f"if {items}:"):
+                self._add_key_consistency_check(fname, field_type, items)
+                self.add_line(f"{result} = {items}[0][1]")
+                self._set_value(fname, result, True)
+        else:
+            with self.indent(f"if not {items}:"):
+                self.add_line(
+                    f"raise MissingField('{fname}',{field_type},cls)"
+                    " from None"
+                )
+            self._add_key_consistency_check(fname, field_type, items)
+            self.add_line(f"{result} = {items}[0][1]")
+            self._set_value(fname, result)
+
+    def _add_key_consistency_check(
+        self, fname: str, field_type: str, items: str
+    ) -> None:
+        prefix = f"__mashumaro_{fname}_multi_key"
+        first = f"{prefix}_first"
+        key = f"{prefix}_key"
+        value = f"{prefix}_value"
+        with self.indent(f"if len({items}) > 1:"):
+            self.add_line(f"{first} = {items}[0][1]")
+            with self.indent(f"for {key}, {value} in {items}[1:]:"):
+                with self.indent(f"if {value} != {first}:"):
+                    self.add_line(
+                        "raise ConflictingFieldValues("
+                        f"'{fname}',{field_type},dict({items}),cls)"
+                    )
+
     def build(
         self,
         fname: str,
@@ -1387,15 +1525,21 @@ class FieldUnpackerCodeBlockBuilder:
         )
         # Keys to try, in order: each alias, then the field name itself when
         # there are no aliases or deserialization not by alias is allowed.
-        if aliases:
-            keys = list(aliases)
-            if self.parent.get_config().allow_deserialization_not_by_alias:
-                keys.append(fname)
-        else:
-            keys = [fname]
-        # Drop duplicates (for example the field name repeated as an alias)
-        # while preserving order, so we never emit a redundant lookup.
-        keys = list(dict.fromkeys(keys))
+        keys = list(
+            self.parent.get_field_unpack_keys(
+                fname, aliases, self.parent.get_config()
+            )
+        )
+        if len(keys) > 1:
+            self._build_with_multiple_keys(
+                fname,
+                field_type,
+                unpacked_value,
+                could_be_none,
+                has_default,
+                keys,
+            )
+            return FieldUnpackerCodeBlock(self.lines, fname, has_default)
         if unpacked_value != "value" or has_default:
             packed_value = "value"
         else:

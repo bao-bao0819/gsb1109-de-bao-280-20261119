@@ -110,6 +110,8 @@ except InvalidFieldValue as exc:
 
 Inspect `exc.msg` and the [chained exception](https://docs.python.org/3/tutorial/errors.html#exception-chaining) when available. The most common causes are a wrong wire representation, a serializer/deserializer pair that disagrees, an invalid literal/enum value, or an ambiguous union.
 
+When a field has several accepted input keys, `InvalidFieldValue.key` (also `key_name` and `input_key`) identifies the key whose value failed to convert. Every present key is converted before any value is selected, so a valid value in one key does not mask a bad value in another. If all keys convert but disagree, `ConflictingFieldValues` is raised instead; its `field_name` names the field and `key_to_value` maps each input key to its converted value. An input key accepted by two different fields raises `AmbiguousFieldAliasError` at compilation time, with `input_key` and `field_names`.
+
 Do not catch every `ValueError` around a full payload. Catch `InvalidFieldValue` and report the structured field context.
 
 ## Unsupported fields and engines

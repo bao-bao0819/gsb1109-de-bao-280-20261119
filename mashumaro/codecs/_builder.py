@@ -4,6 +4,11 @@ from typing import Any
 
 from typing_extensions import TypeForm
 
+from mashumaro.codecs._cache import (
+    bind_template,
+    get_template,
+    remember_template,
+)
 from mashumaro.core.meta.code.builder import CodeBuilder
 from mashumaro.core.meta.helpers import is_optional, is_type_var_any
 from mashumaro.core.meta.types.common import (
@@ -30,6 +35,16 @@ class CodecCodeBuilder(CodeBuilder):
         decoder_obj: Any,
         pre_decoder_func: Callable[[Any], Any] | None = None,
     ) -> None:
+        template = get_template(
+            "decode",
+            self,
+            decoder_obj,
+            shape_type,
+            pre_decoder_func,
+        )
+        if template is not None:
+            bind_template(template, decoder_obj, "decode")
+            return
         self.reset()
         with self.indent("def decode(value):"):
             if pre_decoder_func:
@@ -62,6 +77,13 @@ class CodecCodeBuilder(CodeBuilder):
         self.ensure_object_imported(decoder_obj, "decoder_obj")
         self.ensure_object_imported(self.cls, "cls")
         self.compile()
+        remember_template(
+            "decode",
+            self,
+            decoder_obj,
+            shape_type,
+            pre_decoder_func,
+        )
 
     def add_encode_method(
         self,
@@ -69,6 +91,16 @@ class CodecCodeBuilder(CodeBuilder):
         encoder_obj: Any,
         post_encoder_func: Callable[[Any], Any] | None = None,
     ) -> None:
+        template = get_template(
+            "encode",
+            self,
+            encoder_obj,
+            shape_type,
+            post_encoder_func,
+        )
+        if template is not None:
+            bind_template(template, encoder_obj, "encode")
+            return
         self.reset()
         with self.indent("def encode(value):"):
             could_be_none = (
@@ -106,3 +138,10 @@ class CodecCodeBuilder(CodeBuilder):
         self.ensure_object_imported(self.cls, "cls")
         self.ensure_object_imported(self.cls, "self")
         self.compile()
+        remember_template(
+            "encode",
+            self,
+            encoder_obj,
+            shape_type,
+            post_encoder_func,
+        )

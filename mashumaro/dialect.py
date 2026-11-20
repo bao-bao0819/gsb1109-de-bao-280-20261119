@@ -50,6 +50,7 @@ class Dialect:
                 )
         new_dialect = cast(type[Dialect], new_class("Dialect", (Dialect,)))
         new_dialect.serialization_strategy = serialization_strategy
+        new_dialect.__mashumaro_merge_sources__ = (cls, other)
         for key in ("omit_none", "omit_default", "no_copy_collections"):
             if (others_value := getattr(other, key)) is not Sentinel.MISSING:
                 setattr(new_dialect, key, others_value)

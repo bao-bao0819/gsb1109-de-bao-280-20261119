@@ -1,0 +1,4 @@
+replay.db
+replay.log
+__pycache__/
+reports/*.json

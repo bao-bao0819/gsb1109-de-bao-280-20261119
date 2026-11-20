@@ -254,9 +254,10 @@ class HistoryManager(models.Manager):
                 row.history_relation_id = instance.pk
             historical_instances.append(row)
 
-        return self.model.objects.bulk_create(
-            historical_instances, batch_size=batch_size
-        )
+        manager = self.model.objects
+        if self._db is not None:
+            manager = manager.db_manager(using=self._db)
+        return manager.bulk_create(historical_instances, batch_size=batch_size)
 
 
 class HistoryDescriptor:

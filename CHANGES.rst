@@ -12,6 +12,11 @@ Unreleased
 
 **Bug fixes:**
 
+- ``bulk_update_with_history()`` now writes both model rows and history records to
+  the database of an explicitly bound ``manager``, keeping the two writes in a single
+  transaction on that database. Calls with an unbound manager keep using the
+  configured database routers.
+
 
 **Other changes:**
 

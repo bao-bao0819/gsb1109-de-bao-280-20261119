@@ -142,6 +142,19 @@ class PollWithHistoricalSessionAttr(models.Model):
     history = HistoricalRecords(bases=[SessionsHistoricalModel])
 
 
+class ImportBatchHistoricalModel(models.Model):
+    import_batch = models.CharField(max_length=64, null=True, unique=True)
+
+    class Meta:
+        abstract = True
+
+
+class InventoryItem(models.Model):
+    sku = models.CharField(max_length=64)
+    price = models.IntegerField()
+    history = HistoricalRecords(bases=[ImportBatchHistoricalModel])
+
+
 class PollWithManyToMany(models.Model):
     question = models.CharField(max_length=200)
     pub_date = models.DateTimeField("date published")

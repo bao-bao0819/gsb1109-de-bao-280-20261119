@@ -13,6 +13,7 @@ from simple_history.exceptions import AlternativeManagerError, NotHistoricalMode
 from simple_history.tests.models import (
     BulkCreateManyToManyModel,
     Document,
+    InventoryItem,
     Place,
     Poll,
     PollChildBookWithManyToMany,
@@ -37,6 +38,8 @@ from simple_history.utils import (
     get_m2m_reverse_field_name,
     update_change_reason,
 )
+
+from .utils import OTHER_DB_NAME
 
 User = get_user_model()
 
@@ -576,6 +579,168 @@ class BulkUpdateWithHistoryAlternativeManagersTestCase(TestCase):
                 fields=["question"],
                 manager=Poll.objects,
             )
+
+
+class BulkUpdateWithHistoryExplicitDatabaseTestCase(TransactionTestCase):
+    databases = {"default", OTHER_DB_NAME}
+
+    def setUp(self):
+        self.default_item = InventoryItem(id=7, sku="default-sku", price=100)
+        bulk_create_with_history(
+            [self.default_item],
+            InventoryItem,
+            custom_historical_attrs={"import_batch": "default-baseline"},
+        )
+
+        self.department_item = InventoryItem(id=7, sku="department-sku", price=200)
+        InventoryItem.objects.using(OTHER_DB_NAME).bulk_create(
+            [self.department_item]
+        )
+        InventoryItem.history.model.objects.using(OTHER_DB_NAME).create(
+            id=7,
+            sku="department-sku",
+            price=200,
+            history_date=datetime(2020, 1, 1),
+            history_type="+",
+            import_batch="department-baseline",
+        )
+        self.department_manager = InventoryItem.objects.db_manager(OTHER_DB_NAME)
+
+    def history_queryset(self, database):
+        return InventoryItem.history.using(database)
+
+    def test_successful_batch_only_writes_to_explicit_database(self):
+        default_history = list(
+            self.history_queryset("default").values_list(
+                "id", "price", "history_change_reason"
+            )
+        )
+        default_history_count = len(default_history)
+
+        rows_updated = bulk_update_with_history(
+            [InventoryItem(id=7, sku="department-updated", price=250)],
+            InventoryItem,
+            fields=["sku", "price"],
+            manager=self.department_manager,
+            custom_historical_attrs={"import_batch": "department-batch-1"},
+        )
+
+        self.assertEqual(rows_updated, 1)
+        self.assertEqual(
+            InventoryItem.objects.using(OTHER_DB_NAME).get(id=7).price, 250
+        )
+        self.assertEqual(
+            self.history_queryset(OTHER_DB_NAME).filter(id=7).count(), 2
+        )
+        self.assertEqual(
+            self.history_queryset(OTHER_DB_NAME)
+            .filter(id=7, import_batch="department-batch-1")
+            .get()
+            .price,
+            250,
+        )
+        self.assertEqual(
+            InventoryItem.objects.using("default").get(id=7).price, 100
+        )
+        self.assertEqual(
+            list(
+                self.history_queryset("default").values_list(
+                    "id", "price", "history_change_reason"
+                )
+            ),
+            default_history,
+        )
+        self.assertEqual(
+            self.history_queryset("default").count(), default_history_count
+        )
+
+    def test_history_constraint_failure_rolls_back_both_department_tables(self):
+        bulk_update_with_history(
+            [InventoryItem(id=7, sku="department-updated", price=250)],
+            InventoryItem,
+            fields=["sku", "price"],
+            manager=self.department_manager,
+            custom_historical_attrs={"import_batch": "department-batch-1"},
+        )
+        department_history_count = self.history_queryset(OTHER_DB_NAME).count()
+
+        with self.assertRaises(IntegrityError):
+            bulk_update_with_history(
+                [InventoryItem(id=7, sku="should-not-persist", price=300)],
+                InventoryItem,
+                fields=["sku", "price"],
+                manager=self.department_manager,
+                custom_historical_attrs={"import_batch": "department-batch-1"},
+            )
+
+        item = InventoryItem.objects.using(OTHER_DB_NAME).get(id=7)
+        self.assertEqual(item.sku, "department-updated")
+        self.assertEqual(item.price, 250)
+        self.assertEqual(
+            self.history_queryset(OTHER_DB_NAME).count(), department_history_count
+        )
+        self.assertFalse(
+            self.history_queryset(OTHER_DB_NAME)
+            .filter(sku="should-not-persist")
+            .exists()
+        )
+        self.assertEqual(
+            InventoryItem.objects.using("default").get(id=7).price, 100
+        )
+        self.assertEqual(self.history_queryset("default").count(), 1)
+
+    def test_history_only_call_stays_in_explicit_database(self):
+        rows_updated = bulk_update_with_history(
+            [InventoryItem(id=7, sku="department-sku", price=999)],
+            InventoryItem,
+            fields=[],
+            manager=self.department_manager,
+            custom_historical_attrs={"import_batch": "department-history-only"},
+        )
+
+        self.assertEqual(rows_updated, 0)
+        self.assertEqual(
+            InventoryItem.objects.using(OTHER_DB_NAME).get(id=7).price, 200
+        )
+        self.assertEqual(
+            self.history_queryset(OTHER_DB_NAME)
+            .filter(import_batch="department-history-only")
+            .count(),
+            1,
+        )
+        self.assertEqual(
+            InventoryItem.objects.using("default").get(id=7).price, 100
+        )
+        self.assertEqual(self.history_queryset("default").count(), 1)
+
+    def test_unbound_manager_keeps_existing_routing_and_change_reason(self):
+        item = InventoryItem(id=7, sku="default-updated", price=110)
+        item._change_reason = "stocktake correction"
+
+        rows_updated = bulk_update_with_history(
+            [item],
+            InventoryItem,
+            fields=["sku", "price"],
+            custom_historical_attrs={"import_batch": "default-batch-2"},
+        )
+
+        self.assertEqual(rows_updated, 1)
+        self.assertEqual(
+            InventoryItem.objects.using("default").get(id=7).price, 110
+        )
+        history = self.history_queryset("default").get(import_batch="default-batch-2")
+        self.assertEqual(history.price, 110)
+        self.assertEqual(history.history_change_reason, "stocktake correction")
+
+        self.assertEqual(
+            InventoryItem.objects.using(OTHER_DB_NAME).get(id=7).price, 200
+        )
+        self.assertEqual(
+            self.history_queryset(OTHER_DB_NAME)
+            .filter(import_batch="default-batch-2")
+            .count(),
+            0,
+        )
 
 
 class CustomHistoricalAttrsTest(TestCase):

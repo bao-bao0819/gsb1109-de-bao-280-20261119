@@ -109,6 +109,11 @@ default manager returns a filtered set), you can specify which manager to use wi
     >>> data = [PollWithAlternativeManager(id=x, question='Question ' + str(x), pub_date=now()) for x in range(1000)]
     >>> objs = bulk_create_with_history(data, PollWithAlternativeManager, batch_size=500, manager=PollWithAlternativeManager.all_polls)
 
+If the manager is explicitly bound to a database (for example with
+``Poll.objects.db_manager("other")``), both the model rows and their history
+records are written to that database within the same transaction. Managers that
+are not bound to a database keep using the configured database routers.
+
 If you're using `additional fields in historical models`_ and have custom fields to
 batch-update into the history, pass the optional dict argument ``custom_historical_attrs``
 containing the field names and values.

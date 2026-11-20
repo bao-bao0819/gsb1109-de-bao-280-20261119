@@ -204,7 +204,9 @@ def bulk_update_with_history(
     :param default_date: Optional date to specify as the history_date in each historical
         record
     :param manager: Optional model manager to use for the model instead of the default
-        manager
+        manager. If the manager is explicitly bound to a database (e.g. with
+        ``db_manager("other")``), both the model rows and their history records are
+        written to that database.
     :param custom_historical_attrs: Optional dict of field `name`:`value` to specify
         values for custom fields
     :return: The number of model rows updated, not including any history objects
@@ -214,7 +216,17 @@ def bulk_update_with_history(
     if model_manager.model is not model:
         raise AlternativeManagerError("The given manager does not belong to the model.")
 
-    with transaction.atomic(savepoint=False):
+    # Managers (and querysets) only expose their explicitly selected database through
+    # ``_db``. When it is unset we leave the alias as ``None`` so the existing routing
+    # behavior is preserved for callers that do not bind a manager to a database.
+    database = getattr(model_manager, "_db", None)
+    if not isinstance(database, str):
+        database = None
+
+    if database is not None:
+        history_manager = history_manager.db_manager(using=database)
+
+    with transaction.atomic(using=database, savepoint=False):
         if not fields:
             # Allow not passing any fields if the user wants to bulk-create history
             # records - e.g. with `custom_historical_attrs` provided

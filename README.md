@@ -362,6 +362,41 @@ Here's how you might decode a tile from a file.
 The `decode` function has a `geojson` option which enforces a GeoJson RFC7946 compatible result. Its default value
 is `True`. To enforce the behaviour of versions <2.0.0, please use `geojson=False`.
 
+### Selecting layers and fields
+
+Decoding a tile only to inspect a few properties of one layer can skip the other layers and fields using the optional
+`layers` and `fields` decode options. Both accept an iterable of strings and default to `None`, which keeps the
+default behaviour of decoding every layer and every field.
+
+- `layers`: only the layers whose name is listed are decoded. The other layers are skipped without reading their
+  features, their tag values or applying their coordinate transformation.
+- `fields`: only the listed property names are decoded for the layer; the other tag values are not parsed. An empty
+  iterable yields empty properties, while `None` decodes every property.
+
+Like the other decode options, they can be provided through `default_options` for every layer, or through
+`per_layer_options` for a single layer. The geometry, feature order and the per-layer decoding rules (such as
+`y_coord_down` and `transformer`) of the selected layers are unchanged.
+
+```python
+  >>> import mapbox_vector_tile
+
+  # Decode only the `roads` layer, keeping only its `name` property.
+  >>> mapbox_vector_tile.decode(tile, default_options={"layers": ["roads"], "fields": ["name"]})
+
+  # An explicit empty field list gives features with empty properties.
+  >>> mapbox_vector_tile.decode(tile, default_options={"layers": ["roads"], "fields": []})
+
+  # Per-layer field selection.
+  >>> mapbox_vector_tile.decode(
+  ...     tile,
+  ...     default_options={"layers": ["roads", "pois"]},
+  ...     per_layer_options={"roads": {"fields": ["name"]}},
+  ... )
+```
+
+If a selected field holds a value that cannot be read (for example a protobuf value with no typed field set), the
+decoder raises the usual `ValueError`. Excluding that field with `fields` avoids parsing its value altogether.
+
 ## Use native protobuf library for performance
 
 The c++ implementation of the underlying protobuf library is more performant than the pure python one. Depending on your operating system, you might need to [compile the C++ library](https://github.com/google/protobuf/tree/master/python#c-implementation) or install it.

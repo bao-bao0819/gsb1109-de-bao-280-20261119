@@ -31,6 +31,12 @@ def decode(tile, per_layer_options=None, default_options=None, **kwargs):
             `None`.
             * `geojson`: when set to `False`, the behaviour of mapbox-vector-tile version 1.* is used. When set
             to `False`, the retrieved dictionary is a valid geojson file. Default to `True`.
+            * `layers`: an optional iterable of layer names. When provided, only the matching layers are decoded;
+            the other layers are skipped without reading their features, tags or coordinate transformation. Default
+            to `None`, which decodes every layer.
+            * `fields`: an optional iterable of property names. When provided for a layer, only the matching
+            properties are decoded and the other tag values are not parsed. An empty iterable yields empty
+            properties. Default to `None`, which decodes every property.
     """
     if kwargs:
         warnings.warn("`decode` signature has changed, use `default_options` instead", DeprecationWarning, stacklevel=2)

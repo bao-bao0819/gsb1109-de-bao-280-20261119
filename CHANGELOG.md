@@ -2,6 +2,10 @@
 
 _In development_
 
+- Add optional `layers` and `fields` decode options to select the layers and property names that are decoded.
+  Unselected layers are skipped without reading their features or applying their coordinate transformation, and
+  unselected fields are not parsed. Both default to `None`, which keeps decoding every layer and field.
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

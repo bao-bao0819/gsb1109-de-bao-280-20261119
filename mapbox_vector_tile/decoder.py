@@ -18,16 +18,21 @@ class TileData:
         self.tile.ParseFromString(pbf_data)
         self.default_options = default_options
         self.per_layer_options = per_layer_options if per_layer_options is not None else {}
+        global_options = get_decode_options(layer_options=None, default_options=self.default_options)
+        self.selected_layers = set(global_options["layers"]) if global_options["layers"] is not None else None
 
     def get_message(self):
         tile = {}
         for layer in self.tile.layers:
             layer_name = layer.name
+            if self.selected_layers is not None and layer_name not in self.selected_layers:
+                continue
             layer_options = self.per_layer_options.get(layer_name, None)
             layer_options = get_decode_options(layer_options=layer_options, default_options=self.default_options)
 
             keys = layer.keys
             vals = layer.values
+            selected_fields = set(layer_options["fields"]) if layer_options["fields"] is not None else None
 
             features = []
             for feature in layer.features:
@@ -36,6 +41,8 @@ class TileData:
                 assert len(tags) % 2 == 0, "Unexpected number of tags"
                 for key_idx, val_idx in zip(tags[::2], tags[1::2]):
                     key = keys[key_idx]
+                    if selected_fields is not None and key not in selected_fields:
+                        continue
                     val = vals[val_idx]
                     value = self.parse_value(val)
                     props[key] = value

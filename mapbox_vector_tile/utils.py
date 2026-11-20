@@ -46,7 +46,7 @@ DEFAULT_ENCODE_OPTIONS = {
     "max_geometry_validate_tries": 5,
 }
 
-DEFAULT_DECODE_OPTIONS = {"y_coord_down": False, "transformer": None, "geojson": True}
+DEFAULT_DECODE_OPTIONS = {"y_coord_down": False, "transformer": None, "geojson": True, "layers": None, "fields": None}
 
 
 def _get_options(layer_options, default_options, global_default_options, operation_name):
@@ -135,9 +135,18 @@ def get_decode_options(layer_options, default_options):
     Returns:
         The options to use for decoding the layer.
     """
-    return _get_options(
+    result = _get_options(
         layer_options=layer_options,
         default_options=default_options,
         global_default_options=DEFAULT_DECODE_OPTIONS,
         operation_name="decoding",
     )
+
+    for option_name in ("layers", "fields"):
+        option_value = result[option_name]
+        if option_value is not None and not (
+            isinstance(option_value, (list, tuple, set)) and all(isinstance(item, str) for item in option_value)
+        ):
+            raise ValueError(f"The {option_name!r} option must be an iterable of strings when decoding a tile.")
+
+    return result

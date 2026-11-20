@@ -74,9 +74,25 @@ class FactorInfo:
        For categorical factors, a tuple of the possible categories this factor
        takes on, in order. For numerical factors, this attribute will always be
        ``None``.
+
+    .. attribute:: unknown_value
+
+       For categorical factors, the name of a reserved "unknown value" level
+       appended to :attr:`categories`, or ``None`` if no such level was
+       reserved. When set, unseen values encountered while building a design
+       matrix are coded against this level instead of raising an error. For
+       numerical factors this attribute will always be ``None``.
     """
 
-    def __init__(self, factor, type, state, num_columns=None, categories=None):
+    def __init__(
+        self,
+        factor,
+        type,
+        state,
+        num_columns=None,
+        categories=None,
+        unknown_value=None,
+    ):
         self.factor = factor
         self.type = type
         if self.type not in ["numerical", "categorical"]:
@@ -92,6 +108,8 @@ class FactorInfo:
                 )
             if categories is not None:
                 raise ValueError("For numerical factors, categories must be None")
+            if unknown_value is not None:
+                raise ValueError("For numerical factors, unknown_value must be None")
         else:
             assert self.type == "categorical"
             if num_columns is not None:
@@ -99,6 +117,7 @@ class FactorInfo:
             categories = tuple(categories)
         self.num_columns = num_columns
         self.categories = categories
+        self.unknown_value = unknown_value
 
     __repr__ = repr_pretty_delegate
 
@@ -145,9 +164,20 @@ def test_FactorInfo():
     assert fi2.type == "categorical"
     assert fi2.num_columns is None
     assert fi2.categories == ("z", "j")
+    assert fi2.unknown_value is None
 
     # smoke test
     repr(fi2)
+
+    fi3 = FactorInfo(
+        "asdf",
+        "categorical",
+        {"a": 2},
+        categories=["z", "j", "UNK"],
+        unknown_value="UNK",
+    )
+    assert fi3.categories == ("z", "j", "UNK")
+    assert fi3.unknown_value == "UNK"
 
     import pytest
 
@@ -157,6 +187,15 @@ def test_FactorInfo():
     pytest.raises(ValueError, FactorInfo, "asdf", "numerical", {}, num_columns="asdf")
     pytest.raises(
         ValueError, FactorInfo, "asdf", "numerical", {}, num_columns=1, categories=1
+    )
+    pytest.raises(
+        ValueError,
+        FactorInfo,
+        "asdf",
+        "numerical",
+        {},
+        num_columns=1,
+        unknown_value="UNK",
     )
 
     pytest.raises(TypeError, FactorInfo, "asdf", "categorical", {})

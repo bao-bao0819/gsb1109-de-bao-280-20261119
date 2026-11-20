@@ -8,6 +8,18 @@ All Patsy releases are archived at Zenodo:
 .. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.592075.svg
    :target: https://doi.org/10.5281/zenodo.592075
 
+Unreleased
+----------
+
+* :func:`C` now accepts an ``unknown_value`` argument that reserves a
+  categorical level for values unseen during training. A frozen
+  :class:`DesignInfo` then codes such values against this reserved level
+  (including interaction columns) instead of raising, while ordinary missing
+  values keep following the configured :class:`~patsy.missing.NAAction`.
+  Reserved names that collide with a real training level raise a
+  :class:`PatsyError`, and factors without ``unknown_value`` keep the previous
+  strict behaviour, now raising ``patsy.categorical.UnknownValueError``.
+
 v1.0.3
 ------
 

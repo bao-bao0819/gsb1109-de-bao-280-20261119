@@ -11,7 +11,7 @@ from patsy import PatsyError
 from patsy.design_info import DesignMatrix, DesignInfo
 from patsy.eval import EvalEnvironment
 from patsy.desc import ModelDesc, Term, INTERCEPT
-from patsy.categorical import C
+from patsy.categorical import C, UnknownValueError
 from patsy.contrasts import Helmert
 from patsy.user_util import balanced, LookupFactor
 from patsy.build import design_matrix_builders, build_design_matrices
@@ -997,3 +997,202 @@ def test_NAActioon_pandas_string_index():
     dm2 = dmatrix(di, data2, 0, return_type="dataframe")
     assert np.allclose(dm2, [[1.0, 6.0, 4.0], [1.0, 7.0, 5.0]])
     assert list(dm2.columns) == ["Intercept", "x", "z"]
+
+
+# A supply-region factor reserves an unseen-value bucket so a frozen training
+# design can score data that contains regions never seen during fitting.
+UNKNOWN_REGION = "__unknown_region__"
+REGION_FORMULA = (
+    "y ~ C(region, levels=['north', 'south'], "
+    "unknown_value='__unknown_region__') * season"
+)
+
+
+def _region_design_info():
+    # Fixed reference level ('north' first), main effects + interaction, and
+    # a genuine missing value among the training rows. The reserved bucket is
+    # never observed in this data.
+    train = {
+        "region": ["north", "south", "north", "south", None],
+        "season": ["spring", "summer", "summer", "spring", "spring"],
+        "y": [1.0, 2.0, 3.0, 4.0, 5.0],
+    }
+    lhs, rhs = dmatrices(REGION_FORMULA, train, NA_action="drop")
+    di = rhs.design_info
+    region_fi = next(
+        fi
+        for fi in di.factor_infos.values()
+        if fi.type == "categorical" and fi.unknown_value is not None
+    )
+    # The reserved bucket is appended after the real, fixed-order levels.
+    assert region_fi.categories == ("north", "south", UNKNOWN_REGION)
+    assert region_fi.unknown_value == UNKNOWN_REGION
+    expected_names = [
+        "Intercept",
+        "C(region, levels=['north', 'south'], unknown_value="
+        "'__unknown_region__')[T.south]",
+        "C(region, levels=['north', 'south'], unknown_value="
+        "'__unknown_region__')[T.__unknown_region__]",
+        "season[T.summer]",
+        "C(region, levels=['north', 'south'], unknown_value="
+        "'__unknown_region__')[T.south]:season[T.summer]",
+        "C(region, levels=['north', 'south'], unknown_value="
+        "'__unknown_region__')[T.__unknown_region__]:season[T.summer]",
+    ]
+    assert di.column_names == expected_names
+    # Training rows never occupy the reserved columns.
+    assert np.all(np.asarray(rhs)[:, 2] == 0)
+    assert np.all(np.asarray(rhs)[:, 5] == 0)
+    return di
+
+
+def test_unknown_value_bucket_freezes_design_and_scores_new_regions():
+    di = _region_design_info()
+
+    # Old regions, brand-new regions and a genuine missing value, interleaved.
+    pred = {
+        "region": ["north", "west", "south", None, "east"],
+        "season": ["spring", "summer", "spring", "summer", "summer"],
+    }
+    (matrix,) = build_design_matrices([di], pred, NA_action="drop")
+    # The NA row is dropped, leaving four valid rows.
+    assert matrix.shape == (4, 6)
+    # No prediction-time columns are added and the reference level is fixed.
+    assert matrix.design_info.column_names == di.column_names
+    expected = np.asarray(
+        [
+            # north / spring -> reference row
+            [1, 0, 0, 0, 0, 0],
+            # west (new) / summer -> reserved main + reserved interaction
+            [1, 0, 1, 1, 0, 1],
+            # south / spring -> ordinary south main only
+            [1, 1, 0, 0, 0, 0],
+            # east (new) / summer -> reserved main + reserved interaction
+            [1, 0, 1, 1, 0, 1],
+        ],
+        dtype=float,
+    )
+    assert np.array_equal(np.asarray(matrix), expected)
+
+
+def test_unknown_value_bucket_string_and_pandas_carriers_are_equivalent():
+    if not have_pandas_categorical:
+        return
+    di = _region_design_info()
+
+    values = ["north", "west", "south", None, "east"]
+    seasons = ["spring", "summer", "spring", "summer", "summer"]
+    string_carrier = {"region": values, "season": seasons}
+    # Different category ordering, plus explicit declaration of the new
+    # values that were absent from training.
+    pandas_carrier = {
+        "region": pandas.Categorical(
+            values, categories=["south", "north", "west", "east"]
+        ),
+        "season": seasons,
+    }
+
+    (m_string,) = build_design_matrices([di], string_carrier, NA_action="drop")
+    (m_pandas,) = build_design_matrices([di], pandas_carrier, NA_action="drop")
+
+    # Same valid rows, same frozen column order, identical values.
+    assert m_string.shape == m_pandas.shape
+    assert m_pandas.design_info.column_names == di.column_names
+    assert np.array_equal(np.asarray(m_string), np.asarray(m_pandas))
+    # Old regions keep their original columns even under the reordered
+    # categorical; only genuinely new values reach the reserved columns.
+    arr = np.asarray(m_pandas)
+    assert arr[0, 1] == 0 and arr[0, 2] == 0  # north
+    assert arr[2, 1] == 1 and arr[2, 2] == 0  # south
+    assert arr[1, 2] == 1 and arr[3, 2] == 1  # west, east
+
+
+def test_unknown_value_bucket_collision_is_a_configuration_error():
+    di = _region_design_info()  # building a clean design still works
+
+    # A real category whose name equals the reserved bucket: sniffed levels.
+    sniffed = {
+        "region": ["north", "south", UNKNOWN_REGION],
+        "season": ["spring", "summer", "spring"],
+        "y": [1.0, 2.0, 3.0],
+    }
+    with pytest.raises(PatsyError):
+        dmatrices(REGION_FORMULA, sniffed)
+
+    # Same collision when the ordinary levels are given explicitly.
+    explicit = {
+        "region": ["north", UNKNOWN_REGION],
+        "season": ["spring", "summer"],
+        "y": [1.0, 2.0],
+    }
+    with pytest.raises(PatsyError):
+        dmatrices(REGION_FORMULA, explicit)
+
+    if have_pandas_categorical:
+        # And when the conflicting level arrives via a pandas Categorical.
+        via_pandas = {
+            "region": pandas.Categorical(
+                ["north", UNKNOWN_REGION],
+                categories=["north", "south", UNKNOWN_REGION],
+            ),
+            "season": ["spring", "summer"],
+            "y": [1.0, 2.0],
+        }
+        with pytest.raises(PatsyError):
+            dmatrices(REGION_FORMULA, via_pandas)
+
+    # The frozen design itself is unaffected by the rejected training runs.
+    assert di.column_names[2].endswith("[T.__unknown_region__]")
+
+
+def test_unreserved_categorical_keeps_strict_matching():
+    train = {
+        "region2": ["north", "south"],
+        "season": ["spring", "summer"],
+        "y": [1.0, 2.0],
+    }
+    _, rhs = dmatrices("y ~ C(region2) * season", train)
+    with pytest.raises(UnknownValueError):
+        build_design_matrices(
+            [rhs.design_info],
+            {"region2": ["west"], "season": ["summer"]},
+        )
+
+    # Even inside a design where region reserves a bucket, the unreserved
+    # season factor keeps strict matching: a new season still raises.
+    di = _region_design_info()
+    with pytest.raises(UnknownValueError):
+        build_design_matrices(
+            [di],
+            {"region": ["west"], "season": ["winter"]},
+        )
+    # ... while the reserved region factor alone accepts the same new region
+    # when paired with a known season.
+    (ok,) = build_design_matrices(
+        [di],
+        {"region": ["west"], "season": ["summer"]},
+    )
+    assert ok.shape == (1, 6)
+
+
+def test_unknown_value_bucket_respects_missing_value_policy():
+    di = _region_design_info()
+
+    # A source that already collapsed an unseen region into an unrecoverable
+    # missing code is simply treated as missing.
+    if have_pandas_categorical:
+        pre_missing = {
+            "region": pandas.Categorical(["north", None, "south"]),
+            "season": ["spring", "summer", "summer"],
+        }
+        (m,) = build_design_matrices([di], pre_missing, NA_action="drop")
+        assert m.shape[0] == 2
+
+    # A genuine None still triggers the configured NA action rather than
+    # being redirected into the reserved bucket.
+    with pytest.raises(PatsyError):
+        build_design_matrices(
+            [di],
+            {"region": ["north", None], "season": ["spring", "summer"]},
+            NA_action="raise",
+        )

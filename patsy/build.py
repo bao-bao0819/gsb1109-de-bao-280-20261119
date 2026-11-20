@@ -88,7 +88,11 @@ def _eval_factor(factor_info, data, NA_action):
     else:
         assert factor_info.type == "categorical"
         result = categorical_to_int(
-            result, factor_info.categories, NA_action, origin=factor_info.factor
+            result,
+            factor_info.categories,
+            NA_action,
+            origin=factor_info.factor,
+            unknown_value=factor_info.unknown_value,
         )
         assert result.ndim == 1
         return result, np.asarray(result == -1)
@@ -506,9 +510,31 @@ def _examine_factor_types(factors, factor_states, data_iter_maker, NA_action):
             break
     # Pull out the levels
     cat_levels_contrasts = {}
+    cat_unknown_values = {}
     for factor, sniffer in cat_sniffers.items():
-        cat_levels_contrasts[factor] = sniffer.levels_contrast()
-    return (num_column_counts, cat_levels_contrasts)
+        levels, contrast, unknown_value = sniffer.levels_contrast()
+        cat_levels_contrasts[factor] = (levels, contrast)
+        cat_unknown_values[factor] = unknown_value
+    # A reserved unknown-value bucket may never be occupied by the training
+    # data: it exists solely for values that are unseen during training. Walk
+    # the data once more and turn any such occupation into a configuration
+    # error, rather than silently merging a real level into the bucket.
+    reserved_factors = [
+        factor for factor in cat_sniffers if cat_unknown_values[factor] is not None
+    ]
+    if reserved_factors:
+        for data in data_iter_maker():
+            for factor in reserved_factors:
+                value = factor.eval(factor_states[factor], data)
+                categorical_to_int(
+                    value,
+                    cat_levels_contrasts[factor][0],
+                    NA_action,
+                    origin=factor.origin,
+                    unknown_value=cat_unknown_values[factor],
+                    reserve_guard=True,
+                )
+    return (num_column_counts, cat_levels_contrasts, cat_unknown_values)
 
 
 def test__examine_factor_types():
@@ -573,6 +599,7 @@ def test__examine_factor_types():
     (
         num_column_counts,
         cat_levels_contrasts,
+        cat_unknown_values,
     ) = _examine_factor_types(factor_states.keys(), factor_states, it, NAAction())
     assert it.i == 2
     iterations = 0
@@ -583,6 +610,12 @@ def test__examine_factor_types():
         string_1col: (("a", "b", "c"), None),
         object_1col: (tuple(sorted(object_levels, key=id)), None),
     }
+    assert cat_unknown_values == {
+        categ_1col: None,
+        bool_1col: None,
+        string_1col: None,
+        object_1col: None,
+    }
 
     # Check that it doesn't read through all the data if that's not necessary:
     it = DataIterMaker()
@@ -590,6 +623,7 @@ def test__examine_factor_types():
     (
         num_column_counts,
         cat_levels_contrasts,
+        cat_unknown_values,
     ) = _examine_factor_types(no_read_necessary, factor_states, it, NAAction())
     assert it.i == 0
     assert num_column_counts == {num_1dim: 1, num_1col: 1, num_4col: 4}
@@ -597,6 +631,7 @@ def test__examine_factor_types():
         categ_1col: (("a", "b", "c"), "MOCK CONTRAST"),
         bool_1col: ((False, True), None),
     }
+    assert cat_unknown_values == {categ_1col: None, bool_1col: None}
 
     # Illegal inputs:
     bool_3col = MockFactor()
@@ -743,9 +778,11 @@ def design_matrix_builders(termlists, data_iter_maker, eval_env, NA_action="drop
     factor_states = _factors_memorize(all_factors, data_iter_maker, eval_env)
     # Now all the factors have working eval methods, so we can evaluate them
     # on some data to find out what type of data they return.
-    (num_column_counts, cat_levels_contrasts) = _examine_factor_types(
-        all_factors, factor_states, data_iter_maker, NA_action
-    )
+    (
+        num_column_counts,
+        cat_levels_contrasts,
+        cat_unknown_values,
+    ) = _examine_factor_types(all_factors, factor_states, data_iter_maker, NA_action)
     # Now we need the factor infos, which encapsulate the knowledge of
     # how to turn any given factor into a chunk of data:
     factor_infos = {}
@@ -767,6 +804,7 @@ def design_matrix_builders(termlists, data_iter_maker, eval_env, NA_action="drop
                 factor_states[factor],
                 num_columns=None,
                 categories=categories,
+                unknown_value=cat_unknown_values[factor],
             )
         factor_infos[factor] = fi
     # And now we can construct the DesignInfo for each termlist:

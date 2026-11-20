@@ -15,7 +15,7 @@ Let's get some categorical data to work with:
 
 .. ipython:: python
 
-   from patsy import dmatrix, demo_data, ContrastMatrix, Poly
+   from patsy import dmatrix, dmatrices, demo_data, ContrastMatrix, Poly
    data = demo_data("a", nlevels=3)
    data
 
@@ -95,3 +95,67 @@ And it can now be used just like the built-in methods:
    dmatrix("C(a, MyTreat)", data)
    # With argument:
    dmatrix("C(a, MyTreat(2))", data)
+
+Reserving a level for unseen values
+-----------------------------------
+
+By default, once a design has been built, every categorical value it
+encounters must match one of the levels that were present during
+training. Feeding it an unknown value raises an error. This is
+inconvenient when you want to apply a fitted model to new data that
+contains a category that did not exist when the model was trained --
+for example, a supply region that opened after the training data was
+collected.
+
+:func:`C` accepts an ``unknown_value`` argument that reserves an extra
+level to catch exactly these values. The reserved level is appended to
+the factor's ordinary levels and participates in the design like any
+other level, but it is *not* expected to appear in the training data:
+
+.. ipython:: python
+
+   train = {"region": ["north", "south", "north"],
+            "y": [1.0, 2.0, 3.0]}
+   _, design = dmatrices(
+       "y ~ C(region, levels=['north', 'south'], unknown_value='UNK')",
+       train)
+   design
+   design.design_info.term_names
+
+Notice the extra ``[T.UNK]`` column, even though no training row ever
+takes that value. When the frozen :class:`DesignInfo` is later used to
+score new data, any region that is not one of the known levels is coded
+against this reserved level instead of raising an error:
+
+.. ipython:: python
+
+   from patsy import build_design_matrices
+   new_data = {"region": ["north", "west", "south"]}
+   build_design_matrices([design.design_info], new_data)[0]
+
+Important points:
+
+* The ordinary level ordering and the reference level are frozen at
+  training time and never change when scoring new data. No columns are
+  added during prediction; the unseen values simply reuse the reserved
+  level's columns, including any interaction columns that involve the
+  factor.
+* Ordinary missing values are unaffected. They are still handled by the
+  :class:`~patsy.missing.NAAction` you choose (e.g. dropped) and are
+  *not* redirected into the reserved bucket. If an upstream process has
+  already converted an unseen value into a missing code that cannot be
+  recovered, then that row is simply treated as missing.
+* If a value equal to ``unknown_value`` actually occurs in the training
+  data, or it collides with one of the ordinary levels, Patsy raises a
+  :class:`~patsy.PatsyError` while building the design. The reserved
+  bucket is never silently merged with a real level.
+* Categorical factors that do not set ``unknown_value`` keep the
+  default strict behaviour: unseen values raise
+  ``UnknownValueError`` (a :class:`~patsy.PatsyError` subclass
+  available as ``patsy.categorical.UnknownValueError``).
+
+The same behaviour works whether the prediction data uses plain strings
+or a :class:`pandas.Categorical`. The pandas categorical may even use a
+different category ordering or explicitly declare the new values; Patsy
+maps each value onto the frozen levels and routes anything unknown into
+the reserved bucket.

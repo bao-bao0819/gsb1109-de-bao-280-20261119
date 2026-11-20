@@ -2,7 +2,13 @@
 # Copyright (C) 2011-2013 Nathaniel Smith <njs@pobox.com>
 # See file LICENSE.txt for license information.
 
-__all__ = ["C", "guess_categorical", "CategoricalSniffer", "categorical_to_int"]
+__all__ = [
+    "C",
+    "guess_categorical",
+    "CategoricalSniffer",
+    "categorical_to_int",
+    "UnknownValueError",
+]
 
 # How we handle categorical data: the big picture
 # -----------------------------------------------
@@ -55,18 +61,29 @@ if have_pandas:
     import pandas
 
 
+class UnknownValueError(PatsyError):
+    """Raised when categorical data contains a value that was not seen when
+    the :class:`~patsy.design_info.DesignInfo` was built, and the offending
+    factor has no reserved "unknown value" level to catch it.
+
+    This is a :class:`~patsy.PatsyError` subclass, so existing code which
+    catches :class:`~patsy.PatsyError` keeps working unchanged.
+    """
+
+
 # Objects of this type will always be treated as categorical, with the
 # specified levels and contrast (if given).
 class _CategoricalBox(object):
-    def __init__(self, data, contrast, levels):
+    def __init__(self, data, contrast, levels, unknown_value=None):
         self.data = data
         self.contrast = contrast
         self.levels = levels
+        self.unknown_value = unknown_value
 
     __getstate__ = no_pickling
 
 
-def C(data, contrast=None, levels=None):
+def C(data, contrast=None, levels=None, unknown_value=None):
     """
     Marks some `data` as being categorical, and specifies how to interpret
     it.
@@ -97,14 +114,32 @@ def C(data, contrast=None, levels=None):
         (:class:`Treatment`, :class:`Diff`, :class:`Poly`, etc.). See
         :ref:`categorical-coding` for more details.
       * A callable that returns one of the above.
+
+    :arg unknown_value: If given, this reserves an extra level named
+      `unknown_value` which is *not* expected to appear in the training data,
+      but is appended to the factor's list of levels. When the resulting
+      :class:`~patsy.design_info.DesignInfo` is later used to build a design
+      matrix from new data, any value that does not match one of the ordinary
+      levels is coded against this reserved level instead of raising an
+      error. This lets a model trained on one set of categories be applied to
+      data that contains brand-new categories (e.g. a new supply region).
+      Ordinary missing values keep being handled by the configured
+      :class:`~patsy.missing.NAAction` and are *not* redirected into this
+      bucket. If `unknown_value` collides with an ordinary level, or a value
+      equal to `unknown_value` is actually present in the training data, a
+      :class:`~patsy.PatsyError` is raised while building the design.
+      Categorical factors without an `unknown_value` keep the default strict
+      behaviour, where an unseen value raises an error.
     """
     if isinstance(data, _CategoricalBox):
         if contrast is None:
             contrast = data.contrast
         if levels is None:
             levels = data.levels
+        if unknown_value is None:
+            unknown_value = data.unknown_value
         data = data.data
-    return _CategoricalBox(data, contrast, levels)
+    return _CategoricalBox(data, contrast, levels, unknown_value)
 
 
 def test_C():
@@ -127,6 +162,15 @@ def test_C():
     assert c4.levels == "LEVELS"
 
     assert_no_pickling(c4)
+
+    c5 = C("DATA", unknown_value="UNKNOWN")
+    assert c5.unknown_value == "UNKNOWN"
+    # re-wrapping a box preserves the reserved level unless overridden
+    c6 = C(c5)
+    assert c6.unknown_value == "UNKNOWN"
+    c7 = C(c5, unknown_value="OTHER")
+    assert c7.unknown_value == "OTHER"
+    assert C("DATA").unknown_value is None
 
 
 def guess_categorical(data):
@@ -178,19 +222,41 @@ class CategoricalSniffer(object):
         self._contrast = None
         self._levels = None
         self._level_set = set()
+        self._unknown_value = None
 
     def levels_contrast(self):
         if self._levels is None:
             levels = list(self._level_set)
             levels.sort(key=SortAnythingKey)
             self._levels = levels
-        return tuple(self._levels), self._contrast
+        levels = tuple(self._levels)
+        unknown_value = self._unknown_value
+        if unknown_value is not None:
+            try:
+                collision = unknown_value in levels
+            except TypeError:
+                raise PatsyError(
+                    "Error interpreting categorical data: "
+                    "the unknown_value level must be hashable",
+                    self._origin,
+                )
+            if collision:
+                raise PatsyError(
+                    "unknown_value %r collides with an existing level of "
+                    "this categorical factor; the reserved unknown-value "
+                    "bucket must not be used as a real level" % (unknown_value,),
+                    self._origin,
+                )
+            levels = levels + (unknown_value,)
+        return levels, self._contrast, unknown_value
 
     def sniff(self, data):
         if hasattr(data, "contrast"):
             self._contrast = data.contrast
         # returns a bool: are we confident that we found all the levels?
         if isinstance(data, _CategoricalBox):
+            if data.unknown_value is not None:
+                self._unknown_value = data.unknown_value
             if data.levels is not None:
                 self._levels = tuple(data.levels)
                 return True
@@ -234,7 +300,14 @@ class CategoricalSniffer(object):
 def test_CategoricalSniffer():
     from patsy.missing import NAAction
 
-    def t(NA_types, datas, exp_finish_fast, exp_levels, exp_contrast=None):
+    def t(
+        NA_types,
+        datas,
+        exp_finish_fast,
+        exp_levels,
+        exp_contrast=None,
+        exp_unknown=None,
+    ):
         sniffer = CategoricalSniffer(NAAction(NA_types=NA_types))
         for data in datas:
             done = sniffer.sniff(data)
@@ -243,7 +316,11 @@ def test_CategoricalSniffer():
                 break
             else:
                 assert not exp_finish_fast
-        assert sniffer.levels_contrast() == (exp_levels, exp_contrast)
+        assert sniffer.levels_contrast() == (
+            exp_levels,
+            exp_contrast,
+            exp_unknown,
+        )
 
     if have_pandas_categorical:
         # We make sure to test with both boxed and unboxed pandas objects,
@@ -286,7 +363,7 @@ def test_CategoricalSniffer():
     # consistent way to sort mixed-type values on both py2 and py3. Honestly
     # people probably shouldn't use this, but I don't know how to give a
     # sensible error.
-    levels, _ = sniffer.levels_contrast()
+    levels, _, _ = sniffer.levels_contrast()
     assert set(levels) == set([None, 1])
 
     # bool special cases
@@ -322,30 +399,130 @@ def test_CategoricalSniffer():
     # >1d is illegal
     pytest.raises(PatsyError, sniffer.sniff, np.asarray([["b"]]))
 
+    # unknown_value reserves an extra level that is never observed
+    t(
+        [],
+        [C(["a", "b"], unknown_value="UNK")],
+        False,
+        ("a", "b", "UNK"),
+        exp_unknown="UNK",
+    )
+    t(
+        [],
+        [C(["b", "a"], levels=["b", "a"], unknown_value="UNK")],
+        True,
+        ("b", "a", "UNK"),
+        exp_unknown="UNK",
+    )
+    # the reserved bucket is appended after an empty set of real levels too
+    t([], [C([], levels=[], unknown_value="UNK")], True, ("UNK",), exp_unknown="UNK")
+
+    # a reserved name that is also a real observed level is a configuration
+    # error, both when levels are sniffed and when they are given explicitly
+    sniffer = CategoricalSniffer(NAAction())
+    sniffer.sniff(C(["a", "b", "UNK"], unknown_value="UNK"))
+    pytest.raises(PatsyError, sniffer.levels_contrast)
+    sniffer = CategoricalSniffer(NAAction())
+    sniffer.sniff(C(["a", "b"], levels=["a", "UNK"], unknown_value="UNK"))
+    pytest.raises(PatsyError, sniffer.levels_contrast)
+
 
 # returns either a 1d ndarray or a pandas.Series
-def categorical_to_int(data, levels, NA_action, origin=None):
+def categorical_to_int(
+    data,
+    levels,
+    NA_action,
+    origin=None,
+    unknown_value=None,
+    reserve_guard=False,
+):
     assert isinstance(levels, tuple)
     # In this function, missing values are always mapped to -1
+    unknown_int = None
+    if unknown_value is not None:
+        try:
+            unknown_int = levels.index(unknown_value)
+        except ValueError:
+            raise PatsyError(
+                "unknown_value %r is not one of the levels of this "
+                "categorical factor" % (unknown_value,),
+                origin,
+            )
+
+    def _reserve_conflict(value):
+        raise PatsyError(
+            "the reserved unknown-value level %r must not be occupied by a "
+            "real observation; it is meant only for values unseen during "
+            "training. Choose a different unknown_value, or remove this level "
+            "from the data (observed value: %r)" % (unknown_value, value),
+            origin,
+        )
 
     if safe_is_pandas_categorical(data):
         data_levels_tuple = tuple(pandas_Categorical_categories(data))
-        if not data_levels_tuple == levels:
-            raise PatsyError(
-                "mismatching levels: expected %r, got %r" % (levels, data_levels_tuple),
-                origin,
-            )
-        # pandas.Categorical also uses -1 to indicate NA, and we don't try to
-        # second-guess its NA detection, so we can just pass it back.
-        return pandas_Categorical_codes(data)
+        if unknown_value is None:
+            if not data_levels_tuple == levels:
+                raise PatsyError(
+                    "mismatching levels: expected %r, got %r"
+                    % (levels, data_levels_tuple),
+                    origin,
+                )
+            # pandas.Categorical also uses -1 to indicate NA, and we don't try
+            # to second-guess its NA detection, so we can just pass it back.
+            return pandas_Categorical_codes(data)
+        # A reserved unknown-value level is in use. The incoming pandas
+        # Categorical may use a different category ordering, declare levels
+        # that were absent during training, or both. Translate each pandas
+        # code onto this factor's level indices; any category not among the
+        # known levels lands in the reserved bucket. NA keeps its -1 code and
+        # is still handled by the configured NA action.
+        factor_index = dict(zip(levels, range(len(levels))))
+        lookup = np.full(len(data_levels_tuple), unknown_int, dtype=int)
+        for pandas_code, level in enumerate(data_levels_tuple):
+            if level in factor_index:
+                factor_code = factor_index[level]
+                if reserve_guard and factor_code == unknown_int:
+                    _reserve_conflict(level)
+                lookup[pandas_code] = factor_code
+            elif reserve_guard:
+                # Training data must not declare categories outside the real
+                # levels: the reserved bucket cannot absorb a training level.
+                raise PatsyError(
+                    "training data contains category %r which is not among "
+                    "the declared levels; the reserved unknown-value bucket "
+                    "cannot be used by a real training level" % (level,),
+                    origin,
+                )
+        codes = np.asarray(pandas_Categorical_codes(data))
+        # Map only the non-missing codes. Pandas uses -1 for NA, and an
+        # all-missing Categorical has no categories at all, so indexing the
+        # (possibly empty) lookup must be restricted to valid codes; NA keeps
+        # its -1 code and is still handled by the configured NA action.
+        out = np.full(codes.shape, -1, dtype=int)
+        valid = codes >= 0
+        if np.any(valid):
+            out[valid] = lookup[codes[valid]]
+        if have_pandas and isinstance(data, pandas.Series):
+            out = pandas.Series(out, index=data.index)
+        return out
 
     if isinstance(data, _CategoricalBox):
-        if data.levels is not None and tuple(data.levels) != levels:
-            raise PatsyError(
-                "mismatching levels: expected %r, got %r"
-                % (levels, tuple(data.levels)),
-                origin,
-            )
+        if data.levels is not None:
+            box_levels = tuple(data.levels)
+            if unknown_value is not None:
+                # The reserved bucket is stored alongside the ordinary levels
+                # but is not something the caller lists explicitly.
+                expected_levels = tuple(
+                    level for level in levels if level != unknown_value
+                )
+            else:
+                expected_levels = levels
+            if box_levels != expected_levels:
+                raise PatsyError(
+                    "mismatching levels: expected %r, got %r"
+                    % (expected_levels, box_levels),
+                    origin,
+                )
         data = data.data
 
     data = _categorical_shape_fix(data)
@@ -358,8 +535,13 @@ def categorical_to_int(data, levels, NA_action, origin=None):
         )
 
     # fastpath to avoid doing an item-by-item iteration over boolean arrays,
-    # as requested by #44
-    if hasattr(data, "dtype") and safe_issubdtype(data.dtype, np.bool_):
+    # as requested by #44. Skipped when a reserved unknown-value level is in
+    # play, since the per-element loop below owns the bucket routing/guard.
+    if (
+        unknown_int is None
+        and hasattr(data, "dtype")
+        and safe_issubdtype(data.dtype, np.bool_)
+    ):
         if level_to_int[False] == 0 and level_to_int[True] == 1:
             return data.astype(np.int_)
     out = np.empty(len(data), dtype=int)
@@ -368,8 +550,13 @@ def categorical_to_int(data, levels, NA_action, origin=None):
             out[i] = -1
         else:
             try:
-                out[i] = level_to_int[value]
+                code = level_to_int[value]
             except KeyError:
+                if unknown_int is not None:
+                    if reserve_guard:
+                        _reserve_conflict(value)
+                    out[i] = unknown_int
+                    continue
                 SHOW_LEVELS = 4
                 level_strs = []
                 if len(levels) <= SHOW_LEVELS:
@@ -379,7 +566,7 @@ def categorical_to_int(data, levels, NA_action, origin=None):
                     level_strs.append("...")
                     level_strs += [repr(level) for level in levels[-SHOW_LEVELS // 2 :]]
                 level_str = "[%s]" % (", ".join(level_strs))
-                raise PatsyError(
+                raise UnknownValueError(
                     "Error converting data to categorical: "
                     "observation with value %r does not match "
                     "any of the expected levels (expected: %s)" % (value, level_str),
@@ -391,6 +578,10 @@ def categorical_to_int(data, levels, NA_action, origin=None):
                     "encountered unhashable value %r" % (value,),
                     origin,
                 )
+            else:
+                if reserve_guard and code == unknown_int:
+                    _reserve_conflict(value)
+                out[i] = code
     if have_pandas and isinstance(data, pandas.Series):
         out = pandas.Series(out, index=data.index)
     return out
@@ -526,3 +717,147 @@ def test_categorical_to_int():
         ("a", "b", "c", "d", "e", "f", "g", "h"),
         NAAction(),
     )
+
+    # --- unknown_value reserves a catch-all bucket -------------------------
+    reserved_levels = ("a", "b", "UNK")
+    # unseen values land in the reserved bucket; known values keep their codes
+    got = categorical_to_int(
+        ["a", "new1", "b", "new2"], reserved_levels, NAAction(), unknown_value="UNK"
+    )
+    assert np.array_equal(got, [0, 2, 1, 2])
+    # the strict path is unchanged for factors without a reserved bucket
+    pytest.raises(
+        UnknownValueError,
+        categorical_to_int,
+        ["a", "new"],
+        ("a", "b"),
+        NAAction(),
+    )
+    # UnknownValueError is just a specialised PatsyError
+    assert issubclass(UnknownValueError, PatsyError)
+    # genuine missing values are NOT redirected into the bucket
+    got_na = categorical_to_int(
+        ["a", None, "new", np.nan],
+        reserved_levels,
+        NAAction(NA_types=["None", "NaN"]),
+        unknown_value="UNK",
+    )
+    assert np.array_equal(got_na, [0, -1, 2, -1])
+    # C() boxes carry the ordinary levels only (the bucket is not listed)
+    got_box = categorical_to_int(
+        C(["a", "new", "b"], levels=["a", "b"]),
+        reserved_levels,
+        NAAction(),
+        unknown_value="UNK",
+    )
+    assert np.array_equal(got_box, [0, 2, 1])
+    # the reserved bucket must actually be among the levels
+    pytest.raises(
+        PatsyError,
+        categorical_to_int,
+        ["a"],
+        ("a", "b"),
+        NAAction(),
+        unknown_value="UNK",
+    )
+
+    if have_pandas_categorical:
+        # A pandas Categorical whose category ordering differs and which
+        # declares the never-seen training value:
+        cat = pandas_Categorical_from_codes([1, 0, 2, -1], ["b", "a", "new_region"])
+        got_pd = categorical_to_int(
+            cat, reserved_levels, NAAction(), unknown_value="UNK"
+        )
+        # values are ["a", "b", "new_region", NA] -> factor codes [0, 1, 2, -1]
+        assert np.array_equal(got_pd, [0, 1, 2, -1])
+        # categories that match known levels are remapped despite ordering;
+        # any extra declared category still routes to the reserved bucket
+        cat2 = pandas_Categorical_from_codes([0, 1, 2], ["new_x", "a", "new_y"])
+        got_pd2 = categorical_to_int(
+            cat2, reserved_levels, NAAction(), unknown_value="UNK"
+        )
+        assert np.array_equal(got_pd2, [2, 0, 2])
+        if have_pandas_categorical_dtype:
+            ser = pandas.Series(
+                pandas_Categorical_from_codes([2, 1], ["a", "b", "brand_new"])
+            )
+            got_ser = categorical_to_int(
+                ser, reserved_levels, NAAction(), unknown_value="UNK"
+            )
+            assert np.array_equal(got_ser, [2, 1])
+            assert np.all(got_ser.index == ser.index)
+        # An all-missing Categorical has no categories at all; its -1 NA codes
+        # must survive instead of indexing the empty lookup table.
+        all_na = pandas.Categorical([None, None])
+        got_all_na = categorical_to_int(
+            all_na, reserved_levels, NAAction(NA_types=["None"]), unknown_value="UNK"
+        )
+        assert np.array_equal(got_all_na, [-1, -1])
+
+    # --- reserve_guard (training-time configuration checks) ---------------
+    # an observation whose value equals the reserved name is refused ...
+    pytest.raises(
+        PatsyError,
+        categorical_to_int,
+        ["a", "UNK"],
+        reserved_levels,
+        NAAction(),
+        None,
+        "UNK",
+        True,
+    )
+    # ... as is an unseen value, so a real training level can't be absorbed
+    pytest.raises(
+        PatsyError,
+        categorical_to_int,
+        ["a", "brand_new"],
+        reserved_levels,
+        NAAction(),
+        None,
+        "UNK",
+        True,
+    )
+    # legitimate known values still pass under the guard
+    got_guard = categorical_to_int(
+        ["a", "b", "a"],
+        reserved_levels,
+        NAAction(),
+        unknown_value="UNK",
+        reserve_guard=True,
+    )
+    assert np.array_equal(got_guard, [0, 1, 0])
+    # the guard never redirects genuine missing values
+    got_guard_na = categorical_to_int(
+        ["a", None],
+        reserved_levels,
+        NAAction(NA_types=["None"]),
+        unknown_value="UNK",
+        reserve_guard=True,
+    )
+    assert np.array_equal(got_guard_na, [0, -1])
+
+    if have_pandas_categorical:
+        # pandas Categorical declaring the reserved name as a real category
+        guarded_cat = pandas_Categorical_from_codes([0, 1], ["a", "UNK"])
+        pytest.raises(
+            PatsyError,
+            categorical_to_int,
+            guarded_cat,
+            reserved_levels,
+            NAAction(),
+            None,
+            "UNK",
+            True,
+        )
+        # pandas Categorical declaring an extra non-reserved category
+        extra_cat = pandas_Categorical_from_codes([0, 1], ["a", "extra"])
+        pytest.raises(
+            PatsyError,
+            categorical_to_int,
+            extra_cat,
+            reserved_levels,
+            NAAction(),
+            None,
+            "UNK",
+            True,
+        )

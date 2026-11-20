@@ -1,0 +1,23 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "amountGroups": {
+      "items": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "invoiceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "invoiceId",
+    "amountGroups"
+  ],
+  "title": "DeliveryNote",
+  "type": "object"
+}

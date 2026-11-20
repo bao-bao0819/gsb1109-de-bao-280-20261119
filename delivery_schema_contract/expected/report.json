@@ -1,0 +1,807 @@
+{
+  "cases": [
+    {
+      "configuration": {
+        "caller_dialect": false,
+        "envelope_hook": false,
+        "model": "DeliveryNote"
+      },
+      "json_decoded": {
+        "amountGroups": [
+          [
+            "12.34",
+            "0.50"
+          ],
+          [
+            "7.00"
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      },
+      "json_decoded_equals_to_dict": true,
+      "json_text": "{\"invoiceId\": \"INV-2026-1119\", \"amountGroups\": [[\"12.34\", \"0.50\"], [\"7.00\"]]}",
+      "name": "default",
+      "observed_amount_pointer": "$.amountGroups.0.0",
+      "observed_amount_value": "12.34",
+      "schema_validation": {
+        "all_errors": [],
+        "classification": "passes",
+        "first_error": null
+      },
+      "to_dict": {
+        "amountGroups": [
+          [
+            "12.34",
+            "0.50"
+          ],
+          [
+            "7.00"
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      },
+      "unwrapped_payload_validation": null
+    },
+    {
+      "configuration": {
+        "caller_dialect": true,
+        "envelope_hook": false,
+        "model": "DeliveryNote"
+      },
+      "json_decoded": {
+        "amountGroups": [
+          [
+            1234,
+            50
+          ],
+          [
+            700
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      },
+      "json_decoded_equals_to_dict": true,
+      "json_text": "{\"invoiceId\": \"INV-2026-1119\", \"amountGroups\": [[1234, 50], [700]]}",
+      "name": "dialect",
+      "observed_amount_pointer": "$.amountGroups.0.0",
+      "observed_amount_value": 1234,
+      "schema_validation": {
+        "all_errors": [
+          {
+            "instance_path": [
+              "amountGroups",
+              0,
+              0
+            ],
+            "instance_pointer": "$.amountGroups.0.0",
+            "message": "1234 is not of type 'string'",
+            "schema_path": [
+              "properties",
+              "amountGroups",
+              "items",
+              "items",
+              "type"
+            ],
+            "schema_pointer": "/properties/amountGroups/items/items/type",
+            "validator": "type"
+          },
+          {
+            "instance_path": [
+              "amountGroups",
+              0,
+              1
+            ],
+            "instance_pointer": "$.amountGroups.0.1",
+            "message": "50 is not of type 'string'",
+            "schema_path": [
+              "properties",
+              "amountGroups",
+              "items",
+              "items",
+              "type"
+            ],
+            "schema_pointer": "/properties/amountGroups/items/items/type",
+            "validator": "type"
+          },
+          {
+            "instance_path": [
+              "amountGroups",
+              1,
+              0
+            ],
+            "instance_pointer": "$.amountGroups.1.0",
+            "message": "700 is not of type 'string'",
+            "schema_path": [
+              "properties",
+              "amountGroups",
+              "items",
+              "items",
+              "type"
+            ],
+            "schema_pointer": "/properties/amountGroups/items/items/type",
+            "validator": "type"
+          }
+        ],
+        "classification": "numeric representation: amount leaf is not the declared type",
+        "first_error": {
+          "instance_path": [
+            "amountGroups",
+            0,
+            0
+          ],
+          "instance_pointer": "$.amountGroups.0.0",
+          "message": "1234 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        }
+      },
+      "to_dict": {
+        "amountGroups": [
+          [
+            1234,
+            50
+          ],
+          [
+            700
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      },
+      "unwrapped_payload_validation": null
+    },
+    {
+      "configuration": {
+        "caller_dialect": false,
+        "envelope_hook": true,
+        "model": "WrappedDeliveryNote"
+      },
+      "json_decoded": {
+        "payload": {
+          "amountGroups": [
+            [
+              "12.34",
+              "0.50"
+            ],
+            [
+              "7.00"
+            ]
+          ],
+          "invoiceId": "INV-2026-1119"
+        }
+      },
+      "json_decoded_equals_to_dict": true,
+      "json_text": "{\"payload\": {\"invoiceId\": \"INV-2026-1119\", \"amountGroups\": [[\"12.34\", \"0.50\"], [\"7.00\"]]}}",
+      "name": "envelope",
+      "observed_amount_pointer": "$.payload.amountGroups.0.0",
+      "observed_amount_value": "12.34",
+      "schema_validation": {
+        "all_errors": [
+          {
+            "instance_path": [],
+            "instance_pointer": "$",
+            "message": "Additional properties are not allowed ('payload' was unexpected)",
+            "schema_path": [
+              "additionalProperties"
+            ],
+            "schema_pointer": "/additionalProperties",
+            "validator": "additionalProperties"
+          },
+          {
+            "instance_path": [],
+            "instance_pointer": "$",
+            "message": "'invoiceId' is a required property",
+            "schema_path": [
+              "required"
+            ],
+            "schema_pointer": "/required",
+            "validator": "required"
+          },
+          {
+            "instance_path": [],
+            "instance_pointer": "$",
+            "message": "'amountGroups' is a required property",
+            "schema_path": [
+              "required"
+            ],
+            "schema_pointer": "/required",
+            "validator": "required"
+          }
+        ],
+        "classification": "envelope: top-level keys moved under payload",
+        "first_error": {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "Additional properties are not allowed ('payload' was unexpected)",
+          "schema_path": [
+            "additionalProperties"
+          ],
+          "schema_pointer": "/additionalProperties",
+          "validator": "additionalProperties"
+        }
+      },
+      "to_dict": {
+        "payload": {
+          "amountGroups": [
+            [
+              "12.34",
+              "0.50"
+            ],
+            [
+              "7.00"
+            ]
+          ],
+          "invoiceId": "INV-2026-1119"
+        }
+      },
+      "unwrapped_payload_validation": {
+        "all_errors": [],
+        "classification": "passes",
+        "first_error": null
+      }
+    },
+    {
+      "configuration": {
+        "caller_dialect": true,
+        "envelope_hook": true,
+        "model": "WrappedDeliveryNote"
+      },
+      "json_decoded": {
+        "payload": {
+          "amountGroups": [
+            [
+              1234,
+              50
+            ],
+            [
+              700
+            ]
+          ],
+          "invoiceId": "INV-2026-1119"
+        }
+      },
+      "json_decoded_equals_to_dict": true,
+      "json_text": "{\"payload\": {\"invoiceId\": \"INV-2026-1119\", \"amountGroups\": [[1234, 50], [700]]}}",
+      "name": "both",
+      "observed_amount_pointer": "$.payload.amountGroups.0.0",
+      "observed_amount_value": 1234,
+      "schema_validation": {
+        "all_errors": [
+          {
+            "instance_path": [],
+            "instance_pointer": "$",
+            "message": "Additional properties are not allowed ('payload' was unexpected)",
+            "schema_path": [
+              "additionalProperties"
+            ],
+            "schema_pointer": "/additionalProperties",
+            "validator": "additionalProperties"
+          },
+          {
+            "instance_path": [],
+            "instance_pointer": "$",
+            "message": "'invoiceId' is a required property",
+            "schema_path": [
+              "required"
+            ],
+            "schema_pointer": "/required",
+            "validator": "required"
+          },
+          {
+            "instance_path": [],
+            "instance_pointer": "$",
+            "message": "'amountGroups' is a required property",
+            "schema_path": [
+              "required"
+            ],
+            "schema_pointer": "/required",
+            "validator": "required"
+          }
+        ],
+        "classification": "envelope: top-level keys moved under payload",
+        "first_error": {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "Additional properties are not allowed ('payload' was unexpected)",
+          "schema_path": [
+            "additionalProperties"
+          ],
+          "schema_pointer": "/additionalProperties",
+          "validator": "additionalProperties"
+        }
+      },
+      "to_dict": {
+        "payload": {
+          "amountGroups": [
+            [
+              1234,
+              50
+            ],
+            [
+              700
+            ]
+          ],
+          "invoiceId": "INV-2026-1119"
+        }
+      },
+      "unwrapped_payload_validation": {
+        "all_errors": [
+          {
+            "instance_path": [
+              "amountGroups",
+              0,
+              0
+            ],
+            "instance_pointer": "$.amountGroups.0.0",
+            "message": "1234 is not of type 'string'",
+            "schema_path": [
+              "properties",
+              "amountGroups",
+              "items",
+              "items",
+              "type"
+            ],
+            "schema_pointer": "/properties/amountGroups/items/items/type",
+            "validator": "type"
+          },
+          {
+            "instance_path": [
+              "amountGroups",
+              0,
+              1
+            ],
+            "instance_pointer": "$.amountGroups.0.1",
+            "message": "50 is not of type 'string'",
+            "schema_path": [
+              "properties",
+              "amountGroups",
+              "items",
+              "items",
+              "type"
+            ],
+            "schema_pointer": "/properties/amountGroups/items/items/type",
+            "validator": "type"
+          },
+          {
+            "instance_path": [
+              "amountGroups",
+              1,
+              0
+            ],
+            "instance_pointer": "$.amountGroups.1.0",
+            "message": "700 is not of type 'string'",
+            "schema_path": [
+              "properties",
+              "amountGroups",
+              "items",
+              "items",
+              "type"
+            ],
+            "schema_pointer": "/properties/amountGroups/items/items/type",
+            "validator": "type"
+          }
+        ],
+        "classification": "numeric representation: amount leaf is not the declared type",
+        "first_error": {
+          "instance_path": [
+            "amountGroups",
+            0,
+            0
+          ],
+          "instance_pointer": "$.amountGroups.0.0",
+          "message": "1234 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        }
+      }
+    }
+  ],
+  "independent_checks": {
+    "both_broken_after_manual_unwrap": {
+      "all_errors": [
+        {
+          "instance_path": [
+            "amountGroups",
+            0,
+            0
+          ],
+          "instance_pointer": "$.amountGroups.0.0",
+          "message": "1234 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        },
+        {
+          "instance_path": [
+            "amountGroups",
+            0,
+            1
+          ],
+          "instance_pointer": "$.amountGroups.0.1",
+          "message": "50 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        },
+        {
+          "instance_path": [
+            "amountGroups",
+            1,
+            0
+          ],
+          "instance_pointer": "$.amountGroups.1.0",
+          "message": "700 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        }
+      ],
+      "classification": "numeric representation: amount leaf is not the declared type",
+      "first_error": {
+        "instance_path": [
+          "amountGroups",
+          0,
+          0
+        ],
+        "instance_pointer": "$.amountGroups.0.0",
+        "message": "1234 is not of type 'string'",
+        "schema_path": [
+          "properties",
+          "amountGroups",
+          "items",
+          "items",
+          "type"
+        ],
+        "schema_pointer": "/properties/amountGroups/items/items/type",
+        "validator": "type"
+      },
+      "observed_amount_pointer": "$.amountGroups.0.0",
+      "payload": {
+        "amountGroups": [
+          [
+            1234,
+            50
+          ],
+          [
+            700
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      }
+    },
+    "both_broken_envelope_hides_numeric": {
+      "all_errors": [
+        {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "Additional properties are not allowed ('payload' was unexpected)",
+          "schema_path": [
+            "additionalProperties"
+          ],
+          "schema_pointer": "/additionalProperties",
+          "validator": "additionalProperties"
+        },
+        {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "'invoiceId' is a required property",
+          "schema_path": [
+            "required"
+          ],
+          "schema_pointer": "/required",
+          "validator": "required"
+        },
+        {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "'amountGroups' is a required property",
+          "schema_path": [
+            "required"
+          ],
+          "schema_pointer": "/required",
+          "validator": "required"
+        }
+      ],
+      "classification": "envelope: top-level keys moved under payload",
+      "first_error": {
+        "instance_path": [],
+        "instance_pointer": "$",
+        "message": "Additional properties are not allowed ('payload' was unexpected)",
+        "schema_path": [
+          "additionalProperties"
+        ],
+        "schema_pointer": "/additionalProperties",
+        "validator": "additionalProperties"
+      },
+      "observed_amount_pointer": "$.payload.amountGroups.0.0",
+      "payload": {
+        "payload": {
+          "amountGroups": [
+            [
+              1234,
+              50
+            ],
+            [
+              700
+            ]
+          ],
+          "invoiceId": "INV-2026-1119"
+        }
+      }
+    },
+    "default_control": {
+      "all_errors": [],
+      "classification": "passes",
+      "first_error": null,
+      "observed_amount_pointer": "$.amountGroups.0.0",
+      "payload": {
+        "amountGroups": [
+          [
+            "12.34",
+            "0.50"
+          ],
+          [
+            "7.00"
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      }
+    },
+    "envelope_fixed_but_numeric_still_broken": {
+      "all_errors": [
+        {
+          "instance_path": [
+            "amountGroups",
+            0,
+            0
+          ],
+          "instance_pointer": "$.amountGroups.0.0",
+          "message": "1234 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        },
+        {
+          "instance_path": [
+            "amountGroups",
+            0,
+            1
+          ],
+          "instance_pointer": "$.amountGroups.0.1",
+          "message": "50 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        },
+        {
+          "instance_path": [
+            "amountGroups",
+            1,
+            0
+          ],
+          "instance_pointer": "$.amountGroups.1.0",
+          "message": "700 is not of type 'string'",
+          "schema_path": [
+            "properties",
+            "amountGroups",
+            "items",
+            "items",
+            "type"
+          ],
+          "schema_pointer": "/properties/amountGroups/items/items/type",
+          "validator": "type"
+        }
+      ],
+      "classification": "numeric representation: amount leaf is not the declared type",
+      "first_error": {
+        "instance_path": [
+          "amountGroups",
+          0,
+          0
+        ],
+        "instance_pointer": "$.amountGroups.0.0",
+        "message": "1234 is not of type 'string'",
+        "schema_path": [
+          "properties",
+          "amountGroups",
+          "items",
+          "items",
+          "type"
+        ],
+        "schema_pointer": "/properties/amountGroups/items/items/type",
+        "validator": "type"
+      },
+      "observed_amount_pointer": "$.amountGroups.0.0",
+      "payload": {
+        "amountGroups": [
+          [
+            1234,
+            50
+          ],
+          [
+            700
+          ]
+        ],
+        "invoiceId": "INV-2026-1119"
+      }
+    },
+    "numeric_fixed_but_envelope_still_broken": {
+      "all_errors": [
+        {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "Additional properties are not allowed ('payload' was unexpected)",
+          "schema_path": [
+            "additionalProperties"
+          ],
+          "schema_pointer": "/additionalProperties",
+          "validator": "additionalProperties"
+        },
+        {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "'invoiceId' is a required property",
+          "schema_path": [
+            "required"
+          ],
+          "schema_pointer": "/required",
+          "validator": "required"
+        },
+        {
+          "instance_path": [],
+          "instance_pointer": "$",
+          "message": "'amountGroups' is a required property",
+          "schema_path": [
+            "required"
+          ],
+          "schema_pointer": "/required",
+          "validator": "required"
+        }
+      ],
+      "classification": "envelope: top-level keys moved under payload",
+      "first_error": {
+        "instance_path": [],
+        "instance_pointer": "$",
+        "message": "Additional properties are not allowed ('payload' was unexpected)",
+        "schema_path": [
+          "additionalProperties"
+        ],
+        "schema_pointer": "/additionalProperties",
+        "validator": "additionalProperties"
+      },
+      "observed_amount_pointer": "$.payload.amountGroups.0.0",
+      "payload": {
+        "payload": {
+          "amountGroups": [
+            [
+              "12.34",
+              "0.50"
+            ],
+            [
+              "7.00"
+            ]
+          ],
+          "invoiceId": "INV-2026-1119"
+        }
+      }
+    }
+  },
+  "schema_scope": {
+    "alias_keys": [
+      "amountGroups",
+      "invoiceId"
+    ],
+    "amount_leaf_schema": {
+      "type": "string"
+    },
+    "bare_decimal_schema": {
+      "format": "decimal",
+      "type": "string"
+    },
+    "caller_dialect_as_json_schema_dialect": {
+      "accepted": false,
+      "exception": "AttributeError",
+      "message": "type object 'CentsDialect' has no attribute 'all_refs'"
+    },
+    "model_strategy": {
+      "class": "DecimalAsText",
+      "declared_on": "DeliveryNote.Config.serialization_strategy",
+      "serialize_return_annotation": "<class 'str'>"
+    },
+    "published_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "amountGroups": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "invoiceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "invoiceId",
+        "amountGroups"
+      ],
+      "title": "DeliveryNote",
+      "type": "object"
+    },
+    "wrapped_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "amountGroups": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "invoiceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "invoiceId",
+        "amountGroups"
+      ],
+      "title": "WrappedDeliveryNote",
+      "type": "object"
+    },
+    "wrapped_schema_matches_published": {
+      "additionalProperties": true,
+      "definitions": true,
+      "properties": true,
+      "required": true
+    }
+  }
+}

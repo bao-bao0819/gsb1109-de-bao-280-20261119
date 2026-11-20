@@ -3,7 +3,7 @@ import warnings
 from mapbox_vector_tile import decoder, encoder
 
 
-def decode(tile, per_layer_options=None, default_options=None, **kwargs):
+def decode(tile, per_layer_options=None, default_options=None, check_mode=False, **kwargs):
     """Decode the provided `tile`
 
     Args:
@@ -19,8 +19,16 @@ def decode(tile, per_layer_options=None, default_options=None, **kwargs):
             These options are taken for layers without entry in `per_layer_options`. For all missing options values,
             the global default values are taken.
 
+        check_mode:
+            When `False` (the default), the whole tile is decoded and any malformed feature makes the decoding fail,
+            matching the standard decoding contract. When `True`, malformed features are skipped instead of failing:
+            the returned dictionary holds the still-decodable layers under the `layers` key and one error entry per
+            malformed feature under the `errors` key. Each error entry identifies the layer name and the original
+            feature index inside that layer, together with the failure reason. Errors raised by a user-provided
+            `transformer` are not treated as malformed data and keep propagating.
+
     Returns:
-        The decoded layers data.
+        The decoded layers data, or a `{"layers": ..., "errors": ...}` dictionary when `check_mode` is `True`.
 
     Notes:
         The possible options are:
@@ -36,7 +44,7 @@ def decode(tile, per_layer_options=None, default_options=None, **kwargs):
         warnings.warn("`decode` signature has changed, use `default_options` instead", DeprecationWarning, stacklevel=2)
         default_options = {**kwargs, **(default_options or {})}
     vector_tile = decoder.TileData(pbf_data=tile, per_layer_options=per_layer_options, default_options=default_options)
-    message = vector_tile.get_message()
+    message = vector_tile.get_message(check_mode=check_mode)
     return message
 
 

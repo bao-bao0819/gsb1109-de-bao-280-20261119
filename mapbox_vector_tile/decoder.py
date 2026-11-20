@@ -12,6 +12,42 @@ from mapbox_vector_tile.utils import (
 )
 
 
+class MVTDecodeError(Exception):
+    """Base class for errors caused by malformed MVT feature data."""
+
+    reason = "invalid_feature"
+
+
+class GeometryCommandTruncatedError(MVTDecodeError, IndexError):
+    """Raised when a geometry command ends before all its coordinate pairs are read."""
+
+    reason = "geometry_command_truncated"
+
+
+class FeaturePropertiesError(MVTDecodeError):
+    """Base class for errors caused by malformed feature tags/properties."""
+
+    reason = "properties_invalid"
+
+
+class UnexpectedTagCountError(FeaturePropertiesError, AssertionError):
+    """Raised when a feature does not hold an even number of tag entries."""
+
+
+class TagIndexOutOfRangeError(FeaturePropertiesError, IndexError):
+    """Raised when a feature tag points outside of the layer keys/values tables."""
+
+
+class InvalidPropertyValueError(FeaturePropertiesError, ValueError):
+    """Raised when a referenced layer value does not set any known variant field."""
+
+
+class UnknownGeometryTypeError(MVTDecodeError, ValueError):
+    """Raised when a feature uses an unknown geometry type."""
+
+    reason = "unknown_geometry_type"
+
+
 class TileData:
     def __init__(self, pbf_data, per_layer_options=None, default_options=None):
         self.tile = vector_tile.tile()
@@ -19,46 +55,74 @@ class TileData:
         self.default_options = default_options
         self.per_layer_options = per_layer_options if per_layer_options is not None else {}
 
-    def get_message(self):
-        tile = {}
+    def get_message(self, check_mode=False):
+        decoded_layers = {}
+        errors = []
         for layer in self.tile.layers:
             layer_name = layer.name
             layer_options = self.per_layer_options.get(layer_name, None)
             layer_options = get_decode_options(layer_options=layer_options, default_options=self.default_options)
 
-            keys = layer.keys
-            vals = layer.values
-
             features = []
-            for feature in layer.features:
-                tags = feature.tags
-                props = {}
-                assert len(tags) % 2 == 0, "Unexpected number of tags"
-                for key_idx, val_idx in zip(tags[::2], tags[1::2]):
-                    key = keys[key_idx]
-                    val = vals[val_idx]
-                    value = self.parse_value(val)
-                    props[key] = value
-
-                geometry = self.parse_geometry(
-                    geom=feature.geometry,
-                    ftype=feature.type,
-                    extent=layer.extent,
-                    y_coord_down=layer_options["y_coord_down"],
-                    transformer=layer_options["transformer"],
-                )
-                if layer_options["geojson"]:
-                    new_feature = {"geometry": geometry, "properties": props, "id": feature.id, "type": "Feature"}
+            for feature_index, feature in enumerate(layer.features):
+                if check_mode:
+                    try:
+                        new_feature = self._decode_feature(feature, layer, layer_options)
+                    except MVTDecodeError as exc:
+                        errors.append(
+                            {
+                                "layer": layer_name,
+                                "index": feature_index,
+                                "reason": exc.reason,
+                                "id_present": feature.HasField("id"),
+                                "id": feature.id if feature.HasField("id") else None,
+                                "message": str(exc),
+                            }
+                        )
+                        continue
                 else:
-                    new_feature = {"geometry": geometry, "properties": props, "id": feature.id, "type": feature.type}
+                    new_feature = self._decode_feature(feature, layer, layer_options)
                 features.append(new_feature)
 
             tile_data = {"extent": layer.extent, "version": layer.version, "features": features}
             if layer_options["geojson"]:
                 tile_data["type"] = "FeatureCollection"
 
-            tile[layer_name] = tile_data
-        return tile
+            decoded_layers[layer_name] = tile_data
+
+        if check_mode:
+            return {"layers": decoded_layers, "errors": errors}
+        return decoded_layers
+
+    def _decode_feature(self, feature, layer, layer_options):
+        props = self.parse_properties(tags=feature.tags, keys=layer.keys, vals=layer.values)
+        geometry = self.parse_geometry(
+            geom=feature.geometry,
+            ftype=feature.type,
+            extent=layer.extent,
+            y_coord_down=layer_options["y_coord_down"],
+            transformer=layer_options["transformer"],
+        )
+        if layer_options["geojson"]:
+            return {"geometry": geometry, "properties": props, "id": feature.id, "type": "Feature"}
+        return {"geometry": geometry, "properties": props, "id": feature.id, "type": feature.type}
+
+    def parse_properties(self, tags, keys, vals):
+        props = {}
+        if len(tags) % 2 != 0:
+            raise UnexpectedTagCountError(f"Unexpected number of tags: {len(tags)} (expected an even number)")
+        for key_idx, val_idx in zip(tags[::2], tags[1::2]):
+            if not 0 <= key_idx < len(keys):
+                raise TagIndexOutOfRangeError(
+                    f"Tag key index {key_idx} is out of range, the layer defines {len(keys)} key(s)"
+                )
+            if not 0 <= val_idx < len(vals):
+                raise TagIndexOutOfRangeError(
+                    f"Tag value index {val_idx} is out of range, the layer defines {len(vals)} value(s)"
+                )
+            value = self.parse_value(vals[val_idx])
+            props[keys[key_idx]] = value
+        return props
 
     @staticmethod
     def zero_pad(val):
@@ -77,7 +141,7 @@ class TileData:
         ):
             if val.HasField(candidate):
                 return getattr(val, candidate)
-        raise ValueError(f"{val} is an unknown value")
+        raise InvalidPropertyValueError(f"{val} is an unknown value")
 
     @staticmethod
     def _area_sign(ring):
@@ -122,6 +186,12 @@ class TileData:
                         self._ensure_polygon_closed(coords)
                     parts.append(coords)
                     coords = []
+
+                if i + 2 * cmd_len > len(geom):
+                    raise GeometryCommandTruncatedError(
+                        f"Geometry command {cmd} expects {cmd_len} coordinate pair(s) but the command stream ends "
+                        f"after {max(0, (len(geom) - i) // 2)} complete pair(s)"
+                    )
 
                 for _ in range(cmd_len):
                     x = geom[i]
@@ -194,4 +264,4 @@ class TileData:
                 return {"type": "MultiPolygon", "coordinates": polygons}
 
         else:
-            raise ValueError(f"Unknown geometry type: {ftype}")
+            raise UnknownGeometryTypeError(f"Unknown geometry type: {ftype}")

@@ -2,6 +2,11 @@
 
 _In development_
 
+- Add a `check_mode` option to `decode` which keeps the valid features of partially corrupted tiles and reports each
+  malformed feature with its layer name, original feature index, failure reason and id presence, instead of failing
+  the whole decoding. Standard decoding keeps raising on malformed data, including for tiles whose outer protobuf
+  bytes cannot be parsed.
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

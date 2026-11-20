@@ -362,6 +362,31 @@ Here's how you might decode a tile from a file.
 The `decode` function has a `geojson` option which enforces a GeoJson RFC7946 compatible result. Its default value
 is `True`. To enforce the behaviour of versions <2.0.0, please use `geojson=False`.
 
+### Check mode for partially corrupted tiles
+
+When a tile contains individual malformed features, the standard decoding call fails on the first error. Pass
+`check_mode=True` to decode the still-valid features instead. The result then contains two keys:
+
+- `layers`: the decoded layers, keeping only the valid features in their original order within each layer.
+- `errors`: one entry per malformed feature, reporting its `layer` name, its original `index` inside that layer, the
+  failure `reason` (for example `geometry_command_truncated` or `properties_invalid`), whether an `id` was actually
+  written (`id_present`, distinguishing a missing id from an explicit id `0`), and an explanatory `message`.
+
+Features whose geometry command stream ends before all its coordinate pairs are read are skipped entirely, so no
+half-read coordinates can reach the result. Errors raised by a user-provided `transformer` are not data errors and
+keep propagating even in check mode. Tiles whose outer protobuf bytes cannot be parsed keep raising a decode error;
+no stream resynchronization is attempted.
+
+```python
+  >>> result = mapbox_vector_tile.decode(data, check_mode=True)
+  >>> result["errors"]
+  [
+      {"layer": "roads", "index": 1, "reason": "geometry_command_truncated", "id_present": False, "id": None, ...},
+      {"layer": "roads", "index": 2, "reason": "properties_invalid", "id_present": True, "id": 0, ...},
+  ]
+  >>> result["layers"]["roads"]["features"]  # valid features only, in original order
+```
+
 ## Use native protobuf library for performance
 
 The c++ implementation of the underlying protobuf library is more performant than the pure python one. Depending on your operating system, you might need to [compile the C++ library](https://github.com/google/protobuf/tree/master/python#c-implementation) or install it.

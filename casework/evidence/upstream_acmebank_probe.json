@@ -1,0 +1,19 @@
+{
+  "pages" : [
+    {
+      "text" : "ACME Bank\n(obviously I made this up, but it's a PDF file nonetheless)\n…\n…\n…\n…\n…\nDate: September 30, 2015\nStatement: September Transactions\nBalance: $1,438.20",
+      "images" : [
+
+      ],
+      "media_box" : [
+        0,
+        0,
+        612,
+        792
+      ],
+      "page" : 1
+    }
+  ],
+  "page_count" : 1,
+  "file" : "\/Users\/guo\/Documents\/GSB\/1109\/batches\/repair72-20261120\/control\/questions\/GSB1109-20261119-BAO-DE-020\/workspace\/examples\/tests\/acme\/acmebank1.pdf"
+}

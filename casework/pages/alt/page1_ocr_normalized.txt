@@ -1,0 +1,8 @@
+ACME Bank
+Statement page 1 (scanned sheet, OCR text reshaped to the legal row template)
+
+Date       Description     Amount
+03/01/2026 TRANSFER OUT 7110 1,250.00
+
+This is the same transaction (ref 7110) after OCR plus row
+normalization: same plugin, different text input, now extractable.

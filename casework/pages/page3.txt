@@ -1,0 +1,7 @@
+ACME Bank
+Statement page 3 (digital text, shifted column layout)
+Date Amount Description
+2026-03-04 1,250.00 ATM FEE 7112
+The amount token is extractable but the row order is
+ISO-date then amount then description: rejected by the
+plugin, which requires MM/DD/YYYY, description, amount-last.

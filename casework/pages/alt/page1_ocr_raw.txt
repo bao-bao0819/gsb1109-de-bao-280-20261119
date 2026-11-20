@@ -1,0 +1,7 @@
+ACME Bank
+Statement page 1 (scanned sheet, no text layer)
+
+Posting Ref   Description              Amount
+7110          TRANSFER OUT             1,250.00
+
+The amount above exists only in the raster image.

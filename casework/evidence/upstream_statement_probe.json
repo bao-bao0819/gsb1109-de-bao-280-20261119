@@ -1,0 +1,19 @@
+{
+  "file" : "\/Users\/guo\/Documents\/GSB\/1109\/batches\/repair72-20261120\/control\/questions\/GSB1109-20261119-BAO-DE-020\/workspace\/examples\/Downloads\/Statement.pdf",
+  "page_count" : 1,
+  "pages" : [
+    {
+      "images" : [
+
+      ],
+      "media_box" : [
+        0,
+        0,
+        612,
+        792
+      ],
+      "text" : "ACME Bank\n(this is another made-up statement)\n…\n…\n…\n…\n…\nDate: March 31,2016\nStatement: March Transactions\nBalance: $2,109.93",
+      "page" : 1
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+ACME Bank
+Statement page 4 (digital text, legal column layout)
+Date Description Amount
+03/05/2026 COFFEE SHOP 7113 48.20
+03/06/2026 OFFICE SUPPLIES 7114 -130.75

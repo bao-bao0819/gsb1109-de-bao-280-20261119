@@ -1,0 +1,8 @@
+ACME Bank Statement Page Two Header Only
+Statement page 2 (scan with OCR-style header text layer)
+
+Posting Ref   Description              Amount
+7111          TRANSFER IN              1,250.00
+
+The amount above exists only in the raster image;
+the native text layer carries the header line only.

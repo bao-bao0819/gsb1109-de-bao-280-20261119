@@ -1,0 +1,34 @@
+{
+  "file": "/Users/guo/Documents/GSB/1109/batches/repair72-20261120/control/questions/GSB1109-20261119-BAO-DE-020/workspace/casework/pdf/mixed_statement.pdf",
+  "classification": "mixed",
+  "has_scanned_pages": true,
+  "ocr_candidate_pages": [
+    1
+  ],
+  "pages": [
+    {
+      "page": 1,
+      "classification": "scan_without_text",
+      "image_coverage": 1.0,
+      "text_chars": 0
+    },
+    {
+      "page": 2,
+      "classification": "scan_with_text",
+      "image_coverage": 1.0,
+      "text_chars": 34
+    },
+    {
+      "page": 3,
+      "classification": "digital",
+      "image_coverage": 0.0,
+      "text_chars": 233
+    },
+    {
+      "page": 4,
+      "classification": "digital",
+      "image_coverage": 0.0,
+      "text_chars": 128
+    }
+  ]
+}

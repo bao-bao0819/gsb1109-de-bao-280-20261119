@@ -1,0 +1,78 @@
+{
+  "file" : "\/Users\/guo\/Documents\/GSB\/1109\/batches\/repair72-20261120\/control\/questions\/GSB1109-20261119-BAO-DE-020\/workspace\/casework\/pdf\/mixed_statement.pdf",
+  "page_count" : 4,
+  "pages" : [
+    {
+      "page" : 1,
+      "media_box" : [
+        0,
+        0,
+        612,
+        792
+      ],
+      "text" : "",
+      "images" : [
+        {
+          "width_px" : 612,
+          "bbox" : [
+            0,
+            0,
+            612,
+            792
+          ],
+          "name" : "Im0",
+          "height_px" : 792
+        }
+      ]
+    },
+    {
+      "media_box" : [
+        0,
+        0,
+        612,
+        792
+      ],
+      "text" : "ACME Bank Statement Page Two Header Only",
+      "page" : 2,
+      "images" : [
+        {
+          "name" : "Im0",
+          "height_px" : 792,
+          "width_px" : 612,
+          "bbox" : [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ]
+    },
+    {
+      "page" : 3,
+      "images" : [
+
+      ],
+      "media_box" : [
+        0,
+        0,
+        612,
+        792
+      ],
+      "text" : "ACME Bank\nStatement page 3 (digital text, shifted column layout)\nDate Amount Description\n2026-03-04 1,250.00 ATM FEE 7112\nThe amount token is extractable but the row order is\nISO-date then amount then description: rejected by the\nplugin, which requires MM\/DD\/YYYY, description, amount-last."
+    },
+    {
+      "page" : 4,
+      "text" : "ACME Bank\nStatement page 4 (digital text, legal column layout)\nDate Description Amount\n03\/05\/2026 COFFEE SHOP 7113 48.20\n03\/06\/2026 OFFICE SUPPLIES 7114 -130.75",
+      "media_box" : [
+        0,
+        0,
+        612,
+        792
+      ],
+      "images" : [
+
+      ]
+    }
+  ]
+}

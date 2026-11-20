@@ -1,0 +1,25 @@
+;; -*- mode: beancount -*-
+
+**** page 1 (no_usable_amount_text)
+
+; no entries: no_usable_amount_text
+
+**** page 2 (no_usable_amount_text)
+
+; no entries: no_usable_amount_text
+
+**** page 3 (layout_mismatch)
+
+; no entries: layout_mismatch
+; rejected line 4: date is ISO YYYY-MM-DD; rule requires MM/DD/YYYY first; amount is not the last whitespace-delimited column
+
+**** page 4 (extracted)
+
+2026-03-05 * "COFFEE SHOP 7113"
+  page: "4"
+  Assets:US:ACMEBank  48.20 USD
+
+2026-03-06 * "OFFICE SUPPLIES 7114"
+  page: "4"
+  Assets:US:ACMEBank  -130.75 USD
+

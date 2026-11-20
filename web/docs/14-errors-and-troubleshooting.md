@@ -112,6 +112,47 @@ Inspect `exc.msg` and the [chained exception](https://docs.python.org/3/tutorial
 
 Do not catch every `ValueError` around a full payload. Catch `InvalidFieldValue` and report the structured field context.
 
+### Input paths
+
+`InvalidFieldValue`, `MissingField`, `MissingDiscriminatorError`, and
+`SuitableVariantNotFoundError` carry a `path` list that describes where the
+failure occurred in the input:
+
+- Dataclass fields contribute the input key that actually supplied the value,
+  so an alias is reported with the spelling that was read.
+- Lists, sets, deques, and other sequence collections contribute the element
+  index.
+- Mappings contribute the original key object, which may contain dots or
+  brackets without becoming ambiguous.
+- A selected discriminated variant does not add a segment of its own; the
+  enclosing field, index, and key already identify the record.
+
+```python
+{
+    "devices": {
+        "plant.1[west].dev-7": {
+            "readings": [
+                {"kind": "temperature", "sampleRate": 1},
+                {"kind": "humidity", "sample_rate": 2},
+                {"kind": "temperature", "sampleRate": "many"},
+            ]
+        }
+    }
+}
+```
+
+Decoding this with a model whose third reading fails produces
+`exc.path == ["devices", "plant.1[west].dev-7", "readings", 2, "sampleRate"]`.
+The leaf `field_name` still reports the Python attribute name
+(`sample_rate`), so existing handlers that inspect `field_name`,
+`field_type`, `field_value`, `holder_class`, or the exception string keep
+working.
+
+`path` is rebuilt for every failure; a later successful or failing decode never
+inherits a previous path. When a nested field is itself a dataclass, failures
+surface wrapped as `InvalidFieldValue` at each enclosing field, and every
+wrapper in the `__context__` chain has the same leading path segments.
+
 ## Unsupported fields and engines
 
 An arbitrary class is not serialized from `__dict__` automatically. This example uses the standard library's [`queue.Queue`](https://docs.python.org/3/library/queue.html#queue.Queue):

@@ -91,6 +91,8 @@ from mashumaro.exceptions import (
     UnserializableDataError,
     UnserializableField,
     UnsupportedDeserializationEngine,
+    unpack_mapping_with_path,
+    unpack_sequence_with_path,
 )
 from mashumaro.helper import pass_through
 from mashumaro.types import (
@@ -1331,6 +1333,27 @@ def unpack_collection(spec: ValueSpec) -> Expression | None:
                 )
             )
 
+    def sequence_with_path(inner: Expression) -> str:
+        spec.builder.ensure_object_imported(unpack_sequence_with_path)
+        return (
+            f"unpack_sequence_with_path("
+            f"{spec.expression}, lambda value: {inner})"
+        )
+
+    def mapping_with_path(
+        key_inner: Expression,
+        value_inner: Expression,
+        source: str | None = None,
+    ) -> str:
+        spec.builder.ensure_object_imported(unpack_mapping_with_path)
+        if source is None:
+            source = spec.expression
+        return (
+            f"unpack_mapping_with_path("
+            f"{source}, lambda key: {key_inner}, "
+            f"lambda value: {value_inner})"
+        )
+
     if spec.origin_type is bytes:
         spec.builder.ensure_object_imported(decodebytes)
         return f"decodebytes({spec.expression}.encode())"
@@ -1343,71 +1366,67 @@ def unpack_collection(spec: ValueSpec) -> Expression | None:
     elif issubclass(spec.origin_type, str):
         return TypeMatchEligibleExpression(f"str({spec.expression})")
     elif ensure_generic_collection_subclass(spec, list):
-        return f"[{inner_expr()} for value in {spec.expression}]"
+        return sequence_with_path(inner_expr())
     elif ensure_generic_collection_subclass(spec, collections.deque):
         spec.builder.ensure_module_imported(collections)
-        return (
-            f"collections.deque([{inner_expr()} "
-            f"for value in {spec.expression}])"
-        )
+        return f"collections.deque({sequence_with_path(inner_expr())})"
     elif issubclass(spec.origin_type, tuple):  # type: ignore
         if is_named_tuple(spec.origin_type):
             return unpack_named_tuple(spec)
         elif ensure_generic_collection(spec):
             return unpack_tuple(spec, args)
     elif ensure_generic_collection_subclass(spec, frozenset):
-        return f"frozenset([{inner_expr()} for value in {spec.expression}])"
+        return f"frozenset({sequence_with_path(inner_expr())})"
     elif ensure_generic_collection_subclass(spec, Set):
-        return f"set([{inner_expr()} for value in {spec.expression}])"
+        return f"set({sequence_with_path(inner_expr())})"
     elif ensure_generic_mapping(spec, args, collections.ChainMap):
         spec.builder.ensure_module_imported(collections)
+        key_inner = inner_expr(0, "key")
+        value_inner = inner_expr(1)
         return (
-            f'collections.ChainMap(*[{{{inner_expr(0, "key")}:{inner_expr(1)} '
-            f"for key, value in m.items()}} for m in {spec.expression}])"
+            "collections.ChainMap(*["
+            f"{mapping_with_path(key_inner, value_inner, 'm')} "
+            f"for m in {spec.expression}])"
         )
     elif ensure_generic_mapping(spec, args, collections.OrderedDict):
         spec.builder.ensure_module_imported(collections)
         return (
-            f'collections.OrderedDict({{{inner_expr(0, "key")}: '
-            f"{inner_expr(1)} for key, value in {spec.expression}.items()}})"
+            "collections.OrderedDict("
+            f"{mapping_with_path(inner_expr(0, 'key'), inner_expr(1))})"
         )
     elif ensure_generic_mapping(spec, args, collections.defaultdict):
         spec.builder.ensure_module_imported(collections)
         default_type = type_name(args[1] if args else None)
         return (
             f"collections.defaultdict({default_type}, "
-            f"{{{inner_expr(0, 'key')}: "
-            f"{inner_expr(1)} for key, value in {spec.expression}.items()}})"
+            f"{mapping_with_path(inner_expr(0, 'key'), inner_expr(1))})"
         )
     elif ensure_generic_mapping(spec, args, collections.Counter):
         spec.builder.ensure_module_imported(collections)
+        key_inner = inner_expr(0, "key")
+        value_inner = inner_expr(1, v_type=int)
         return (
-            f'collections.Counter({{{inner_expr(0, "key")}: '
-            f"{inner_expr(1, v_type=int)} "
-            f"for key, value in {spec.expression}.items()}})"
+            f"collections.Counter({mapping_with_path(key_inner, value_inner)})"
         )
     elif is_typed_dict(spec.origin_type):
         return unpack_typed_dict(spec)
     elif issubclass(spec.origin_type, types.MappingProxyType):
         spec.builder.ensure_module_imported(types)
         return (
-            f'types.MappingProxyType({{{inner_expr(0, "key")}: {inner_expr(1)}'
-            f" for key, value in {spec.expression}.items()}})"
+            "types.MappingProxyType("
+            f"{mapping_with_path(inner_expr(0, 'key'), inner_expr(1))})"
         )
     elif _FROZENDICT_TYPE is not None and ensure_generic_mapping(
         spec, args, _FROZENDICT_TYPE
     ):
         return (
-            f'frozendict({{{inner_expr(0, "key")}: {inner_expr(1)} '
-            f"for key, value in {spec.expression}.items()}})"
+            "frozendict("
+            f"{mapping_with_path(inner_expr(0, 'key'), inner_expr(1))})"
         )
     elif ensure_generic_mapping(spec, args, Mapping):
-        return (
-            f'{{{inner_expr(0, "key")}: {inner_expr(1)} '
-            f"for key, value in {spec.expression}.items()}}"
-        )
+        return mapping_with_path(inner_expr(0, "key"), inner_expr(1))
     elif ensure_generic_collection_subclass(spec, Sequence):
-        return f"[{inner_expr()} for value in {spec.expression}]"
+        return sequence_with_path(inner_expr())
 
 
 @register

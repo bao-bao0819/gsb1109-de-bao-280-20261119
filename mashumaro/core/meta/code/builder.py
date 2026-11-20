@@ -1335,13 +1335,16 @@ class FieldUnpackerCodeBlockBuilder:
         field_type_name: str,
         unpacked_value: str,
         in_kwargs: bool,
+        input_key_name: str,
     ) -> None:
         with self.lines.indent("try:"):
             self._set_value(field_name, unpacked_value, in_kwargs)
-        with self.lines.indent("except:"):
+        with self.lines.indent("except Exception as __exc:"):
             self.lines.append(
                 "raise InvalidFieldValue("
-                f"'{field_name}',{field_type_name},value,cls)"
+                f"'{field_name}',{field_type_name},value,cls,"
+                f"path=[{input_key_name}, "
+                "*getattr(__exc, 'path', ())])"
             )
 
     def _set_value(
@@ -1402,6 +1405,13 @@ class FieldUnpackerCodeBlockBuilder:
             packed_value = f"__{fname}"
             unpacked_value = packed_value
         fetched_via_subscript = False
+        # Remember which accepted spelling actually supplied the value so a
+        # failure can be reported against the caller's input, not the model's
+        # internal attribute name.
+        if len(keys) == 1:
+            input_key_name = repr(keys[0])
+        else:
+            input_key_name = "__input_key"
         if not has_default and len(keys) == 1:
             # Required field with a single key: fetch via subscript. On the
             # happy path this is noticeably faster than d.get(key, MISSING)
@@ -1415,32 +1425,47 @@ class FieldUnpackerCodeBlockBuilder:
                 self.add_line(f"{packed_value} = d['{keys[0]}']")
             with self.indent("except KeyError:"):
                 self.add_line(
-                    f"raise MissingField('{fname}',{field_type},cls) from None"
+                    f"raise MissingField('{fname}',{field_type},cls,"
+                    f"path=[{input_key_name}]) from None"
                 )
             fetched_via_subscript = True
+        elif len(keys) == 1:
+            self.add_line(f"{packed_value} = d.get('{keys[0]}', MISSING)")
         else:
+            self.add_line(f"__input_key = {keys[0]!r}")
             self.add_line(f"{packed_value} = d.get('{keys[0]}', MISSING)")
             for key in keys[1:]:
                 with self.indent(f"if {packed_value} is MISSING:"):
                     self.add_line(f"{packed_value} = d.get('{key}', MISSING)")
+                    with self.indent(f"if {packed_value} is not MISSING:"):
+                        self.add_line(f"__input_key = {key!r}")
         if not has_default:
             if not fetched_via_subscript:
                 with self.indent(f"if {packed_value} is MISSING:"):
                     self.add_line(
-                        f"raise MissingField('{fname}',{field_type},cls)"
+                        f"raise MissingField('{fname}',{field_type},cls,"
+                        f"path=[{input_key_name}])"
                         " from None"
                     )
             if packed_value != unpacked_value:
                 if could_be_none:
                     with self.indent(f"if {packed_value} is not None:"):
                         self._try_set_value(
-                            fname, field_type, unpacked_value, has_default
+                            fname,
+                            field_type,
+                            unpacked_value,
+                            has_default,
+                            input_key_name,
                         )
                     with self.indent("else:"):
                         self._set_value(fname, "None", has_default)
                 else:
                     self._try_set_value(
-                        fname, field_type, unpacked_value, has_default
+                        fname,
+                        field_type,
+                        unpacked_value,
+                        has_default,
+                        input_key_name,
                     )
         else:
             with self.indent(f"if {packed_value} is not MISSING:"):
@@ -1448,7 +1473,11 @@ class FieldUnpackerCodeBlockBuilder:
                     if unpacked_value != "value":
                         with self.indent(f"if {packed_value} is not None:"):
                             self._try_set_value(
-                                fname, field_type, unpacked_value, has_default
+                                fname,
+                                field_type,
+                                unpacked_value,
+                                has_default,
+                                input_key_name,
                             )
                         if default is not None:
                             with self.indent("else:"):
@@ -1458,7 +1487,11 @@ class FieldUnpackerCodeBlockBuilder:
                 else:
                     if unpacked_value != "value":
                         self._try_set_value(
-                            fname, field_type, unpacked_value, has_default
+                            fname,
+                            field_type,
+                            unpacked_value,
+                            has_default,
+                            input_key_name,
                         )
                     else:
                         self._set_value(fname, unpacked_value, has_default)

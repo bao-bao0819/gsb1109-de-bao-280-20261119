@@ -1,0 +1,1173 @@
+{
+  "after_part_failure": {
+    "scenario": "failure-after-part-registration",
+    "failure": "RuntimeError: deterministic conversion failure on secret",
+    "states": {
+      "after_health": {
+        "label": "after-health",
+        "component_schema_names": [
+          "Health"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          }
+        ],
+        "paths": [
+          "/health"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "after_failure": {
+        "label": "after-failure",
+        "component_schema_names": [
+          "Health",
+          "Product1",
+          "Part"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          },
+          "Product1": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Part": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          },
+          {
+            "schema": "PartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Part",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product1",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          }
+        ],
+        "paths": [
+          "/health"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health",
+          "#/components/schemas/Product1"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "same_instance_retry": {
+        "label": "same-instance-retry",
+        "component_schema_names": [
+          "Health",
+          "Product1",
+          "Part",
+          "Product"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          },
+          "Product1": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Part": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Product": {
+            "properties": [
+              "id",
+              "name",
+              "part",
+              "secret"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          },
+          {
+            "schema": "PartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Part",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product1",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name",
+              "part",
+              "secret"
+            ]
+          }
+        ],
+        "paths": [
+          "/health",
+          "/products"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health",
+          "#/components/schemas/Part",
+          "#/components/schemas/Product",
+          "#/components/schemas/Product1"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "fresh_instance_retry": {
+        "label": "fresh-instance-retry",
+        "component_schema_names": [
+          "Health",
+          "Product1",
+          "Part",
+          "Product"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          },
+          "Product1": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Part": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Product": {
+            "properties": [
+              "id",
+              "name",
+              "part",
+              "secret"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name",
+              "part",
+              "secret"
+            ]
+          },
+          {
+            "schema": "PartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Part",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product1",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          }
+        ],
+        "paths": [
+          "/health",
+          "/products"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health",
+          "#/components/schemas/Part",
+          "#/components/schemas/Product",
+          "#/components/schemas/Product1"
+        ],
+        "unresolved_refs_in_document": []
+      }
+    },
+    "direct_product_conversion": {
+      "same_instance": [
+        "id",
+        "name",
+        "part",
+        "secret"
+      ],
+      "fresh_instance": [
+        "id",
+        "name",
+        "part",
+        "secret"
+      ]
+    }
+  },
+  "before_part_failure": {
+    "scenario": "failure-before-part-registration",
+    "failure": "RuntimeError: deterministic conversion failure on secret",
+    "states": {
+      "after_health": {
+        "label": "after-health",
+        "component_schema_names": [
+          "Health"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          }
+        ],
+        "paths": [
+          "/health"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "after_failure": {
+        "label": "after-failure",
+        "component_schema_names": [
+          "Health"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          }
+        ],
+        "paths": [
+          "/health"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "same_instance_retry": {
+        "label": "same-instance-retry",
+        "component_schema_names": [
+          "Health",
+          "ProductLeafFirst1",
+          "PartLeafFirst",
+          "ProductLeafFirst"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          },
+          "ProductLeafFirst1": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "PartLeafFirst": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "ProductLeafFirst": {
+            "properties": [
+              "id",
+              "name",
+              "secret",
+              "part"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          },
+          {
+            "schema": "ProductLeafFirstSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "ProductLeafFirst",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name",
+              "secret",
+              "part"
+            ]
+          },
+          {
+            "schema": "PartLeafFirstSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "PartLeafFirst",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductLeafFirstSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "ProductLeafFirst1",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          }
+        ],
+        "paths": [
+          "/health",
+          "/products"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health",
+          "#/components/schemas/PartLeafFirst",
+          "#/components/schemas/ProductLeafFirst",
+          "#/components/schemas/ProductLeafFirst1"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "fresh_instance_retry": {
+        "label": "fresh-instance-retry",
+        "component_schema_names": [
+          "Health",
+          "ProductLeafFirst1",
+          "PartLeafFirst",
+          "ProductLeafFirst"
+        ],
+        "component_schemas": {
+          "Health": {
+            "properties": [
+              "status"
+            ],
+            "required": []
+          },
+          "ProductLeafFirst1": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "PartLeafFirst": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "ProductLeafFirst": {
+            "properties": [
+              "id",
+              "name",
+              "secret",
+              "part"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "HealthSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Health",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "status"
+            ]
+          },
+          {
+            "schema": "ProductLeafFirstSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "ProductLeafFirst",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name",
+              "secret",
+              "part"
+            ]
+          },
+          {
+            "schema": "PartLeafFirstSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "PartLeafFirst",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductLeafFirstSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "ProductLeafFirst1",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          }
+        ],
+        "paths": [
+          "/health",
+          "/products"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Health",
+          "#/components/schemas/PartLeafFirst",
+          "#/components/schemas/ProductLeafFirst",
+          "#/components/schemas/ProductLeafFirst1"
+        ],
+        "unresolved_refs_in_document": []
+      }
+    }
+  },
+  "projection_only_control": {
+    "scenario": "no-error-projection-control",
+    "states": {
+      "product_entry": {
+        "label": "product_entry",
+        "component_schema_names": [
+          "Product1",
+          "Part",
+          "Product"
+        ],
+        "component_schemas": {
+          "Product1": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Part": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Product": {
+            "properties": [
+              "id",
+              "name",
+              "part",
+              "secret"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name",
+              "part",
+              "secret"
+            ]
+          },
+          {
+            "schema": "PartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Part",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product1",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          }
+        ],
+        "paths": [
+          "/entry"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Part",
+          "#/components/schemas/Product",
+          "#/components/schemas/Product1"
+        ],
+        "unresolved_refs_in_document": [],
+        "direct_product_conversion": [
+          "id",
+          "name",
+          "part",
+          "secret"
+        ]
+      },
+      "part_entry": {
+        "label": "part_entry",
+        "component_schema_names": [
+          "Product",
+          "Part"
+        ],
+        "component_schemas": {
+          "Product": {
+            "properties": [
+              "id",
+              "name"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "Part": {
+            "properties": [
+              "id",
+              "label",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "PartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Part",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "label",
+              "product"
+            ]
+          },
+          {
+            "schema": "ProductSchema",
+            "modifiers": {
+              "only": [
+                "id",
+                "name"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "Product",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "name"
+            ]
+          }
+        ],
+        "paths": [
+          "/entry"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/Part",
+          "#/components/schemas/Product"
+        ],
+        "unresolved_refs_in_document": [],
+        "direct_product_conversion": [
+          "id",
+          "name",
+          "part",
+          "secret"
+        ]
+      }
+    }
+  },
+  "declared_projection_control": {
+    "scenario": "declared-projection-control",
+    "states": {
+      "first_run": {
+        "label": "first_run",
+        "component_schema_names": [
+          "DeclaredProduct",
+          "DeclaredPart"
+        ],
+        "component_schemas": {
+          "DeclaredProduct": {
+            "properties": [
+              "id"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "DeclaredPart": {
+            "properties": [
+              "id",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "DeclaredPartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "DeclaredPart",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "product"
+            ]
+          },
+          {
+            "schema": "DeclaredProductSchema",
+            "modifiers": {
+              "only": [
+                "id"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "DeclaredProduct",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id"
+            ]
+          }
+        ],
+        "paths": [
+          "/parts"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/DeclaredPart",
+          "#/components/schemas/DeclaredProduct"
+        ],
+        "unresolved_refs_in_document": [],
+        "direct_product_conversion": [
+          "id",
+          "name",
+          "part"
+        ]
+      },
+      "same_instance_rerun": {
+        "label": "same-instance-rerun",
+        "component_schema_names": [
+          "DeclaredProduct",
+          "DeclaredPart"
+        ],
+        "component_schemas": {
+          "DeclaredProduct": {
+            "properties": [
+              "id"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "DeclaredPart": {
+            "properties": [
+              "id",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "DeclaredPartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "DeclaredPart",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "product"
+            ]
+          },
+          {
+            "schema": "DeclaredProductSchema",
+            "modifiers": {
+              "only": [
+                "id"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "DeclaredProduct",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id"
+            ]
+          }
+        ],
+        "paths": [
+          "/parts",
+          "/parts-again"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/DeclaredPart",
+          "#/components/schemas/DeclaredProduct"
+        ],
+        "unresolved_refs_in_document": []
+      },
+      "second_run": {
+        "label": "second_run",
+        "component_schema_names": [
+          "DeclaredProduct",
+          "DeclaredPart"
+        ],
+        "component_schemas": {
+          "DeclaredProduct": {
+            "properties": [
+              "id"
+            ],
+            "required": [
+              "id"
+            ]
+          },
+          "DeclaredPart": {
+            "properties": [
+              "id",
+              "product"
+            ],
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "refs": [
+          {
+            "schema": "DeclaredPartSchema",
+            "modifiers": {
+              "only": [],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "DeclaredPart",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id",
+              "product"
+            ]
+          },
+          {
+            "schema": "DeclaredProductSchema",
+            "modifiers": {
+              "only": [
+                "id"
+              ],
+              "exclude": [],
+              "load_only": [],
+              "dump_only": [],
+              "partial": null
+            },
+            "name": "DeclaredProduct",
+            "name_registered_in_components": true,
+            "registered_properties": [
+              "id"
+            ]
+          }
+        ],
+        "paths": [
+          "/parts"
+        ],
+        "all_refs_in_document": [
+          "#/components/schemas/DeclaredPart",
+          "#/components/schemas/DeclaredProduct"
+        ],
+        "unresolved_refs_in_document": [],
+        "direct_product_conversion": [
+          "id",
+          "name",
+          "part"
+        ]
+      }
+    }
+  }
+}

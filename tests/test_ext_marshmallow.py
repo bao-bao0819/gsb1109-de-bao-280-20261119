@@ -229,6 +229,155 @@ class TestDefinitionHelper:
         assert pets_1["type"] == pets_2["type"] == "array"
 
 
+def operation_with_schema(schema):
+    return {
+        "get": {
+            "responses": {
+                "200": {
+                    "description": "ok",
+                    "content": {"application/json": {"schema": schema}},
+                }
+            }
+        }
+    }
+
+
+def iter_refs(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("$ref"), str):
+            yield value["$ref"]
+        for child in value.values():
+            yield from iter_refs(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_refs(child)
+
+
+def unresolved_refs(document):
+    unresolved = []
+    for ref in iter_refs(document):
+        current = document
+        try:
+            for part in ref.removeprefix("#/").split("/"):
+                current = current[part.replace("~1", "/").replace("~0", "~")]
+        except (KeyError, TypeError):
+            unresolved.append(ref)
+    return unresolved
+
+
+class TestRegistrationFailureRecovery:
+    """A failed schema registration must not leave a usable stale ref."""
+
+    @staticmethod
+    def make_spec_with_failing_leaf(failing_field, state):
+        plugin = MarshmallowPlugin()
+        spec = APISpec(
+            title="recovery",
+            version="1.0.0",
+            openapi_version="3.0.2",
+            plugins=[plugin],
+        )
+
+        def fail_at_leaf(self, field, ret, **kwargs):
+            if state["fail"] and isinstance(field, failing_field):
+                raise RuntimeError("deterministic leaf conversion failure")
+            return {}
+
+        plugin.converter.add_attribute_function(fail_at_leaf)
+        return spec, plugin
+
+    @pytest.mark.parametrize("leaf_first", (False, True))
+    def test_retry_after_conversion_failure(self, leaf_first):
+        class FailingField(String):
+            pass
+
+        if leaf_first:
+            # The failure occurs before the nested schema is registered.
+            class PartSchema(Schema):
+                id = Int(required=True)
+                product = Nested(lambda: ProductSchema(), only=("id", "name"))
+
+            class ProductSchema(Schema):
+                id = Int(required=True)
+                secret = FailingField()
+                part = Nested(PartSchema)
+        else:
+            # The nested schema and its projection are registered before the
+            # conversion failure, leaving partial but valid components.
+            class PartSchema(Schema):
+                id = Int(required=True)
+                product = Nested(lambda: ProductSchema(), only=("id", "name"))
+
+            class ProductSchema(Schema):
+                id = Int(required=True)
+                part = Nested(PartSchema)
+                secret = FailingField()
+
+        class HealthSchema(Schema):
+            status = String()
+
+        state = {"fail": True}
+        spec, plugin = self.make_spec_with_failing_leaf(FailingField, state)
+
+        spec.path("/health", operations=operation_with_schema(HealthSchema))
+
+        with pytest.raises(RuntimeError, match="deterministic leaf"):
+            spec.path("/products", operations=operation_with_schema(ProductSchema))
+
+        # Anything named by the converter must actually be registered,
+        # otherwise a retry would emit a dangling reference.
+        assert all(
+            name in spec.components.schemas for name in plugin.converter.refs.values()
+        )
+        assert "Health" in spec.components.schemas
+        assert unresolved_refs(spec.to_dict()) == []
+
+        state["fail"] = False
+        spec.path("/products", operations=operation_with_schema(ProductSchema))
+
+        definitions = get_schemas(spec)
+        assert definitions["Health"]["properties"] == {"status": {"type": "string"}}
+        expected_product_props = (
+            ["id", "secret", "part"] if leaf_first else ["id", "part", "secret"]
+        )
+        assert list(definitions["Product"]["properties"]) == expected_product_props
+        assert "Part" in definitions
+        assert unresolved_refs(spec.to_dict()) == []
+        assert all(
+            name in spec.components.schemas for name in plugin.converter.refs.values()
+        )
+
+    def test_projection_declaration_is_not_a_stale_cache(self):
+        class ProjectedProductSchema(Schema):
+            id = Int(required=True)
+            name = String()
+            part = Nested(lambda: ProjectedPartSchema())
+
+        class ProjectedPartSchema(Schema):
+            id = Int(required=True)
+            product = Nested(ProjectedProductSchema, only=("id",))
+
+        def build_schemas():
+            plugin = MarshmallowPlugin()
+            spec = APISpec(
+                title="projection",
+                version="1.0.0",
+                openapi_version="3.0.2",
+                plugins=[plugin],
+            )
+            spec.path(
+                "/parts",
+                operations=operation_with_schema(ProjectedPartSchema),
+            )
+            return get_schemas(spec)["ProjectedProduct"]
+
+        first = build_schemas()
+        second = build_schemas()
+
+        assert list(first["properties"]) == ["id"]
+        assert first == second
+
+
 class TestComponentParameterHelper:
     @pytest.mark.parametrize("schema", [PetSchema, PetSchema()])
     def test_can_use_schema_in_parameter(self, spec, schema):

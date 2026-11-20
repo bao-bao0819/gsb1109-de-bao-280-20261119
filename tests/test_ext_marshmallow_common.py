@@ -56,6 +56,25 @@ class TestUniqueName:
             name_2 = get_unique_schema_name(spec.components, "Pet")
         assert name_2 == "Pet2"
 
+    def test_reserved_name_is_not_reused(self, spec):
+        with pytest.warns(
+            UserWarning, match="Multiple schemas resolved to the name Pet"
+        ):
+            name = get_unique_schema_name(
+                spec.components, "Pet", reserved_names={"Pet"}
+            )
+        assert name == "Pet1"
+
+    def test_reserved_name_is_skipped_when_choosing_suffix(self, spec):
+        spec.components.schema("Pet", properties={})
+        with pytest.warns(
+            UserWarning, match="Multiple schemas resolved to the name Pet"
+        ):
+            name = get_unique_schema_name(
+                spec.components, "Pet", reserved_names={"Pet1"}
+            )
+        assert name == "Pet2"
+
 
 class TestGetFields:
     @pytest.mark.parametrize("exclude_type", (tuple, list))

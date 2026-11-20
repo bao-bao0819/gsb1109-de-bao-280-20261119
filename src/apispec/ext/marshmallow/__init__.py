@@ -85,6 +85,8 @@ from .common import make_schema_key, resolve_schema_cls, resolve_schema_instance
 from .openapi import OpenAPIConverter
 from .schema_resolver import SchemaResolver
 
+_MISSING = object()
+
 
 def resolver(schema: type[Schema]) -> str:
     """Default schema name resolver function that strips 'Schema' from the end of the class name."""
@@ -183,9 +185,31 @@ class MarshmallowPlugin(BasePlugin):
         schema_key = make_schema_key(schema_instance)
         self.warn_if_schema_already_in_spec(schema_key)
         assert self.converter is not None, "init_spec has not yet been called"
+        previous_name = self.converter.refs.get(schema_key, _MISSING)
         self.converter.refs[schema_key] = name
-
-        json_schema = self.converter.schema2jsonschema(schema_instance)
+        self.converter._schema_names_in_progress.add(name)
+        try:
+            json_schema = self.converter.schema2jsonschema(schema_instance)
+        except Exception:
+            # Do not leave a name pointing at a component that was never
+            # registered. Otherwise a retry would skip conversion and emit a
+            # dangling reference. A nested registration may have replaced this
+            # entry with a name that did get registered; keep that one.
+            current_name = self.converter.refs.get(schema_key, _MISSING)
+            if (
+                current_name is not _MISSING
+                and current_name not in self.spec.components.schemas
+            ):
+                if (
+                    previous_name is not _MISSING
+                    and previous_name in self.spec.components.schemas
+                ):
+                    self.converter.refs[schema_key] = previous_name
+                else:
+                    del self.converter.refs[schema_key]
+            raise
+        finally:
+            self.converter._schema_names_in_progress.discard(name)
 
         return json_schema
 

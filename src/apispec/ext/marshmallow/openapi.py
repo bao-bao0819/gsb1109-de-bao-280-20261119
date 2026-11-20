@@ -68,6 +68,9 @@ class OpenAPIConverter(FieldConverterMixin):
         self.init_parameter_attribute_functions()
         # Schema references
         self.refs: dict = {}
+        # Names of schemas whose registration is in progress. This prevents a
+        # nested schema from taking a name that its parent is about to use.
+        self._schema_names_in_progress: set[str] = set()
 
     def init_parameter_attribute_functions(self) -> None:
         self.parameter_attribute_functions = [
@@ -131,7 +134,11 @@ class OpenAPIConverter(FieldConverterMixin):
                 if getattr(schema, "many", False):
                     return {"type": "array", "items": json_schema}
                 return json_schema
-            name = get_unique_schema_name(self.spec.components, name)
+            name = get_unique_schema_name(
+                self.spec.components,
+                name,
+                reserved_names=self._schema_names_in_progress,
+            )
             self.spec.components.schema(name, schema=schema)
         return self.get_ref_dict(schema_instance)
 

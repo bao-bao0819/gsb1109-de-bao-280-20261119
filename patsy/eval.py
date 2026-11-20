@@ -19,9 +19,12 @@ import tokenize
 import ast
 import numbers
 from patsy import PatsyError
-from patsy.util import PushbackAdapter, no_pickling, assert_no_pickling
+from patsy.util import PushbackAdapter, no_pickling, assert_no_pickling, have_pandas
 from patsy.tokens import pretty_untokenize, normalize_token_spacing, python_tokenize
 from patsy.compat import call_and_wrap_exc
+
+if have_pandas:
+    import pandas
 
 
 def _all_future_flags():
@@ -96,6 +99,103 @@ def test_VarLookupDict():
     assert isinstance(repr(ds), str)
 
     assert_no_pickling(ds)
+
+
+# When evaluating factor code, names are resolved first against the user's
+# data object and only then against the evaluation environment (see
+# EvalFactor._eval), so evaluating a single factor involves probing the data
+# object for many names that will ultimately be resolved elsewhere --
+# functions from the calling environment, patsy builtins like Q, internal
+# stateful-transform objects, and so on. User-provided data objects are
+# allowed to be simple key-lookup mappings that load or decode columns
+# lazily inside __getitem__ (e.g. when fitting a model in batches against
+# data that is too large to materialize eagerly). For such objects, even a
+# failed lookup of a non-column name can trigger a spurious (and potentially
+# expensive, or even failing) attempt to load a nonexistent column. This
+# adapter avoids that by checking __contains__ before delegating to
+# __getitem__, so the underlying object is only ever queried for keys it
+# actually contains. This does not change name resolution semantics in any
+# way: data still shadows the environment, and keys that the data object
+# does not contain still raise KeyError.
+class _LazyDataDict(object):
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        if key not in self._data:
+            raise KeyError(key)
+        return self._data[key]
+
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self._data)
+
+
+def _as_eval_data(data):
+    # Plain dicts and pandas DataFrames have cheap, side-effect-free
+    # lookups, so we pass them through untouched to guarantee that their
+    # behavior (including subclasses like defaultdict) is exactly as it has
+    # always been. Only user-provided key-lookup objects are adapted, and
+    # only when they support a cheap __contains__ existence check.
+    if isinstance(data, dict):
+        return data
+    if have_pandas and isinstance(data, pandas.DataFrame):
+        return data
+    if hasattr(data, "__contains__"):
+        return _LazyDataDict(data)
+    return data
+
+
+def test__LazyDataDict():
+    class Data(object):
+        def __init__(self):
+            self.getitem_probes = []
+
+        def __contains__(self, key):
+            return key == "real_column"
+
+        def __getitem__(self, key):
+            self.getitem_probes.append(key)
+            if key != "real_column":
+                raise AssertionError("probed a nonexistent column")
+            return 42
+
+    raw = Data()
+    data = _LazyDataDict(raw)
+    assert data["real_column"] == 42
+    import pytest
+
+    pytest.raises(KeyError, data.__getitem__, "not_a_column")
+    # The missing key was rejected via __contains__ without ever touching
+    # the underlying object's __getitem__:
+    assert raw.getitem_probes == ["real_column"]
+    assert isinstance(repr(data), str)
+
+
+def test__as_eval_data():
+    # dicts (including subclasses like defaultdict) are passed through
+    # untouched:
+    from collections import defaultdict
+
+    plain = {"a": 1}
+    assert _as_eval_data(plain) is plain
+    default = defaultdict(int)
+    assert _as_eval_data(default) is default
+    # Objects without __contains__ are passed through untouched:
+    odd = object()
+    assert _as_eval_data(odd) is odd
+
+    # Other key-lookup objects get the lazy adapter:
+    class KeyLookup(object):
+        def __contains__(self, key):
+            return False
+
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+    assert isinstance(_as_eval_data(KeyLookup()), _LazyDataDict)
+    if have_pandas:
+        df = pandas.DataFrame({"a": [1]})
+        assert _as_eval_data(df) is df
 
 
 def ast_names(code):
@@ -578,7 +678,9 @@ class EvalFactor(object):
         return len(pass_bins)
 
     def _eval(self, code, memorize_state, data):
-        inner_namespace = VarLookupDict([data, memorize_state["transforms"]])
+        inner_namespace = VarLookupDict(
+            [_as_eval_data(data), memorize_state["transforms"]]
+        )
         return call_and_wrap_exc(
             "Error evaluating factor",
             self,

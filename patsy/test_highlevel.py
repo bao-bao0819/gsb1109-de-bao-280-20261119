@@ -997,3 +997,154 @@ def test_NAActioon_pandas_string_index():
     dm2 = dmatrix(di, data2, 0, return_type="dataframe")
     assert np.allclose(dm2, [[1.0, 6.0, 4.0], [1.0, 7.0, 5.0]])
     assert list(dm2.columns) == ["Intercept", "x", "z"]
+
+
+class _LazyBatchData(object):
+    """A key-lookup data object that "decodes" columns on demand.
+
+    Stands in for a batch of training data whose columns are too expensive
+    to materialize eagerly: every column actually loaded is recorded in
+    .loaded, and attempting to materialize the column named "big_unused"
+    is an error (as it would be for, say, a column too large to decode).
+    """
+
+    def __init__(self, columns):
+        self._columns = dict(columns)
+        self.loaded = []
+
+    def __contains__(self, key):
+        return key in self._columns
+
+    def __getitem__(self, key):
+        if key == "big_unused":
+            raise RuntimeError("unused big column was materialized")
+        value = self._columns[key]
+        self.loaded.append(key)
+        return value
+
+
+def test_lazy_key_lookup_data_batches():
+    from collections import Counter
+
+    # Environment functions used by the formula: pick_col chooses which
+    # column Q() should fetch based on the current batch's code, and double
+    # is an ordinary environment function.
+    pick_col_calls = []
+
+    def pick_col(code):
+        pick_col_calls.append(code)
+        return "col_" + code
+
+    def double(v):
+        return 2 * np.asarray(v)
+
+    # center(center(x)) nests stateful transforms, so fitting requires
+    # multiple passes over the data.
+    formula = "y ~ center(center(x)) + Q(pick_col(code)) + double(x)"
+
+    def make_batch(i, code):
+        return {
+            "y": np.arange(4.0) + 10 * i,
+            "x": np.arange(4.0) + 10 * i + 1,
+            "code": code,
+            "col_a": np.arange(4.0) + 100 + i,
+            "col_b": np.arange(4.0) + 200 + i,
+            "big_unused": np.arange(4.0) + 1000,
+        }
+
+    # Reference fit using plain dicts:
+    dict_batches = [make_batch(i, "a") for i in range(3)]
+
+    def dict_iter_maker():
+        return iter(dict_batches)
+
+    ref_lhs, ref_rhs = incr_dbuilders(formula, dict_iter_maker, eval_env=0)
+
+    # The same fit using lazy key-lookup data objects:
+    lazy_batches = [_LazyBatchData(make_batch(i, "a")) for i in range(3)]
+
+    def lazy_iter_maker():
+        return iter(lazy_batches)
+
+    lhs_builder, rhs_builder = incr_dbuilders(formula, lazy_iter_maker, eval_env=0)
+    assert lhs_builder.column_names == ref_lhs.column_names
+    assert rhs_builder.column_names == ref_rhs.column_names
+
+    # The nested stateful transforms need two memorize passes over every
+    # batch, plus (for the first batch) a factor-examination pass. Each
+    # pass reads the current batch's own columns, and nothing else: the
+    # unused columns are never materialized, and the environment functions
+    # (pick_col, double, Q, center) are never probed as if they were
+    # nonexistent columns to decode.
+    assert Counter(lazy_batches[0].loaded) == Counter(
+        {"x": 4, "y": 1, "code": 1, "col_a": 1}
+    )
+    for batch in lazy_batches[1:]:
+        assert Counter(batch.loaded) == Counter({"x": 2})
+
+    # Re-building each training batch gives the same matrices as the
+    # plain-dict reference -- repeated scans never confuse one batch's data
+    # with another's.
+    for lazy_batch, dict_batch in zip(lazy_batches, dict_batches):
+        lazy_lhs_m, lazy_rhs_m = build_design_matrices(
+            [lhs_builder, rhs_builder], lazy_batch
+        )
+        ref_lhs_m, ref_rhs_m = build_design_matrices([ref_lhs, ref_rhs], dict_batch)
+        assert np.allclose(lazy_lhs_m, ref_lhs_m)
+        assert np.allclose(lazy_rhs_m, ref_rhs_m)
+
+    # Applying the learned design to a new batch: this batch's code makes
+    # Q() pick a different column than the one used during fitting, and the
+    # previously used column is not loaded at all.
+    new_lazy = _LazyBatchData(make_batch(5, "b"))
+    new_ref = make_batch(5, "b")
+    lazy_lhs_m, lazy_rhs_m = build_design_matrices([lhs_builder, rhs_builder], new_lazy)
+    ref_lhs_m, ref_rhs_m = build_design_matrices([ref_lhs, ref_rhs], new_ref)
+    assert np.allclose(lazy_lhs_m, ref_lhs_m)
+    assert np.allclose(lazy_rhs_m, ref_rhs_m)
+    assert Counter(new_lazy.loaded) == Counter({"y": 1, "x": 2, "code": 1, "col_b": 1})
+
+    # The environment function really was used to pick the columns, with
+    # each batch's own code:
+    assert set(pick_col_calls) == {"a", "b"}
+
+
+def test_lazy_key_lookup_data_shadows_environment():
+    # Control for the batch test above: when the data object itself
+    # contains a name that is also present in the environment, the data
+    # value must win (standard patsy namespace semantics) -- even when the
+    # environment value is a function and the shadowing data value is a
+    # callable column.
+    env_pick_col_calls = []
+
+    def pick_col(code):
+        env_pick_col_calls.append(code)
+        return "col_" + code
+
+    def data_pick_col(code):
+        return {"a": "col_b"}[code]
+
+    columns = {
+        "y": np.arange(4.0),
+        "code": "a",
+        "col_a": np.arange(4.0) + 100,
+        "col_b": np.arange(4.0) + 200,
+        "pick_col": data_pick_col,
+        "big_unused": np.arange(4.0) + 1000,
+    }
+    formula = "y ~ Q(pick_col(code))"
+    ref_lhs, ref_rhs = dmatrices(formula, dict(columns), eval_env=0)
+    lazy = _LazyBatchData(columns)
+    lazy_lhs, lazy_rhs = dmatrices(formula, lazy, eval_env=0)
+    assert np.allclose(lazy_lhs, ref_lhs)
+    assert np.allclose(lazy_rhs, ref_rhs)
+    # The data object's callable shadowed the environment function, so the
+    # environment function was never called...
+    assert env_pick_col_calls == []
+    # ... and the matrix really does contain col_b, as selected by the
+    # data's own pick_col:
+    assert np.allclose(np.asarray(lazy_rhs)[:, 1], columns["col_b"])
+    # The shadowing callable was itself loaded as an ordinary column:
+    assert "pick_col" in lazy.loaded
+    assert "col_b" in lazy.loaded
+    assert "col_a" not in lazy.loaded

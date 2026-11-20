@@ -41,7 +41,7 @@ DEFAULT = object()
 
 __all__ = [
     'TableGroup', 'Table', 'Column', 'ForeignKey', 'Link', 'NaturalLanguage', 'Datatype',
-    'is_url', 'CSVW',
+    'is_url', 'CSVW', 'HeaderResolutionError',
 ]
 
 is_url = utils.is_url
@@ -58,6 +58,30 @@ class Invalid:  # pylint: disable=R0903,C0115:
 
 
 INVALID = Invalid()
+
+
+class HeaderResolutionError(ValueError):
+    """
+    Raised when a header cell cannot be mapped to exactly one column of the table schema.
+
+    If the header is ambiguous - i.e. several columns could match, typically because translated
+    titles do not distinguish them - `candidates` lists the technical names (headers) of the
+    matching columns, so callers can present the choice instead of guessing a permutation.
+    """
+    def __init__(
+            self,
+            header: str,
+            fname: Optional[Union[str, pathlib.Path]] = None,
+            candidates: Optional[Iterable[str]] = None):
+        self.header = header
+        self.candidates = list(candidates or [])
+        msg = f'Ambiguous header "{header}"' if self.candidates \
+            else f'Cannot resolve header "{header}"'
+        if self.candidates:
+            msg += f' (candidates: {", ".join(self.candidates)})'
+        if fname:
+            msg = f'{fname}: {msg}'
+        super().__init__(msg)
 
 
 @dataclasses.dataclass
@@ -505,17 +529,24 @@ class Column(Description):
     def __eq__(self, other):
         return self.asdict() == other.asdict()
 
-    def has_title(self, v) -> Union[str, bool]:
+    def has_title(self, v, lang: Optional[str] = None) -> Union[str, bool]:
         """
         Check whether the name or a title of the column matches v.
 
         If v matches a title, the associated language tag (or 'und') is returned.
+
+        :param lang: If given, only titles carrying this language tag (or untagged,
+            'und', titles) are considered. The technical `name` always matches,
+            regardless of the selected language.
         """
         if self.name and self.name == v:
             return True
+        selected = (lang or 'und').split('-')[0]
         for tag, titles in (self.titles or {}).items():
             if v in titles:
-                return tag or 'und'
+                if lang is None or tag is None or (tag or 'und').split('-')[0] in \
+                        ('und', selected):
+                    return tag or 'und'
         return False
 
     @property
@@ -1077,16 +1108,17 @@ class Table(TableLike):
 
         return stack.enter_context(UnicodeReaderWithLineNumber(handle, dialect=dialect))
 
-    def _validated_csv_header(self, header, strict) -> list[str]:
+    def _validated_csv_header(self, header, strict, lang: Optional[str] = None) -> list[str]:
         if not strict:
             if self.tableSchema.columns and len(self.tableSchema.columns) < len(header):
                 warnings.warn('Column number mismatch')
+            header_lang = (lang or self.lang or 'und').split('-')[0]
             for name, col in zip(header, self.tableSchema.columns):
-                res = col.has_title(name)
+                res = col.has_title(name, lang)
                 if (not col.name) and not res:
                     warnings.warn('Incompatible table models')
                 if (isinstance(res, str) and  # noqa: W504
-                        res.split('-')[0] not in ['und', (self.lang or 'und').split('-')[0]]):
+                        res.split('-')[0] not in ['und', header_lang]):
                     warnings.warn('Incompatible column titles')
         return header
 
@@ -1138,9 +1170,52 @@ class Table(TableLike):
             colnames: list[str],
             strict: bool,
             row: Iterable,
+            lang: Optional[str] = None,
+            fname=None,
     ) -> list[tuple[int, str, Column]]:
         def default_col(index):
             return Column.fromvalue({'name': f'_col.{index}'})
+
+        if lang is not None:
+            # A header language was selected for this import: resolve every header cell against
+            # the schema independently of its position. Technical names take precedence over
+            # translated titles, already bound columns are excluded and no cell value may be
+            # routed into two columns.
+            columns = self.tableSchema.columns
+            resolved: dict[int, Optional[Column]] = {}
+            assigned: set[str] = set()
+
+            def bind(index: int, col: Optional[Column], candidates: list[Column]):
+                if col is None:
+                    if len(candidates) > 1:
+                        raise HeaderResolutionError(
+                            header[index], fname,
+                            candidates=[c.header for c in candidates])
+                    resolved[index] = None
+                    return
+                if col.header in assigned:
+                    raise HeaderResolutionError(
+                        header[index], fname, candidates=[col.header])
+                assigned.add(col.header)
+                resolved[index] = col
+
+            # First pass: headers equal to a technical name bind deterministically, regardless of
+            # any translated title that happens to be spelled the same way.
+            for index, h in enumerate(header):
+                name_matches = [c for c in columns if c.name and c.name == h]
+                if name_matches:
+                    bind(index, name_matches[0], name_matches)
+
+            # Second pass: remaining headers match translated titles of still unbound columns.
+            for index, h in enumerate(header):
+                if index in resolved:
+                    continue
+                candidates = [
+                    c for c in columns
+                    if c.header not in assigned and c.has_title(h, lang) is not False]
+                bind(index, candidates[0] if len(candidates) == 1 else None, candidates)
+
+            return [(j, h, resolved[j]) for j, h in enumerate(header)]
 
         # If columns in the data are ordered as in the spec, we can match values to
         # columns by index, rather than looking up columns by name.
@@ -1176,6 +1251,7 @@ class Table(TableLike):
             fname=None,
             _Row: type = collections.OrderedDict,  # pylint: disable=invalid-name
             strict=True,
+            lang: Optional[str] = None,
     ) -> Generator[Union[dict[str, Any], tuple[str, int, dict[str, Any]]], None, None]:
         """Iterate over the rows of the table
 
@@ -1195,6 +1271,12 @@ class Table(TableLike):
         :param strict: Flag signaling whether data is read strictly - i.e. raising `ValueError` \
         when invalid data is encountered - or not - i.e. only issueing a warning and returning \
         invalid data as `str` as provided by the undelying DSV reader.
+        :param lang: Optional language tag (e.g. 'en' or 'zh') selecting which translated \
+        column titles are used to match header cells for this import only. Technical column \
+        names always take precedence; the metadata and its names are not modified. When a \
+        header matches several columns indistinguishably, a `HeaderResolutionError` listing \
+        the candidates is raised. If None (the default), the historical, position based \
+        header handling is used unchanged.
         :return: A generator of dicts or triples (fname, lineno, dict) if with_metadata
         """
         dialect = self._get_dialect()
@@ -1209,7 +1291,7 @@ class Table(TableLike):
             # specified in the metadata.
             if dialect.header:
                 try:
-                    header = self._validated_csv_header(next(reader)[1], strict)
+                    header = self._validated_csv_header(next(reader)[1], strict, lang)
                 except StopIteration:  # pragma: no cover
                     return
             else:
@@ -1219,7 +1301,7 @@ class Table(TableLike):
             for i, (lineno, row) in enumerate(reader):
                 if i == 0:
                     header_cols = self._get_header_cols(
-                        header, table_parse_spec.colnames, strict, row)
+                        header, table_parse_spec.colnames, strict, row, lang=lang, fname=fname)
                     missing = table_parse_spec.requiredcols - \
                         {c.header for j, h, c in header_cols if c}
                     if missing:
@@ -1361,9 +1443,12 @@ class TableGroup(TableLike):
             raise ValueError(f'Foreign key error: missing column "{e}" referenced') from e
         return fkis
 
-    def check_referential_integrity(self, data=None, log=None, strict=False):
+    def check_referential_integrity(self, data=None, log=None, strict=False, lang=None):
         """
         Strict validation does not allow for nullable foreign key columns.
+
+        :param lang: Optional header language tag forwarded to :meth:`Table.iterdicts`, so the
+            same column resolution used for parsing also drives foreign key evaluation.
         """
         if data is not None:
             warnings.warn('the data argument of check_referential_integrity '
@@ -1371,7 +1456,7 @@ class TableGroup(TableLike):
         if strict:
             for t in self.tables:
                 for fk in t.tableSchema.foreignKeys:
-                    for row in t:
+                    for row in t.iterdicts(lang=lang):
                         if any(row.get(col) is None for col in fk.columnReference):
                             raise ValueError(
                                 f'Foreign key column is null: '
@@ -1399,7 +1484,8 @@ class TableGroup(TableLike):
             fks = collections.OrderedDict()
             for pk, kgrp in itertools.groupby(grp, lambda x: x.pk):
                 fks[tuple(pk)] = [(fk.source_table, tuple(fk.fk)) for fk in kgrp]
-            success = self._check_fks_referencing_table(success, target_table, fks, strict, log)
+            success = self._check_fks_referencing_table(
+                success, target_table, fks, strict, log, lang)
         return success
 
     @staticmethod
@@ -1409,16 +1495,17 @@ class TableGroup(TableLike):
             fks: collections.OrderedDict[ColRefType, list[tuple[Table, ColRefType]]],
             strict: bool,
             log: logging.Logger,
+            lang: Optional[str] = None,
     ) -> bool:
         """Check all foreign keys referencing the same table."""
         target_table = ReferencedTable(
             target_table, collections.OrderedDict((fk, len(fk) == 1) for fk in fks), log)
         # Now read the available primary keys for each foreign key constraint to the table.
-        success = target_table.get_pks(success, strict)
+        success = target_table.get_pks(success, strict, lang=lang)
         for pk, source_tables in fks.items():
             # For each foreign key constraint referencing `target_table` we check the fk values.
             for source_table, fk in source_tables:
-                success = target_table.check_fks(success, pk, source_table, fk)
+                success = target_table.check_fks(success, pk, source_table, fk, lang=lang)
         return success
 
 
@@ -1436,10 +1523,10 @@ class ReferencedTable:
     refs: dict[ColRefType, set] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(set))
 
-    def get_pks(self, success: bool, strict: bool) -> bool:
+    def get_pks(self, success: bool, strict: bool, lang: Optional[str] = None) -> bool:
         """Read the actual fk values in the table."""
         itemgetters = {pk: operator.itemgetter(*pk) for pk in self.pks}
-        for row in self.table.iterdicts(log=self.log):
+        for row in self.table.iterdicts(log=self.log, lang=lang):
             for pk in self.pks:
                 vals = itemgetters[pk](row)
                 if vals in self.refs[pk]:
@@ -1482,12 +1569,14 @@ class ReferencedTable:
             pk: ColRefType,
             source_table: Table,
             fk: ColRefType,
+            lang: Optional[str] = None,
     ) -> bool:
         """
         Check one fk constraint, i.e. whether the fk values in self.table actually can be found
         in `target_table`.
         """
-        for fname, lineno, item in source_table.iterdicts(log=self.log, with_metadata=True):
+        for fname, lineno, item in source_table.iterdicts(
+                log=self.log, with_metadata=True, lang=lang):
             item = RefValues(fname=fname, lineno=lineno, values=operator.itemgetter(*fk)(item))
             success = self._check_item(success, item, pk)
         return success

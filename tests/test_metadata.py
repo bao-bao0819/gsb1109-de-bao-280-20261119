@@ -219,6 +219,133 @@ def test_Schema():
         Schema.fromvalue({'columns': [{'name': 'a'}, {'titles': 'a'}]})
 
 
+# Two columns whose English titles are both "ID". station_id additionally carries an English
+# title spelled like the other column's technical name ("project_id"), but its own technical
+# name stays "station_id". Both columns are required.
+BILINGUAL_METADATA = {
+    "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+    "url": "data.csv",
+    "tableSchema": {
+        "columns": [
+            {"name": "station_id",
+             "titles": {"en": ["ID", "project_id"], "zh": ["站号"]},
+             "datatype": "string", "required": True},
+            {"name": "project_id",
+             "titles": {"en": ["ID"], "zh": ["项目号"]},
+             "datatype": "string", "required": True},
+        ]
+    },
+}
+
+
+class TestHeaderLanguage:
+
+    @staticmethod
+    def _table(tmp_path, header, values=("STN", "PRJ")):
+        p = tmp_path / "data.csv"
+        p.write_text(",".join(header) + "\n" + ",".join(values) + "\n", encoding="utf-8")
+        return csvw.Table.fromvalue(BILINGUAL_METADATA), p
+
+    def test_technical_name_binds_itself(self, tmp_path):
+        # Header "ID" followed by the technical name "station_id": station_id must bind its own
+        # column, leaving "ID" to project_id.
+        t, p = self._table(tmp_path, ["ID", "station_id"])
+        row = list(t.iterdicts(fname=p, lang="en"))[0]
+        assert row["project_id"] == "STN"
+        assert row["station_id"] == "PRJ"
+
+    def test_swap_keeps_physical_columns(self, tmp_path):
+        # Same columns in reverse order: each value still enters the same technical name from
+        # its original physical column.
+        t, p = self._table(tmp_path, ["station_id", "ID"])
+        row = list(t.iterdicts(fname=p, lang="en"))[0]
+        assert row["station_id"] == "STN"
+        assert row["project_id"] == "PRJ"
+
+    def test_duplicate_translated_title_is_ambiguous(self, tmp_path):
+        t, p = self._table(tmp_path, ["ID", "ID"])
+        with pytest.raises(csvw.HeaderResolutionError) as exc:
+            list(t.iterdicts(fname=p, lang="en"))
+        assert set(exc.value.candidates) == {"station_id", "project_id"}
+
+    def test_explicit_chinese_titles_resolve(self, tmp_path):
+        t, p = self._table(tmp_path, ["站号", "项目号"])
+        row = list(t.iterdicts(fname=p, lang="zh"))[0]
+        assert row["station_id"] == "STN"
+        assert row["project_id"] == "PRJ"
+
+    def test_technical_name_takes_precedence_over_title_trap(self, tmp_path):
+        # A header equal to another column's technical name binds that technical column, even
+        # though station_id lists "project_id" as one of its English titles.
+        t, p = self._table(tmp_path, ["project_id", "station_id"])
+        row = list(t.iterdicts(fname=p, lang="en"))[0]
+        assert row["project_id"] == "STN"
+        assert row["station_id"] == "PRJ"
+
+    def test_legacy_call_without_language_unchanged(self, tmp_path):
+        # No lang selected: historical position based behaviour is preserved.
+        t, p = self._table(tmp_path, ["ID", "station_id"])
+        with pytest.raises(ValueError):
+            list(t.iterdicts(fname=p))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            row = list(t.iterdicts(fname=p, strict=False))[0]
+        assert row["station_id"] == "STN"
+        assert row["project_id"] == "PRJ"
+
+    def test_metadata_is_not_modified(self, tmp_path):
+        t, p = self._table(tmp_path, ["station_id", "ID"])
+        list(t.iterdicts(fname=p, lang="en"))
+        names = [c.name for c in t.tableSchema.columns]
+        assert names == ["station_id", "project_id"]
+        assert t.tableSchema.columns[0].titles.getfirst("en") == "ID"
+        assert t.tableSchema.columns[0].titles.getfirst("zh") == "站号"
+
+    def test_has_title_language_filter(self):
+        col = csvw.Column.fromvalue(
+            {"name": "station_id", "titles": {"en": ["ID"], "zh": ["站号"]}})
+        assert col.has_title("station_id", "en") is True
+        assert col.has_title("ID", "en") == "en"
+        assert col.has_title("站号", "zh") == "zh"
+        # The English title must not match when the Chinese header language is selected.
+        assert col.has_title("ID", "zh") is False
+        # The technical name still matches regardless of the selected language.
+        assert col.has_title("station_id", "zh") is True
+
+    def test_foreign_key_uses_same_language(self, tmp_path):
+        stations = tmp_path / "stations.csv"
+        # Referenced table exposes its key via the shared English title "ID".
+        stations.write_text("ID\nS1\nS2\n", encoding="utf-8")
+        observations = tmp_path / "observations.csv"
+        observations.write_text("station_id,ID\nS1,P1\n", encoding="utf-8")
+        metadata = {
+            "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+            "tables": [
+                {"url": "stations.csv", "tableSchema": {"columns": [
+                    {"name": "station_id", "titles": {"en": ["ID"], "zh": ["站号"]}}],
+                    "primaryKey": "station_id"}},
+                {"url": "observations.csv", "tableSchema": {
+                    "columns": [
+                        {"name": "station_id",
+                         "titles": {"en": ["ID"], "zh": ["站号"]}},
+                        {"name": "project_id",
+                         "titles": {"en": ["ID"], "zh": ["项目号"]}}],
+                    "foreignKeys": [{
+                        "columnReference": "station_id",
+                        "reference": {"resource": "stations.csv",
+                                      "columnReference": "station_id"}}]}},
+            ],
+        }
+        md = tmp_path / "md.json"
+        md.write_text(json.dumps(metadata), encoding="utf-8")
+        tg = csvw.TableGroup.from_file(str(md))
+        assert tg.check_referential_integrity(lang="en")
+        # The parsed observation keeps the two physical values in distinct technical columns.
+        row = list(tg.tabledict["observations.csv"].iterdicts(lang="en"))[0]
+        assert row["station_id"] == "S1"
+        assert row["project_id"] == "P1"
+
+
 def _make_table_like(cls, tmp_path, data=None, metadata=None, mdname=None):
     md = tmp_path / 'md'
     if metadata is None:

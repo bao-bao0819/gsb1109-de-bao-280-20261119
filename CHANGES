@@ -2,6 +2,17 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Added an optional `lang` parameter to `Table.iterdicts` (and forwarded by
+  `TableGroup.check_referential_integrity`) to select the translated column titles used to
+  match header cells for a single import. Technical column names always take precedence and
+  the metadata is left untouched. A header that matches several columns indistinguishably now
+  raises `HeaderResolutionError` listing the candidates instead of silently guessing a
+  permutation. Calls without `lang` keep their previous behaviour.
+
+
 Version 4.2.0
 -------------
 

@@ -1,0 +1,235 @@
+{
+  "scenarios": [
+    {
+      "scenario": "complete_short",
+      "title": "Normal complete short download (first page is the whole table)",
+      "path": "/data/events.csv?_stream=1&_size=10&_dl=1&_where=id%20%3C%3D%2010",
+      "http": {
+        "status": 200,
+        "content_type": "text/csv; charset=utf-8",
+        "content_length": null,
+        "transfer_encoding": "chunked",
+        "link": null,
+        "content_disposition": "attachment; filename=\"events.csv\"",
+        "response_started": true
+      },
+      "transport": {
+        "client_saw_complete_http_message": true,
+        "client_error": null,
+        "server_closed_without_final_chunk": false,
+        "wire_events": [
+          "Response",
+          "Data",
+          "EndOfMessage",
+          "ConnectionClosed"
+        ],
+        "wire_chunks": 1,
+        "chunk_sizes": [
+          600209
+        ]
+      },
+      "csv": {
+        "complete_records_including_header": 11,
+        "data_rows": 10,
+        "ends_on_record_boundary": true,
+        "residual_bytes": 0,
+        "residual_preview": "",
+        "parse_error": null,
+        "sha256_of_all_body_bytes": "cc45ddb5febc4b1dcf803501db34eebd10611f798bf33c473899c489ac6698d2",
+        "sha256_of_complete_record_bytes": "cc45ddb5febc4b1dcf803501db34eebd10611f798bf33c473899c489ac6698d2"
+      }
+    },
+    {
+      "scenario": "complete_long",
+      "title": "Normal complete download spanning two pages",
+      "path": "/data/events.csv?_stream=1&_size=10&_dl=1",
+      "http": {
+        "status": 200,
+        "content_type": "text/csv; charset=utf-8",
+        "content_length": null,
+        "transfer_encoding": "chunked",
+        "link": null,
+        "content_disposition": "attachment; filename=\"events.csv\"",
+        "response_started": true
+      },
+      "transport": {
+        "client_saw_complete_http_message": true,
+        "client_error": null,
+        "server_closed_without_final_chunk": false,
+        "wire_events": [
+          "Response",
+          "Data",
+          "Data",
+          "EndOfMessage",
+          "ConnectionClosed"
+        ],
+        "wire_chunks": 2,
+        "chunk_sizes": [
+          600209,
+          600208
+        ]
+      },
+      "csv": {
+        "complete_records_including_header": 21,
+        "data_rows": 20,
+        "ends_on_record_boundary": true,
+        "residual_bytes": 0,
+        "residual_preview": "",
+        "parse_error": null,
+        "sha256_of_all_body_bytes": "11187d012036c4c28d6443ee4bf9a48c88187868d13195fead49f01960601978",
+        "sha256_of_complete_record_bytes": "11187d012036c4c28d6443ee4bf9a48c88187868d13195fead49f01960601978"
+      }
+    },
+    {
+      "scenario": "fail_first_page",
+      "title": "First page query fails (SQL produced no rows yet)",
+      "path": "/data/events.csv?_stream=1&_size=10&_dl=1&_where=nosuchfunction%28id%29",
+      "http": {
+        "status": 400,
+        "content_type": "text/plain; charset=utf-8",
+        "content_length": null,
+        "transfer_encoding": "chunked",
+        "link": null,
+        "content_disposition": null,
+        "response_started": true
+      },
+      "transport": {
+        "client_saw_complete_http_message": true,
+        "client_error": null,
+        "server_closed_without_final_chunk": false,
+        "wire_events": [
+          "Response",
+          "Data",
+          "EndOfMessage",
+          "ConnectionClosed"
+        ],
+        "wire_chunks": 1,
+        "chunk_sizes": [
+          32
+        ]
+      },
+      "csv": {
+        "complete_records_including_header": 0,
+        "data_rows": 0,
+        "ends_on_record_boundary": false,
+        "residual_bytes": 32,
+        "residual_preview": "no such function: nosuchfunction",
+        "parse_error": null,
+        "sha256_of_all_body_bytes": "a80e2bff182cef8d3d2e30f3630eb90f5246f1005068a27b8336ddae389b9821",
+        "sha256_of_complete_record_bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "scenario": "timeout_next_page",
+      "title": "First page succeeds, next page query times out",
+      "path": "/data/events.csv?_stream=1&_size=10&_dl=1&_where=case%20when%20id%20%3C%3D%2011%20then%201%20else%20%28with%20recursive%20c%28x%29%20as%20%28select%201%20union%20all%20select%20x%20%2B%201%20from%20c%20where%20x%20%3C%2020000000%29%20select%20count%28%2A%29%20from%20c%29%20end%20%3E%200",
+      "http": {
+        "status": 200,
+        "content_type": "text/csv; charset=utf-8",
+        "content_length": null,
+        "transfer_encoding": "chunked",
+        "link": null,
+        "content_disposition": "attachment; filename=\"events.csv\"",
+        "response_started": true
+      },
+      "transport": {
+        "client_saw_complete_http_message": false,
+        "client_error": "RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)",
+        "server_closed_without_final_chunk": true,
+        "wire_events": [
+          "Response",
+          "Data",
+          "ERROR RemoteProtocolError"
+        ],
+        "wire_chunks": 1,
+        "chunk_sizes": [
+          600209
+        ]
+      },
+      "csv": {
+        "complete_records_including_header": 11,
+        "data_rows": 10,
+        "ends_on_record_boundary": true,
+        "residual_bytes": 0,
+        "residual_preview": "",
+        "parse_error": null,
+        "sha256_of_all_body_bytes": "cc45ddb5febc4b1dcf803501db34eebd10611f798bf33c473899c489ac6698d2",
+        "sha256_of_complete_record_bytes": "cc45ddb5febc4b1dcf803501db34eebd10611f798bf33c473899c489ac6698d2"
+      }
+    },
+    {
+      "scenario": "size_limit",
+      "title": "Response stops at the max_stream_mb limit after one page",
+      "path": "/data/events.csv?_stream=1&_size=10&_dl=1",
+      "http": {
+        "status": 200,
+        "content_type": "text/csv; charset=utf-8",
+        "content_length": null,
+        "transfer_encoding": "chunked",
+        "link": null,
+        "content_disposition": "attachment; filename=\"events.csv\"",
+        "response_started": true
+      },
+      "transport": {
+        "client_saw_complete_http_message": false,
+        "client_error": "RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)",
+        "server_closed_without_final_chunk": true,
+        "wire_events": [
+          "Response",
+          "Data",
+          "ERROR RemoteProtocolError"
+        ],
+        "wire_chunks": 1,
+        "chunk_sizes": [
+          600209
+        ]
+      },
+      "csv": {
+        "complete_records_including_header": 11,
+        "data_rows": 10,
+        "ends_on_record_boundary": true,
+        "residual_bytes": 0,
+        "residual_preview": "",
+        "parse_error": null,
+        "sha256_of_all_body_bytes": "cc45ddb5febc4b1dcf803501db34eebd10611f798bf33c473899c489ac6698d2",
+        "sha256_of_complete_record_bytes": "cc45ddb5febc4b1dcf803501db34eebd10611f798bf33c473899c489ac6698d2"
+      }
+    },
+    {
+      "scenario": "size_limit_before_any_body",
+      "title": "max_stream_mb refuses the first chunk (headers sent, no CSV)",
+      "path": "/data/events.csv?_stream=1&_size=20&_dl=1",
+      "http": {
+        "status": 200,
+        "content_type": "text/csv; charset=utf-8",
+        "content_length": null,
+        "transfer_encoding": "chunked",
+        "link": null,
+        "content_disposition": "attachment; filename=\"events.csv\"",
+        "response_started": true
+      },
+      "transport": {
+        "client_saw_complete_http_message": false,
+        "client_error": "RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)",
+        "server_closed_without_final_chunk": true,
+        "wire_events": [
+          "Response",
+          "ERROR RemoteProtocolError"
+        ],
+        "wire_chunks": 0,
+        "chunk_sizes": []
+      },
+      "csv": {
+        "complete_records_including_header": 0,
+        "data_rows": 0,
+        "ends_on_record_boundary": true,
+        "residual_bytes": 0,
+        "residual_preview": "",
+        "parse_error": null,
+        "sha256_of_all_body_bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "sha256_of_complete_record_bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ],
+  "checks_failed": []
+}

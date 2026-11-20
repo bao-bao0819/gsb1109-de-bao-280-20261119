@@ -1,0 +1,3 @@
+# Large captured bytes are reproducible with: python -m repro.run --raw repro/artifacts/wire
+artifacts/wire/
+__pycache__/

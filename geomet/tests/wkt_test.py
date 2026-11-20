@@ -20,6 +20,7 @@ except ImportError:
 import geomet
 import unittest
 
+from geomet import wkb
 from geomet import wkt
 
 
@@ -520,6 +521,44 @@ class MultiPointLoadsTestCase(unittest.TestCase):
         expected = 'Invalid WKT: `MULTIPOINT ((0 0), (0 1)`'
         self.assertEqual(expected, str(ar.exception))
 
+    def test_empty_members_keep_position(self):
+        mp = 'MULTIPOINT (EMPTY, (0 0), EMPTY)'
+        expected = dict(type='MultiPoint', coordinates=[
+            [], [0.0, 0.0], [],
+        ])
+        self.assertEqual(expected, wkt.loads(mp))
+
+    def test_only_empty_members(self):
+        mp = 'MULTIPOINT (EMPTY, EMPTY)'
+        expected = dict(type='MultiPoint', coordinates=[[], []])
+        self.assertEqual(expected, wkt.loads(mp))
+
+    def test_single_empty_member(self):
+        mp = 'MULTIPOINT (EMPTY)'
+        expected = dict(type='MultiPoint', coordinates=[[]])
+        self.assertEqual(expected, wkt.loads(mp))
+
+    def test_empty_member_bare_style(self):
+        # The bare (no inner parens) member style mixed with EMPTY.
+        mp = 'MULTIPOINT (1 2, EMPTY)'
+        expected = dict(type='MultiPoint', coordinates=[
+            [1.0, 2.0], [],
+        ])
+        self.assertEqual(expected, wkt.loads(mp))
+
+    def test_empty_member_among_points(self):
+        mp = 'MULTIPOINT ((1 2), EMPTY, (3 4))'
+        expected = dict(type='MultiPoint', coordinates=[
+            [1.0, 2.0], [], [3.0, 4.0],
+        ])
+        self.assertEqual(expected, wkt.loads(mp))
+
+    def test_whole_empty_has_no_member_slots(self):
+        self.assertEqual(
+            dict(type='MultiPoint', coordinates=[]),
+            wkt.loads('MULTIPOINT EMPTY'),
+        )
+
 
 class MultiPointDumpsTestCase(unittest.TestCase):
 
@@ -552,6 +591,34 @@ class MultiPointDumpsTestCase(unittest.TestCase):
         )
         expected = 'SRID=4326;' + WKT['multipoint']['2d']
         self.assertEqual(expected, wkt.dumps(mp, decimals=3))
+
+    def test_empty_members_keep_position(self):
+        mp = dict(type='MultiPoint', coordinates=[
+            [], [0.0, 0.0], [],
+        ])
+        self.assertEqual(
+            'MULTIPOINT (EMPTY, (0 0), EMPTY)',
+            wkt.dumps(mp, decimals=0),
+        )
+
+    def test_only_empty_members(self):
+        mp = dict(type='MultiPoint', coordinates=[[], []])
+        self.assertEqual(
+            'MULTIPOINT (EMPTY, EMPTY)', wkt.dumps(mp, decimals=0)
+        )
+
+    def test_whole_empty(self):
+        mp = dict(type='MultiPoint', coordinates=[])
+        self.assertEqual('MULTIPOINT EMPTY', wkt.dumps(mp))
+
+    def test_empty_members_among_points(self):
+        mp = dict(type='MultiPoint', coordinates=[
+            [1.0, 2.0], [], [3.0, 4.0],
+        ])
+        self.assertEqual(
+            'MULTIPOINT ((1 2), EMPTY, (3 4))',
+            wkt.dumps(mp, decimals=0),
+        )
 
 
 class MultiPolygonDumpsTestCase(unittest.TestCase):
@@ -1253,3 +1320,66 @@ class TestMisc(unittest.TestCase):
 
         expected = 'Expected "b" but found "a"'
         self.assertEqual(expected, str(ar.exception))
+
+
+class MultiPointWktWkbRoundtripTestCase(unittest.TestCase):
+    """WKT -> object -> WKB -> object -> WKT for empty MultiPoint members."""
+
+    def _roundtrip(self, source, big_endian=True, decimals=0):
+        obj = wkt.loads(source)
+        binary = wkb.dumps(obj, big_endian=big_endian)
+        decoded = wkb.loads(binary)
+        return obj, binary, decoded, wkt.dumps(decoded, decimals=decimals)
+
+    def test_empty_origin_empty_keeps_three_positions(self):
+        source = 'MULTIPOINT (EMPTY, (0 0), EMPTY)'
+        for big_endian in (True, False):
+            obj, binary, decoded, rendered = self._roundtrip(
+                source, big_endian=big_endian)
+            # Three slots preserved and only the middle is a measured point.
+            self.assertEqual([[], [0.0, 0.0], []], obj['coordinates'])
+            self.assertEqual([[], [0.0, 0.0], []], decoded['coordinates'])
+            self.assertEqual(source, rendered)
+
+    def test_only_empty_members_keep_two_slots(self):
+        source = 'MULTIPOINT (EMPTY, EMPTY)'
+        for big_endian in (True, False):
+            obj, binary, decoded, rendered = self._roundtrip(
+                source, big_endian=big_endian)
+            self.assertEqual([[], []], decoded['coordinates'])
+            self.assertEqual(2, len(decoded['coordinates']))
+            self.assertEqual(source, rendered)
+            # Empty-only groups are encoded as XY (2D MultiPoint type 4).
+            type_bytes = binary[1:5] if big_endian else binary[1:5][::-1]
+            self.assertEqual(b'\x00\x00\x00\x04', type_bytes)
+
+    def test_whole_empty_group_has_no_slots(self):
+        source = 'MULTIPOINT EMPTY'
+        for big_endian in (True, False):
+            obj, binary, decoded, rendered = self._roundtrip(
+                source, big_endian=big_endian)
+            self.assertEqual([], decoded['coordinates'])
+            self.assertEqual(0, len(decoded['coordinates']))
+            self.assertEqual(source, rendered)
+
+    def test_normal_points_keep_values_and_order(self):
+        source = (
+            'MULTIPOINT ((100.000 3.101), (101.000 2.100), (3.140 2.180))'
+        )
+        obj, binary, decoded, rendered = self._roundtrip(
+            source, big_endian=True, decimals=3)
+        self.assertEqual(
+            [[100.0, 3.101], [101.0, 2.1], [3.14, 2.18]],
+            decoded['coordinates'])
+        self.assertEqual(source, rendered)
+
+    def test_partial_nan_point_is_bad_measurement(self):
+        # WKB control record: empty, then a point with only one NaN coord,
+        # then empty. The bad measurement must be attributed to its member.
+        geom = dict(type='MultiPoint', coordinates=[
+            [], [float('nan'), 0.0], [],
+        ])
+        binary = wkb.dumps(geom, big_endian=True)
+        with self.assertRaises(ValueError) as ar:
+            wkb.loads(binary)
+        self.assertIn('member 1', str(ar.exception))

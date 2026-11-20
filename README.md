@@ -153,6 +153,25 @@ Attempting to output an empty geometry to a binary format will result in an exce
 As a result, GeoMet has chosen to not attempt to address these problems, and
 simply raise an exception instead.
 
+#### MultiPoint exception
+
+`MultiPoint` geometries are the exception. Sampling records need to keep their
+positions even when an individual sample has no measured point, so empty
+member points are preserved as empty slots rather than dropped:
+
+- In WKT, an empty member is written as `EMPTY`; for example
+  `MULTIPOINT (EMPTY, (0 0), EMPTY)` round-trips with all three member
+  positions intact and only the middle member carrying a measured point.
+- In WKB, an empty member point is encoded with NaN for *every* coordinate
+  (the convention used by the binary provider). A point where only some
+  coordinates are NaN is a bad measurement, not an empty point, and decoding
+  it raises a `ValueError` which identifies the offending member.
+- A `MultiPoint` whose members are all empty, or which has no members at all,
+  is encoded as an XY (2-dimensional) geometry. A wholly empty MultiPoint
+  carries zero point slots, while a MultiPoint with empty members keeps one
+  slot per member. Other geometry types retain the ambiguous-dimension error
+  described above.
+
 Example:
 
     >>> import geomet
@@ -169,6 +188,14 @@ Example:
     File "/home/jdoe/geomet/geomet/wkb.py", line 238, in _dumps
         raise ValueError(
     ValueError: Empty geometries cannot be represented in WKB. Reason: The dimensionality of the WKB would be ambiguous.
+
+MultiPoint empty members instead round-trip while keeping their slots:
+
+    >>> mp = wkt.loads('MULTIPOINT (EMPTY, (0 0), EMPTY)')
+    >>> mp
+    {'type': 'MultiPoint', 'coordinates': [[], [0.0, 0.0], []]}
+    >>> wkt.dumps(wkb.loads(wkb.dumps(mp)), decimals=0)
+    'MULTIPOINT (EMPTY, (0 0), EMPTY)'
 
 
 ## See also

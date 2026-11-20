@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 import binascii
+import math
 import struct
 
 from geomet.util import block_splitter
@@ -114,6 +115,41 @@ _BINARY_TO_GEOM_TYPE = dict(
 _INT_TO_DIM_LABEL = {2: '2D', 3: 'Z', 4: 'ZM'}
 
 
+def _is_nan(value):
+    """Return `True` if `value` is an IEEE-754 NaN."""
+    return isinstance(value, float) and math.isnan(value)
+
+
+def _is_empty_point(values):
+    """
+    Return `True` if every coordinate of a point is NaN.
+
+    The binary provider represents an empty point by encoding NaN for *every*
+    coordinate. A point where only some coordinates are NaN is a bad
+    measurement, not an empty point.
+    """
+    return bool(values) and all(_is_nan(v) for v in values)
+
+
+def _has_nan(values):
+    """Return `True` if any coordinate of a point is NaN."""
+    return any(_is_nan(v) for v in values)
+
+
+def _multipoint_num_dims(coords):
+    """
+    Determine the number of coordinate values per MultiPoint member.
+
+    Empty member points carry no coordinates, so dimensionality is inferred
+    from the first non-empty member. If every member is empty (or there are no
+    members at all), an XY (2-dimensional) geometry is assumed.
+    """
+    for vertex in coords:
+        if vertex:
+            return len(vertex)
+    return 2
+
+
 def _get_geom_type(type_bytes):
     """Get the GeoJSON geometry type label from a WKB type byte string.
 
@@ -212,6 +248,13 @@ def dumps(obj, big_endian=True):
         know if the geometry type is 2D, Z, M, or ZM. In such cases, a
         ValueError will be raised.
 
+        MultiPoint is the exception: empty member points (empty coordinate
+        lists) keep their sampling slots and are encoded with NaN for every
+        coordinate, and a wholly empty MultiPoint is encoded as an XY
+        (2-dimensional) geometry with zero point slots. Decoding a point with
+        only some NaN coordinates raises a ValueError identifying the member,
+        since it is a bad measurement rather than an empty point.
+
     :param dict obj:
         GeoJson-like `dict` object.
     :param bool big_endian:
@@ -243,10 +286,16 @@ def _dumps(obj, big_endian=True, include_meta=True):
     # JSON/dict structure, but that's handled.
     coords_or_geoms = obj.get('coordinates', obj.get('geometries'))
     if len(list(flatten_multi_dim(coords_or_geoms))) == 0:
-        raise ValueError(
-            'Empty geometries cannot be represented in WKB. Reason: The '
-            'dimensionality of the WKB would be ambiguous.'
-        )
+        # A MultiPoint may legitimately contain no coordinate values while
+        # still being encodable: it either carries empty member points (which
+        # keep their sampling slots), or is a wholly empty MultiPoint. Both
+        # cases are encoded as XY (2-dimensional). Every other geometry type
+        # retains its existing ambiguous-dimension error semantics.
+        if geom_type != 'MultiPoint':
+            raise ValueError(
+                'Empty geometries cannot be represented in WKB. Reason: The '
+                'dimensionality of the WKB would be ambiguous.'
+            )
 
     return exporter(obj, big_endian, meta)
 
@@ -470,10 +519,14 @@ def _dump_multipoint(obj, big_endian, meta):
     Dump a GeoJSON-like `dict` to a multipoint WKB string.
 
     Input parameters and output are similar to :funct:`_dump_point`.
+
+    Empty member points (empty coordinate lists) occupy a member slot and are
+    encoded with NaN for every coordinate. A member whose coordinates are only
+    partially NaN is passed through unchanged so that the bad measurement can
+    be identified on the receiving side.
     """
     coords = obj['coordinates']
-    vertex = coords[0]
-    num_dims = len(vertex)
+    num_dims = _multipoint_num_dims(coords)
 
     wkb_string, byte_fmt, byte_order = _header_bytefmt_byteorder(
         'MultiPoint', num_dims, big_endian, meta
@@ -486,9 +539,13 @@ def _dump_multipoint(obj, big_endian, meta):
         point_type = LITTLE_ENDIAN + point_type[::-1]
 
     wkb_string += struct.pack('%sl' % byte_order, len(coords))
+    nan = float('nan')
     for vertex in coords:
         # POINT type strings
         wkb_string += point_type
+        if not vertex:
+            # Empty member point: NaN for every coordinate.
+            vertex = [nan] * num_dims
         wkb_string += struct.pack(byte_fmt, *vertex)
 
     return wkb_string
@@ -738,14 +795,16 @@ def _load_multipoint(big_endian, type_bytes, data_bytes):
     [num_points] = struct.unpack('%sl' % endian_token,
                                  as_bin_str(take(4, data_bytes)))
 
+    if num_points == 0:
+        # A wholly empty MultiPoint carries no member slots.
+        return dict(type='MultiPoint', coordinates=coords)
+
     while True:
         point_endian = as_bin_str(take(1, data_bytes))
         point_type = as_bin_str(take(4, data_bytes))
         values = struct.unpack('%s%s' % (endian_token, 'd' * num_dims),
                                as_bin_str(take(8 * num_dims, data_bytes)))
         values = list(values)
-        if is_m:
-            values.insert(2, 0.0)
 
         if big_endian:
             assert point_endian == BIG_ENDIAN
@@ -754,7 +813,23 @@ def _load_multipoint(big_endian, type_bytes, data_bytes):
             assert point_endian == LITTLE_ENDIAN
             assert point_type[::-1] == _WKB[dim]['Point']
 
-        coords.append(list(values))
+        member_index = len(coords)
+        if _is_empty_point(values):
+            # An empty point is signaled by NaN in every coordinate. Keep an
+            # empty slot so that member positions stay aligned.
+            coords.append([])
+        else:
+            if _has_nan(values):
+                # Only some coordinates are NaN: this is a bad measurement,
+                # not a legal empty point. Point at the offending member.
+                raise ValueError(
+                    'Bad measurement in MultiPoint member %d: every '
+                    'coordinate must be NaN to represent an empty point.'
+                    % member_index
+                )
+            if is_m:
+                values.insert(2, 0.0)
+            coords.append(list(values))
         if len(coords) == num_points:
             break
 

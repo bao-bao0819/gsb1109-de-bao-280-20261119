@@ -80,7 +80,16 @@ def dumps(obj, decimals=16):
                 return 'GEOMETRYCOLLECTION EMPTY'
         else:
             # Geom has no coordinate values at all, and must be empty.
-            if len(list(util.flatten_multi_dim(obj['coordinates']))) == 0:
+            coordinates = obj['coordinates']
+            if geom_type == 'MultiPoint':
+                # A MultiPoint with no member points is empty. A MultiPoint
+                # which carries members (even empty ones) keeps its member
+                # slots so that sampling positions stay aligned.
+                is_empty = len(coordinates) == 0
+            else:
+                is_empty = len(list(
+                    util.flatten_multi_dim(coordinates))) == 0
+            if is_empty:
                 return '%s EMPTY' % geom_type.upper()
     except KeyError:
         raise geomet.InvalidGeoJSONException('Invalid GeoJSON: %s' % obj)
@@ -293,16 +302,23 @@ def _dump_multipoint(obj, decimals):
 
     Input parameters and return value are the MULTIPOINT equivalent to
     :func:`_dump_point`.
+
+    Empty member points (empty coordinate lists) are rendered as ``EMPTY`` but
+    still occupy their position, keeping sampling records aligned.
     """
     coords = obj['coordinates']
 
     if not coords:
         fmt = "EMPTY"
     else:
-        points = (' '.join(_round_and_pad(c, decimals)
-                           for c in pt) for pt in coords)
-        # Add parens around each point.
-        fmt = '(%s)' % ', '.join('(%s)' % pt for pt in points)
+        points = []
+        for pt in coords:
+            if not pt:
+                points.append('EMPTY')
+            else:
+                points.append('(%s)' % ' '.join(
+                    _round_and_pad(c, decimals) for c in pt))
+        fmt = '(%s)' % ', '.join(points)
 
     return 'MULTIPOINT %s' % fmt
 
@@ -517,6 +533,9 @@ def _load_multipoint(tokens, string):
     Has similar inputs and return value to to :func:`_load_point`, except is
     for handling MULTIPOINT geometry.
 
+    Empty member points (``EMPTY``) are kept as empty coordinate lists so that
+    the position of each sampling record stays aligned with its siblings.
+
     :returns:
         A GeoJSON `dict` MultiPoint representation of the WKT ``string``.
     """
@@ -531,6 +550,7 @@ def _load_multipoint(tokens, string):
     pt = []
 
     paren_depth = 1
+    member_empty = False
     try:
         for t in tokens:
             if t == '(':
@@ -538,20 +558,26 @@ def _load_multipoint(tokens, string):
             elif t == ')':
                 paren_depth -= 1
                 if paren_depth == 0:
+                    # Finalize the trailing member. A stray empty member left
+                    # behind by a trailing comma is ignored, mirroring the
+                    # behavior for ordinary (non-empty) points.
+                    if member_empty:
+                        coords.append([])
+                    elif pt:
+                        coords.append(pt)
                     break
             elif t == ',':
                 # the point is done
-                coords.append(pt)
+                coords.append([] if member_empty else pt)
                 pt = []
+                member_empty = False
+            elif t == 'EMPTY':
+                # An empty member point: keep an empty slot in place.
+                member_empty = True
             else:
                 pt.append(float(t))
     except tokenize.TokenError:
         raise ValueError(INVALID_WKT_FMT % string)
-
-    # Given the way we're parsing, we'll probably have to deal with the last
-    # point after the loop
-    if len(pt) > 0:
-        coords.append(pt)
 
     return dict(type='MultiPoint', coordinates=coords)
 

@@ -26,11 +26,13 @@ class WKBTestCase(unittest.TestCase):
                          str(ar.exception))
 
     def test_empty(self):
+        # A wholly empty MultiPoint is encodable as an XY geometry and is
+        # covered by MultiPointTestCase; every other geometry type remains
+        # ambiguous and must still raise.
         types = [
             'Point',
             'LineString',
             'Polygon',
-            'MultiPoint',
             'MultiLineString',
             'MultiPolygon',
         ]
@@ -38,7 +40,6 @@ class WKBTestCase(unittest.TestCase):
             [],
             [[]],
             [[[]]],
-            [[]],
             [[[]]],
             [[[[]]]],
         ]
@@ -625,6 +626,129 @@ class MultiPointTestCase(unittest.TestCase):
             wkb.loads(self.multipoint2d_srid664_wkb),
             self.multipoint2d_srid664,
         )
+
+    # The binary provider encodes an empty point as NaN for every coordinate.
+    NAN = b'\x7f\xf8\x00\x00\x00\x00\x00\x00'
+
+    def test_dumps_empty_members_keep_position(self):
+        # empty, origin, empty: the empty members keep their slots.
+        geom = dict(type='MultiPoint', coordinates=[
+            [], [0.0, 0.0], [],
+        ])
+        expected = (
+            b'\x00'                       # big endian
+            + b'\x00\x00\x00\x04'         # 2D MultiPoint
+            + b'\x00\x00\x00\x03'         # 3 points
+            # point 1: empty (NaN, NaN)
+            + b'\x00'                     # big endian
+            + b'\x00\x00\x00\x01'         # 2D Point
+            + self.NAN + self.NAN
+            # point 2: origin
+            + b'\x00'
+            + b'\x00\x00\x00\x01'
+            + b'\x00\x00\x00\x00\x00\x00\x00\x00'  # 0.0
+            + b'\x00\x00\x00\x00\x00\x00\x00\x00'  # 0.0
+            # point 3: empty (NaN, NaN)
+            + b'\x00'
+            + b'\x00\x00\x00\x01'
+            + self.NAN + self.NAN
+        )
+        self.assertEqual(expected, wkb.dumps(geom, big_endian=True))
+
+    def test_loads_all_nan_members_become_empty_slots(self):
+        geom_wkb = (
+            b'\x00'
+            + b'\x00\x00\x00\x04'
+            + b'\x00\x00\x00\x03'
+            + b'\x00' + b'\x00\x00\x00\x01' + self.NAN + self.NAN
+            + b'\x00' + b'\x00\x00\x00\x01'
+            + b'\x00' * 8 + b'\x00' * 8
+            + b'\x00' + b'\x00\x00\x00\x01' + self.NAN + self.NAN
+        )
+        expected = dict(type='MultiPoint', coordinates=[
+            [], [0.0, 0.0], [],
+        ])
+        self.assertEqual(expected, wkb.loads(geom_wkb))
+
+    def test_empty_members_roundtrip(self):
+        for big_endian in (True, False):
+            geom = dict(type='MultiPoint', coordinates=[
+                [], [0.0, 0.0], [],
+            ])
+            self.assertEqual(
+                geom, wkb.loads(wkb.dumps(geom, big_endian=big_endian))
+            )
+
+    def test_dumps_all_empty_members_default_to_xy(self):
+        # A group of only empty points is encoded as a 2D (XY) MultiPoint and
+        # each empty member retains its slot.
+        geom = dict(type='MultiPoint', coordinates=[[], []])
+        wkb_bytes = wkb.dumps(geom, big_endian=True)
+        self.assertEqual(b'\x00\x00\x00\x04', wkb_bytes[1:5])
+        self.assertEqual(
+            dict(type='MultiPoint', coordinates=[[], []]),
+            wkb.loads(wkb_bytes),
+        )
+        self.assertEqual(2, len(wkb.loads(wkb_bytes)['coordinates']))
+
+    def test_dumps_whole_empty_multipoint_has_no_member_slots(self):
+        # A wholly empty MultiPoint is XY and carries zero point slots.
+        geom = dict(type='MultiPoint', coordinates=[])
+        expected = (
+            b'\x00'                  # big endian
+            b'\x00\x00\x00\x04'      # 2D MultiPoint
+            b'\x00\x00\x00\x00'      # 0 points
+        )
+        wkb_bytes = wkb.dumps(geom, big_endian=True)
+        self.assertEqual(expected, wkb_bytes)
+        self.assertEqual(
+            dict(type='MultiPoint', coordinates=[]), wkb.loads(wkb_bytes)
+        )
+        self.assertEqual(0, len(wkb.loads(wkb_bytes)['coordinates']))
+
+    def test_whole_empty_multipoint_little_endian_roundtrip(self):
+        geom = dict(type='MultiPoint', coordinates=[])
+        wkb_bytes = wkb.dumps(geom, big_endian=False)
+        self.assertEqual(
+            b'\x01' b'\x04\x00\x00\x00' b'\x00\x00\x00\x00', wkb_bytes
+        )
+        self.assertEqual(geom, wkb.loads(wkb_bytes))
+
+    def test_loads_partial_nan_is_bad_measurement(self):
+        # Only one coordinate is NaN: not a legal empty point. The error must
+        # identify the offending member rather than treating it as empty.
+        for member_index in range(3):
+            coords = [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+            coords[member_index] = [float('nan'), 0.0]
+            geom = dict(type='MultiPoint', coordinates=coords)
+            with self.assertRaises(ValueError) as ar:
+                wkb.loads(wkb.dumps(geom, big_endian=True))
+            self.assertIn('member %d' % member_index, str(ar.exception))
+
+    def test_loads_partial_nan_provider_record_little_endian(self):
+        # Hand-built little-endian provider record: empty, then a point with
+        # a single NaN coordinate, then empty.
+        nan_le = b'\x00\x00\x00\x00\x00\x00\xf8\x7f'
+        zero_le = b'\x00' * 8
+        point_header = b'\x01' + b'\x01\x00\x00\x00'
+        provider_wkb = (
+            b'\x01'                          # little endian
+            + b'\x04\x00\x00\x00'            # 2D MultiPoint
+            + b'\x03\x00\x00\x00'            # 3 points
+            + point_header + nan_le + nan_le      # member 0: empty
+            + point_header + nan_le + zero_le     # member 1: bad measurement
+            + point_header + nan_le + nan_le     # member 2: empty
+        )
+        with self.assertRaises(ValueError) as ar:
+            wkb.loads(provider_wkb)
+        self.assertIn('member 1', str(ar.exception))
+
+    def test_normal_multipoint_values_and_order_preserved(self):
+        geom = self.multipoint2d
+        for big_endian in (True, False):
+            self.assertEqual(
+                geom, wkb.loads(wkb.dumps(geom, big_endian=big_endian))
+            )
 
 
 class MultiLineStringTestCase(unittest.TestCase):

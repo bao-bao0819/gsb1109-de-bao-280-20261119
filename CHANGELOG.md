@@ -1,5 +1,8 @@
 # DeepDiff Change log
 
+- Unreleased
+    - Added `view='external'` together with `external_redact_values`: a redacted report view for sharing diffs with external parties. Sensitive values are replaced by per-report codenames in paths, old/new values and added or removed objects (the same original value maps to the same codename within one report, and codenames are salted per report so separate reports can not be correlated). Non-sensitive values such as public amounts stay visible, the change count matches the internal view, `Delta` still round-trips from the same diff object, and exports via `to_dict()`, `to_json()` and `pretty()` refuse to produce a non-compliant report without leaking the original data.
+
 - v9-2-0
     - Added `iterable_match_keys` to match list items by key per path, e.g. `{"root['orders']": "order_id", "root['orders'][*]['lines']": ("sku", "warehouse")}`. Inserted, removed and reordered records are reported per record at real list indexes, and `Delta` round-trips (#664)
     - Support for Python 3.15

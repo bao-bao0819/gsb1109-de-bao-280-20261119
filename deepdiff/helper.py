@@ -215,6 +215,7 @@ TEXT_VIEW = 'text'
 DELTA_VIEW = '_delta'
 COLORED_VIEW = 'colored'
 COLORED_COMPACT_VIEW = 'colored_compact'
+EXTERNAL_VIEW = 'external'
 
 ENUM_INCLUDE_KEYS: List[str] = ['__objclass__', 'name', 'value']
 

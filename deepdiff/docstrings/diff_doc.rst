@@ -59,6 +59,11 @@ exclude_types: list, default = None
     :ref:`exclude_types_label`
     List of object types to exclude from the report.
 
+external_redact_values: list, default = None
+    List of sensitive values to redact when view='external' is used. The values are replaced by
+    per-report codenames wherever they appear: as field values, as dictionary keys in paths and
+    inside added or removed nested objects. Required when using the external view.
+
 exclude_obj_callback: function, default = None
     :ref:`exclude_obj_callback_label`
     A function that takes the object and its path and returns a Boolean. If True is returned, the object is excluded from the results, otherwise it is included.
@@ -219,6 +224,9 @@ view: string, default = text
     The choices are text (the default) and tree.
     The text view is the original format of the results.
     The tree view allows you to traverse through the tree of results. So you can traverse through the tree and see what items were compared to what.
+    The external view produces a redacted report that is safe to share with external parties:
+    the sensitive values passed via external_redact_values are replaced by per-report codenames
+    in paths, old and new values and added or removed objects, while non-sensitive values stay visible.
 
 
 **Returns**

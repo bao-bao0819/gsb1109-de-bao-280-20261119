@@ -26,6 +26,7 @@ from deepdiff.helper import (
     get_type,
     TEXT_VIEW,
     TREE_VIEW,
+    EXTERNAL_VIEW,
     np_float32,
     np_float64,
     np_int32,
@@ -39,6 +40,7 @@ from deepdiff.helper import (
     ipranges,
 )
 from deepdiff.model import DeltaResult
+from deepdiff.external import EXTERNAL_REPORT_UNAVAILABLE_MSG
 
 try:
     import orjson
@@ -241,6 +243,11 @@ class SerializationMixin:
                 verbose_level = 2
             else:
                 verbose_level = self.verbose_level  # type: ignore
+        if self.view == EXTERNAL_VIEW:  # type: ignore
+            external_report = getattr(self, '_external_report', None)
+            if external_report is None:
+                raise ValueError(EXTERNAL_REPORT_UNAVAILABLE_MSG)
+            return external_report.to_dict()
         return dict(self._get_view_results(TEXT_VIEW, verbose_level=verbose_level))  # type: ignore
 
     def _to_delta_dict(
@@ -334,6 +341,11 @@ class SerializationMixin:
             Item root[1] removed from set.
         """
         result = []
+        if getattr(self, 'view', None) == EXTERNAL_VIEW:
+            external_report = getattr(self, '_external_report', None)
+            if external_report is None:
+                raise ValueError(EXTERNAL_REPORT_UNAVAILABLE_MSG)
+            return external_report.pretty()
         if prefix is None:
             prefix = ''
         keys = sorted(self.tree.keys())  # type: ignore # sorting keys to guarantee constant order across python versions.

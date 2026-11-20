@@ -27,6 +27,7 @@ from deepdiff.helper import (strings, bytes_type, numbers, uuids, ListItemRemove
                              number_to_string, datetime_normalize, KEY_TO_VAL_STR, booleans,
                              np_ndarray, np_floating, get_numpy_ndarray_rows, RepeatedTimer,
                              TEXT_VIEW, TREE_VIEW, DELTA_VIEW, COLORED_VIEW, COLORED_COMPACT_VIEW,
+                             EXTERNAL_VIEW,
                              detailed__dict__, add_root_to_paths,
                              np, get_truncate_datetime, dict_, CannotCompare, ENUM_INCLUDE_KEYS,
                              PydanticBaseModel, Opcode, SetOrdered, ipranges,
@@ -44,6 +45,7 @@ from deepdiff.deephash import DeepHash, combine_hashes_lists
 from deepdiff.base import Base
 from deepdiff.lfucache import LFUCache, DummyLFU
 from deepdiff.colored_view import ColoredView
+from deepdiff.external import ExternalReport, EXTERNAL_VIEW_REQUIRES_VALUES_MSG
 from deepdiff.match_keys import CompiledMatchKeys, KeySpec, get_key_matching_pairs
 from deepdiff._multiprocessing import (
     normalize_mp_config, compute_distances_parallel,
@@ -93,7 +95,7 @@ WORKER_PASSES_COUNT = 'WORKER PASSES COUNT'
 WORKER_DISTANCE_CACHE_HIT_COUNT = 'WORKER DISTANCE CACHE HIT COUNT'
 WORKER_BATCH_COUNT = 'WORKER BATCH COUNT'
 CANT_FIND_NUMPY_MSG = 'Unable to import numpy. This must be a bug in DeepDiff since a numpy array is detected.'
-INVALID_VIEW_MSG = "view parameter must be one of 'text', 'tree', 'delta', 'colored' or 'colored_compact'. But {} was passed."
+INVALID_VIEW_MSG = "view parameter must be one of 'text', 'tree', 'delta', 'colored', 'colored_compact' or 'external'. But {} was passed."
 CUTOFF_RANGE_ERROR_MSG = 'cutoff_distance_for_pairs needs to be a positive float max 1.'
 VERBOSE_LEVEL_RANGE_MSG = 'verbose_level should be 0, 1, or 2.'
 PURGE_LEVEL_RANGE_MSG = 'cache_purge_level should be 0, 1, or 2.'
@@ -168,6 +170,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  exclude_paths: Union[str, List[str], Set[str], FrozenSet[str], None]=None,
                  exclude_regex_paths: Union[str, List[str], Pattern[str], List[Pattern[str]], None]=None,
                  exclude_types: Optional[List[type]]=None,
+                 external_redact_values: Optional[Any]=None,
                  get_deep_distance: bool=False,
                  group_by: Union[str, Tuple[str, str], Callable, None]=None,
                  group_by_sort_key: Union[str, Callable, None]=None,
@@ -228,6 +231,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                 "ignore_string_type_changes, ignore_numeric_type_changes, ignore_type_subclasses, ignore_uuid_types, truncate_datetime, "
                 "ignore_private_variables, ignore_nan_inequality, number_to_string_func, verbose_level, "
                 "view, hasher, hashes, max_passes, max_diffs, zip_ordered_iterables, "
+                "external_redact_values, "
                 "cutoff_distance_for_pairs, cutoff_intersection_for_pairs, log_frequency_in_sec, cache_size, "
                 "cache_tuning_sample_size, get_deep_distance, group_by, group_by_sort_key, cache_purge_level, log_stacktrace,"
                 "math_epsilon, iterable_compare_func, iterable_match_keys, use_enum_value, _original_type, "
@@ -278,6 +282,12 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             self.exclude_regex_paths = convert_item_or_items_into_compiled_regexes_else_none(exclude_regex_paths)
             self.exclude_types = set(exclude_types) if exclude_types else None
             self.exclude_types_tuple = tuple(exclude_types) if exclude_types else None  # we need tuple for checking isinstance
+            if external_redact_values is None:
+                self.external_redact_values = None
+            elif isinstance(external_redact_values, (str, bytes)):
+                self.external_redact_values = (external_redact_values,)
+            else:
+                self.external_redact_values = tuple(external_redact_values)
             self.ignore_type_subclasses = ignore_type_subclasses
             self.type_check_func = type_in_type_group if ignore_type_subclasses else type_is_subclass_of_type_group
             self.ignore_string_case = ignore_string_case
@@ -319,6 +329,8 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             if cache_purge_level not in {0, 1, 2}:
                 raise ValueError(PURGE_LEVEL_RANGE_MSG)
             self.view = view
+            if view == EXTERNAL_VIEW and not self.external_redact_values:
+                raise ValueError(EXTERNAL_VIEW_REQUIRES_VALUES_MSG)
             # Setting up the cache for dynamic programming. One dictionary per instance of root of DeepDiff running.
             self.max_passes = max_passes
             self.max_diffs = max_diffs
@@ -2307,6 +2319,13 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             result = ColoredView(t2=self.t2, tree_result=self.tree, compact=False)
         elif view == COLORED_COMPACT_VIEW:
             result = ColoredView(t2=self.t2, tree_result=self.tree, compact=True)
+        elif view == EXTERNAL_VIEW:
+            effective_verbose_level = verbose_level if verbose_level is not None else self.verbose_level
+            self._external_report = ExternalReport(
+                tree_results=self.tree,
+                sensitive_values=self.external_redact_values,
+                verbose_level=effective_verbose_level)
+            result = self._external_report.redacted
         else:
             raise ValueError(INVALID_VIEW_MSG.format(view))
         return result

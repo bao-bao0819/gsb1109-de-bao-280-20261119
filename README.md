@@ -126,6 +126,48 @@ header of the GeoPackage geometry:
 If an integer SRID identifier is present in a `'meta'` key (like `'meta': {'srid': 4326}`), then the SRID will be included in the
 GeoPackage header.
 
+## Structural WKB profiling
+
+`wkb.profile_wkb` inspects the structure of one WKB record without building
+coordinate objects. It reports each member's declared type, byte order,
+dimensions, SRID, declared child counts and byte ranges relative to the
+record start, which makes mixed types and dimensions visible before data is
+loaded into a table:
+
+```python
+from geomet import wkb
+
+profile = wkb.profile_wkb(record + following, end=len(record))
+profile.geometry_type
+[(member.path, member.geometry_type, member.byte_range)
+ for member in profile.flat_members]
+```
+
+Supplying `end` (or `length`) matters when records are packed together: the
+profiler never reads past that position, so a record truncated in the middle
+of a polygon cannot consume the start of the next record as if it were
+missing coordinates.
+
+Each member's `status` distinguishes the outcomes which matter for archiving:
+
+- `no_members`: the member is a Point, LineString or Polygon (including an
+  empty polygon or collection), so there are no child members to list.
+- `complete`: a container whose declared child members were all verified.
+- `incomplete`: the current member's payload, or one of its children, ended
+  before the declared structure was verified. `issue`, `expected_end`,
+  `available` and `missing` locate the shortfall.
+- `unreadable_type`: the type declaration does not name a readable WKB type.
+
+Only verified members are present in the result. A container whose child is
+incomplete keeps the members verified before that child and leaves the rest
+out. Vertex payloads are skipped rather than parsed, so profiling memory does
+not grow with the vertex count of the first polygon.
+
+The profiler also accepts a seekable binary stream, a non-seekable stream
+with an explicit record length, or an iterable of byte chunks. A segmented
+read produces the same member sequence, byte ranges and statuses as reading
+the same bytes in one piece. `wkb.loads` is unchanged.
+
 ## History
 
 This library was originally created as the result of a bug report related

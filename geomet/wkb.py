@@ -18,7 +18,28 @@ from geomet.util import block_splitter
 from geomet.util import take
 from geomet.util import as_bin_str
 from geomet.util import flatten_multi_dim
+from geomet import wkb_profile as _wkb_profile
+from geomet.wkb_profile import DEFAULT_CHUNK_SIZE as PROFILE_CHUNK_SIZE
+from geomet.wkb_profile import STATUS_COMPLETE as PROFILE_COMPLETE
+from geomet.wkb_profile import STATUS_INCOMPLETE as PROFILE_INCOMPLETE
+from geomet.wkb_profile import STATUS_NO_MEMBERS as PROFILE_NO_MEMBERS
+from geomet.wkb_profile import STATUSES as PROFILE_STATUSES
+from geomet.wkb_profile import (
+    STATUS_UNREADABLE_TYPE as PROFILE_UNREADABLE_TYPE,
+)
+from geomet.wkb_profile import WKBProfileError
+from geomet.wkb_profile import WKBProfile as _WKBProfile
 from itertools import chain
+
+#: The statuses a structural profile can report.  Re-exported here so that
+#: callers of ``geomet.wkb.profile_wkb`` do not need a second import.
+PROFILE_STATUS_NO_MEMBERS = PROFILE_NO_MEMBERS
+PROFILE_STATUS_COMPLETE = PROFILE_COMPLETE
+PROFILE_STATUS_INCOMPLETE = PROFILE_INCOMPLETE
+PROFILE_STATUS_UNREADABLE_TYPE = PROFILE_UNREADABLE_TYPE
+PROFILE_STATUSES = PROFILE_STATUSES
+WKBProfileError = WKBProfileError
+WKBProfile = _WKBProfile
 
 """
 Well-Known Binary (WKB) is a format used to encode simple geometric features
@@ -943,3 +964,59 @@ _loads_registry = {
     'MultiPolygon': _load_multipolygon,
     'GeometryCollection': _load_geometrycollection,
 }
+
+
+def profile_wkb(source, end=None, start=None, chunk_size=PROFILE_CHUNK_SIZE,
+                length=None, max_depth=_wkb_profile.DEFAULT_MAX_DEPTH):
+    """Profile one WKB record without decoding its coordinate objects.
+
+    This is the structural inspection entry point.  It shares the type
+    constants with the decoders above, but it does not call them and does not
+    modify :func:`loads` behaviour.
+
+    :param source:
+        A bytes-like object, a readable binary stream, or an iterable of
+        byte chunks.
+    :param end:
+        Exclusive end position of the record.  For bytes-like objects and
+        seekable streams this is an absolute offset; for non-seekable
+        streams and chunk iterables it is a length measured from ``start``.
+        Supplying it prevents a truncated record from reading into the next
+        record.
+    :param start:
+        Start position of the record.  Defaults to 0 for bytes-like input
+        and to the current position for a stream.
+    :param chunk_size:
+        Bytes discarded per read while skipping vertex payloads on an input
+        which cannot seek.
+    :param length:
+        Alternative to ``end``: the number of bytes in the record.
+    :param max_depth:
+        Maximum nesting depth before the profile is reported incomplete.
+
+    :returns:
+        A profile mapping.  Each member reports its geometry type, declared
+        and parsed child counts, byte ranges and a status of
+        ``no_members``, ``complete``, ``incomplete`` or
+        ``unreadable_type``.  Data problems are reported in the profile
+        instead of raised; an unusable input range raises
+        :class:`WKBProfileError`.
+
+    See :mod:`geomet.wkb_profile` for the full result layout.
+    """
+    return _wkb_profile.profile_wkb(
+        source,
+        end=end,
+        start=start,
+        chunk_size=chunk_size,
+        length=length,
+        max_depth=max_depth,
+    )
+
+
+#: Short aliases for the structural inspection entry point.
+profile = profile_wkb
+inspect = profile_wkb
+inspect_wkb = profile_wkb
+scan_wkb = profile_wkb
+structural_profile = profile_wkb

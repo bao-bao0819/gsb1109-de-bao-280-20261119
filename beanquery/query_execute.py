@@ -215,6 +215,15 @@ def execute_select(query):
 
             rows.append(values)
 
+    # Apply the DISPLAY clause predicate. This is applied after the rows have
+    # been fully evaluated, so that the values of running balance columns and
+    # aggregates reflect every row selected by the WHERE clause, and before
+    # sorting, so that the display predicate only affects which rows appear
+    # in the output, not the ledger order in which balances accumulate.
+    if query.display_index is not None:
+        index = query.display_index
+        rows = [row for row in rows if row[index]]
+
     # Apply ORDER BY.
     if order_spec is not None:
         # Process the order-by clauses grouped by their ordering direction.

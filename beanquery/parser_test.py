@@ -438,6 +438,70 @@ class TestSelectOptions(QueryParserTestBase):
         with self.assertRaises(parser.ParseError):
             parser.parse("SELECT * LIMIT;")
 
+    def test_display(self):
+        self.assertParse(
+            "SELECT * FROM OPEN ON 2014-01-01 DISPLAY flag = '!';",
+            Select(ast.Asterisk(),
+                   ast.From(None, datetime.date(2014, 1, 1), None, None),
+                   display_clause=ast.Equal(
+                       ast.Column('flag'),
+                       ast.Constant('!'))))
+
+        self.assertParse(
+            "SELECT * FROM OPEN ON 2014-01-01 FILTER flag = '!';",
+            Select(ast.Asterisk(),
+                   ast.From(None, datetime.date(2014, 1, 1), None, None),
+                   display_clause=ast.Equal(
+                       ast.Column('flag'),
+                       ast.Constant('!'))))
+
+    def test_display_after_group_by(self):
+        self.assertParse(
+            "SELECT account, count(*) GROUP BY account DISPLAY count(*) > 1;",
+            Select([ast.Target(ast.Column('account'), None),
+                    ast.Target(ast.Function('count', [ast.Asterisk()]), None)],
+                   group_by=ast.GroupBy([ast.Column('account')], None),
+                   display_clause=ast.Greater(
+                       ast.Function('count', [ast.Asterisk()]),
+                       ast.Constant(1))))
+
+    def test_display_before_group_by(self):
+        self.assertParse(
+            "SELECT account, count(*) DISPLAY count(*) > 1 GROUP BY account;",
+            Select([ast.Target(ast.Column('account'), None),
+                    ast.Target(ast.Function('count', [ast.Asterisk()]), None)],
+                   group_by=ast.GroupBy([ast.Column('account')], None),
+                   display_clause=ast.Greater(
+                       ast.Function('count', [ast.Asterisk()]),
+                       ast.Constant(1))))
+
+    def test_display_empty(self):
+        with self.assertRaises(parser.ParseError):
+            parser.parse("SELECT * DISPLAY;")
+
+
+class TestOpening(QueryParserTestBase):
+
+    def test_opening_empty(self):
+        self.assertParse(
+            "OPENING;", ast.Opening(None, None, None))
+
+    def test_opening_from(self):
+        self.assertParse(
+            "OPENING FROM OPEN ON 2014-01-01 CLOSE ON 2014-02-01;",
+            ast.Opening(
+                None,
+                ast.From(None, datetime.date(2014, 1, 1), datetime.date(2014, 2, 1), None),
+                None))
+
+    def test_opening_with_units_and_where(self):
+        self.assertParse(
+            "OPENING AT cost FROM OPEN ON 2014-01-01 WHERE account = 'Assets:A';",
+            ast.Opening(
+                'cost',
+                ast.From(None, datetime.date(2014, 1, 1), None, None),
+                ast.Equal(ast.Column('account'), ast.Constant('Assets:A'))))
+
 
 class TestBalances(QueryParserTestBase):
 

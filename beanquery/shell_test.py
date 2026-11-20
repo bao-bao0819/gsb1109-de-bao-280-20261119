@@ -203,6 +203,28 @@ class TestUseCases(unittest.TestCase):
         self.assertRegex(out, r'Assets:Gold * \d+\.\d+ USD')
 
     @runshell
+    def test_display(self, out, err):
+        """
+        SELECT date, narration, position, balance
+        FROM OPEN ON 2022-02-01 CLOSE ON 2022-03-01
+        WHERE account = 'Assets:Checking'
+        DISPLAY flag = '*';
+        """
+        self.assertRegex(out, 'Test 02')
+        self.assertNotRegex(out, 'Test 01')
+        self.assertRegex(out, r'\d+\.\d+ USD')
+
+    @runshell
+    def test_opening(self, out, err):
+        """
+        OPENING AT cost
+        FROM OPEN ON 2022-02-01 CLOSE ON 2022-03-01
+        WHERE account = 'Assets:Checking';
+        """
+        self.assertRegex(out, 'Assets:Checking')
+        self.assertRegex(out, r'\d+\.\d+ USD')
+
+    @runshell
     def test_income_statement(self, out, err):
         """
         SELECT account, cost(sum(position))

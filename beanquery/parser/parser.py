@@ -53,6 +53,8 @@ KEYWORDS: set[str] = {
     'TRUE',
     'PIVOT',
     'JOURNAL',
+    'FILTER',
+    'OPENING',
 }
 
 
@@ -113,15 +115,17 @@ class BQLParser(Parser):
             with self._option():
                 self._print_()
             with self._option():
+                self._opening_()
+            with self._option():
                 self._create_table_()
             with self._option():
                 self._insert_()
             self._error(
                 'expecting one of: '
                 "'BALANCES' 'CREATE' 'INSERT' 'JOURNAL'"
-                "'PRINT' 'SELECT' <balances>"
+                "'OPENING' 'PRINT' 'SELECT' <balances>"
                 '<create_table> <insert> <journal>'
-                '<print> <select>'
+                '<opening> <print> <select>'
             )
 
     @tatsumasu('Select')
@@ -171,11 +175,52 @@ class BQLParser(Parser):
             self.name_last_node('where_clause')
             self._define(['where_clause'], [])
         with self._optional():
-            self._token('GROUP')
-            self._token('BY')
-            self._groupby_()
-            self.name_last_node('group_by')
-            self._define(['group_by'], [])
+            with self._group():
+                with self._choice():
+                    with self._option():
+                        self._token('GROUP')
+                        self._token('BY')
+                        self._groupby_()
+                        self.name_last_node('group_by')
+                        with self._optional():
+                            with self._group():
+                                with self._choice():
+                                    with self._option():
+                                        self._token('DISPLAY')
+                                    with self._option():
+                                        self._token('FILTER')
+                                    self._error(
+                                        'expecting one of: '
+                                        "'DISPLAY' 'FILTER'"
+                                    )
+                            self._expression_()
+                            self.name_last_node('display_clause')
+                            self._define(['display_clause'], [])
+                        self._define(['display_clause', 'group_by'], [])
+                    with self._option():
+                        with self._group():
+                            with self._choice():
+                                with self._option():
+                                    self._token('DISPLAY')
+                                with self._option():
+                                    self._token('FILTER')
+                                self._error(
+                                    'expecting one of: '
+                                    "'DISPLAY' 'FILTER'"
+                                )
+                        self._expression_()
+                        self.name_last_node('display_clause')
+                        with self._optional():
+                            self._token('GROUP')
+                            self._token('BY')
+                            self._groupby_()
+                            self.name_last_node('group_by')
+                            self._define(['group_by'], [])
+                        self._define(['display_clause', 'group_by'], [])
+                    self._error(
+                        'expecting one of: '
+                        "'DISPLAY' 'FILTER' 'GROUP'"
+                    )
         with self._optional():
             self._token('ORDER')
             self._token('BY')
@@ -199,7 +244,7 @@ class BQLParser(Parser):
             self._integer_()
             self.name_last_node('limit')
             self._define(['limit'], [])
-        self._define(['distinct', 'from_clause', 'group_by', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
+        self._define(['display_clause', 'distinct', 'from_clause', 'group_by', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
 
     @tatsumasu()
     def _subselect_(self):
@@ -1189,6 +1234,26 @@ class BQLParser(Parser):
             self.name_last_node('from_clause')
             self._define(['from_clause'], [])
         self._define(['from_clause'], [])
+
+    @tatsumasu('Opening')
+    def _opening_(self):
+        self._token('OPENING')
+        with self._optional():
+            self._token('AT')
+            self._identifier_()
+            self.name_last_node('summary_func')
+            self._define(['summary_func'], [])
+        with self._optional():
+            self._token('FROM')
+            self._from_()
+            self.name_last_node('from_clause')
+            self._define(['from_clause'], [])
+        with self._optional():
+            self._token('WHERE')
+            self._expression_()
+            self.name_last_node('where_clause')
+            self._define(['where_clause'], [])
+        self._define(['from_clause', 'summary_func', 'where_clause'], [])
 
     @tatsumasu('CreateTable')
     def _create_table_(self):

@@ -547,7 +547,8 @@ class BQLShell(DispatchingShell):
            SELECT [DISTINCT] [<targets>|*]
            [FROM <from_expr> [OPEN ON <date>] [CLOSE [ON <date>]] [CLEAR]]
            [WHERE <where_expr>]
-           [GROUP BY <groups>]
+           [GROUP BY <groups> [HAVING <having_expr>]]
+           [DISPLAY <display_expr>]
            [ORDER BY <groups> [ASC|DESC]]
            [LIMIT num]
 
@@ -571,6 +572,14 @@ class BQLShell(DispatchingShell):
           where_expr: A logical expression that matches on the attributes of
             postings. The available columns are similar to those in the targets
             clause, without the aggregation functions.
+
+          display_expr: A logical expression that selects the rows to output
+            without affecting the rows that contribute to the balance column or
+            to the aggregations. It is evaluated after the WHERE clause and
+            before ORDER BY. In an aggregate query it must be an aggregate
+            expression. The clause may also be spelled FILTER. This is useful to
+            print only selected postings of a period while the balances still
+            follow the full ledger.
 
           OPEN clause: replace all the transactions before the given date by
             summarizing entries and transfer Income and Expenses balances to
@@ -624,6 +633,24 @@ class BQLShell(DispatchingShell):
         See the SELECT query help for more details on the FROM clause.
         """
         return self.on_Select(balance)
+
+    def on_Opening(self, opening):
+        """
+        Select the balances at the opening date of the FROM clause. This
+        command is a convenience and converts into an equivalent Select
+        statement, designed to extract the balance of each account in the
+        opening balances synthesized by the OPEN clause.
+
+        The general form of an OPENING statement loosely follows SQL syntax:
+
+           OPENING [AT <summary_func>] [FROM_CLAUSE] [WHERE_CLAUSE]
+
+        The opening balance is available even when the report over the period
+        has no visible rows.
+
+        See the SELECT query help for more details on the FROM clause.
+        """
+        return self.on_Select(opening)
 
     def help_targets(self):
         template = textwrap.dedent("""

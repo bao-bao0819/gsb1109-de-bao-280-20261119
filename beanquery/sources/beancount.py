@@ -13,6 +13,7 @@ from beancount import parser
 from beancount.core import amount
 from beancount.core import convert
 from beancount.core import data
+from beancount.core import flags
 from beancount.core import getters
 from beancount.core import inventory
 from beancount.core import position
@@ -26,6 +27,7 @@ from beanquery import types
 from beanquery import query_compile
 from beanquery import query_render
 from beanquery import hashable
+from beanquery.errors import ProgrammingError
 from beanquery.query_env import ColumnsRegistry
 
 
@@ -244,13 +246,14 @@ _TABLES.append(CommoditiesTable)
 
 
 class _BeancountTable(tables.Table):
-    def __init__(self, entries, options, open=None, close=None, clear=None):
+    def __init__(self, entries, options, open=None, close=None, clear=None, opening=False):
         super().__init__()
         self.entries = entries
         self.options = options
         self.open = open
         self.close = close
         self.clear = clear
+        self.opening = opening
 
     def evolve(self, **kwargs):
         table = copy.copy(self)
@@ -277,6 +280,19 @@ class _BeancountTable(tables.Table):
         # Process the CLEAR clause.
         if self.clear is not None:
             entries, index = summarize.clear_opt(entries, None, options)
+
+        # Restrict the entries to the opening balances synthesized by the OPEN
+        # clause. These are the summarization entries dated before the opening
+        # date. Only the OPENING statement sets this mode; regular queries are
+        # unaffected.
+        if self.opening:
+            if self.open is None:
+                raise ProgrammingError('OPENING requires an OPEN ON date')
+            entries = [entry
+                       for entry in entries
+                       if isinstance(entry, data.Transaction) and
+                       entry.date < self.open and
+                       entry.flag == flags.FLAG_SUMMARIZE]
 
         return entries
 

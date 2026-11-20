@@ -127,6 +127,26 @@ class Compiler:
         new_targets, order_spec = self._compile_order_by(node.order_by, c_targets)
         c_targets.extend(new_targets)
 
+        # Compile the DISPLAY clause. The predicate is appended as an invisible
+        # target so that it is evaluated in the same pass as the visible
+        # targets, after the WHERE clause selected the rows that participate in
+        # running balances and aggregations. Only the rows for which it
+        # evaluates to true are eventually emitted. In an aggregated query the
+        # predicate selects whole groups and thus has to be an aggregate, just
+        # like the HAVING clause.
+        display_index = None
+        if node.display_clause is not None:
+            c_display = self._compile(node.display_clause)
+            columns, aggregates = get_columns_and_aggregates(c_display)
+            if columns and aggregates:
+                raise CompilationError('mixed aggregates and non-aggregates are not allowed', node.display_clause)
+            if group_indexes is not None and not is_aggregate(c_display):
+                raise CompilationError(
+                    'the DISPLAY clause must be an aggregate expression in an aggregate query',
+                    node.display_clause)
+            display_index = len(c_targets)
+            c_targets.append(EvalTarget(c_display, None, is_aggregate(c_display)))
+
         # If this is an aggregate query (it groups, see list of indexes), check that
         # the set of non-aggregates match exactly the group indexes. This should
         # always be the case at this point, because we have added all the necessary
@@ -149,7 +169,8 @@ class Compiler:
                           having_index,
                           order_spec,
                           node.limit,
-                          node.distinct)
+                          node.distinct,
+                          display_index)
 
         pivots = self._compile_pivot_by(node.pivot_by, c_targets, group_indexes)
         if pivots:
@@ -727,6 +748,21 @@ class Compiler:
         return self._compile(transform_balances(node))
 
     @_compile.register
+    def _opening(self, node: ast.Opening):
+        # The opening balances are defined by the OPEN clause of the FROM
+        # clause: they are the summarization entries synthesized for the dates
+        # before the opening date.
+        if not isinstance(node.from_clause, ast.From) or node.from_clause.open is None:
+            raise CompilationError('OPENING requires a FROM clause with an OPEN ON date', node)
+        evolve = getattr(self.table, 'evolve', None)
+        if evolve is None:
+            raise CompilationError('OPENING is not supported on this table', node)
+        # Mark the table as producing only the opening balances. The flag is
+        # preserved when the FROM clause evolves the table with its qualifiers.
+        self.table = evolve(opening=True)
+        return self._compile(transform_opening(node))
+
+    @_compile.register
     def _journal(self, node: ast.Journal):
         return self._compile(transform_journal(node))
 
@@ -837,6 +873,39 @@ def transform_balances(balances):
     return ast.Select(cooked_select.targets,
                       balances.from_clause,
                       balances.where_clause,
+                      cooked_select.group_by,
+                      cooked_select.order_by,
+                      None, None, None)
+
+
+def transform_opening(opening):
+    """Translate an Opening entry into an uncompiled Select statement.
+
+    The statement selects the balances of the accounts at the opening date of
+    the FROM clause. It is compiled like a regular balances statement, with
+    the table restricted to the summarization entries produced by the OPEN
+    clause.
+
+    Args:
+      opening: An instance of an Opening object.
+    Returns:
+      An instance of an uncompiled Select object.
+    """
+    cooked_select = parser.parse("""
+
+      SELECT account, SUM({}(position))
+      GROUP BY account, ACCOUNT_SORTKEY(account)
+      ORDER BY ACCOUNT_SORTKEY(account)
+
+    """.format(opening.summary_func or ""))
+
+    from_clause = opening.from_clause
+    if from_clause is None:
+        from_clause = ast.From(None, None, None, None)
+
+    return ast.Select(cooked_select.targets,
+                      from_clause,
+                      opening.where_clause,
                       cooked_select.group_by,
                       cooked_select.order_by,
                       None, None, None)

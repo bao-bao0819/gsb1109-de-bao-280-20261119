@@ -64,11 +64,26 @@ class Node:
 
 
 def node(name, fields):
-    """Manufacture an AST node class."""
+    """Manufacture an AST node class.
+
+    Fields whose name is suffixed with ``?`` are optional and default to
+    ``None``. This is used for fields added to existing nodes so that code
+    constructing the nodes with positional arguments keeps working.
+    """
+
+    definitions = []
+    for token in fields.split():
+        optional = token.endswith('?')
+        if optional:
+            token = token[:-1]
+        if optional:
+            definitions.append((token, typing.Any, dataclasses.field(default=None)))
+        else:
+            definitions.append((token, typing.Any))
 
     return dataclasses.make_dataclass(
         name,
-        [*fields.split(), ('parseinfo', None, dataclasses.field(default=None, compare=False, repr=False))],
+        [*definitions, ('parseinfo', None, dataclasses.field(default=None, compare=False, repr=False))],
         bases=(Node,),
         **({'slots': True} if sys.version_info[:2] >= (3, 10) else {}))
 
@@ -85,7 +100,10 @@ def node(name, fields):
 #   pivot_by: An instance of 'PivotBy', or None if absent.
 #   limit: An integer, or None is absent.
 #   distinct: A boolean value (True), or None if absent.
-Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct')
+#   display_clause: A root expression node that selects which rows are
+#     displayed without affecting the rows that contribute to the balance
+#     column, or None if absent.
+Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct display_clause?')
 
 # A select query that produces final balances for accounts.
 # This is equivalent to
@@ -100,6 +118,24 @@ Select = node('Select', 'targets from_clause where_clause group_by order_by pivo
 #     May be to extract units, value at cost, etc.
 #   from_clause: An instance of 'From', or None if absent.
 Balances = node('Balances', 'summary_func from_clause where_clause')
+
+# A select query that produces the balances at the beginning of the period
+# selected by the FROM clause. The value summarized is the inventory of the
+# postings strictly before the opening date, after the FROM clause
+# summarization has been applied.
+#
+# This is equivalent to
+#
+#   SELECT account, sum(position)
+#   FROM ... OPEN ON <date>
+#   WHERE ...
+#   GROUP BY account
+#
+# Attributes:
+#   summary_func: A method on an inventory to call on the position column.
+#     May be to extract units, value at cost, etc.
+#   from_clause: An instance of 'From', or None if absent.
+Opening = node('Opening', 'summary_func from_clause where_clause')
 
 # A select query that produces a journal of postings.
 # This is equivalent to

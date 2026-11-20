@@ -1,6 +1,28 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- Added the ``DISPLAY`` (or ``FILTER``) clause to ``SELECT`` queries. The
+  clause takes a predicate that selects the rows to output without
+  affecting the rows that contribute to the ``balance`` column or to the
+  aggregations. This allows a report to show only a subset of the postings
+  of a period while the running balances keep following the ledger. The
+  predicate is evaluated after the ``WHERE`` clause and before ``ORDER
+  BY``. In an aggregate query it must be an aggregate expression, like
+  the ``HAVING`` clause::
+
+    SELECT date, narration, balance
+    FROM OPEN ON 2025-05-01 CLOSE ON 2025-06-01
+    WHERE account = 'Assets:A'
+    DISPLAY flag = '*'
+
+- Added the ``OPENING`` statement to retrieve the balances at the opening
+  date of the ``FROM`` clause. It is equivalent to ``BALANCES`` restricted
+  to the opening balances synthesized by the ``OPEN`` clause, which makes
+  the opening balance available even when the report over the period has
+  no visible rows::
+
+    OPENING AT cost FROM OPEN ON 2025-05-01 CLOSE ON 2025-06-01
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

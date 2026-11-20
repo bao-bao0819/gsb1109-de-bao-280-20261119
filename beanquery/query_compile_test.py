@@ -850,3 +850,43 @@ class TestQuotedIdentifiers(unittest.TestCase):
         # if the double quoted string is not a table name, it is a string literal ideed
         query = self.compile('''SELECT "a" + "b" FROM postings''')
         self.assertEqual(query.c_targets[0].c_expr.value, 'ab')
+
+
+class TestCompileDisplayAndOpening(CompileSelectBase):
+
+    def test_display_index(self):
+        query = self.compile("""
+          SELECT account, balance FROM OPEN ON 2014-01-01
+          WHERE account = 'Assets:A' DISPLAY flag = '*';
+        """)
+        self.assertEqual(3, len(query.c_targets))
+        self.assertEqual(2, query.display_index)
+        self.assertIsNone(query.c_targets[2].name)
+        self.assertTrue(all(target.name is not None for target in query.c_targets[:2]))
+
+    def test_display_is_invisible(self):
+        query = self.compile("""
+          SELECT account FROM OPEN ON 2014-01-01 DISPLAY flag = '*';
+        """)
+        self.assertEqual(['account'], [target.name for target in query.columns])
+
+    def test_no_display_index(self):
+        query = self.compile("SELECT account FROM OPEN ON 2014-01-01;")
+        self.assertIsNone(query.display_index)
+
+    def test_opening(self):
+        query = self.compile("""
+          OPENING FROM OPEN ON 2014-01-01 CLOSE ON 2014-02-01 WHERE account = 'Assets:A';
+        """)
+        self.assertTrue(query.table.opening)
+        self.assertEqual(datetime.date(2014, 1, 1), query.table.open)
+        self.assertEqual(datetime.date(2014, 2, 1), query.table.close)
+
+    def test_opening_requires_open(self):
+        with self.assertRaises(CompilationError) as assertion:
+            self.compile("OPENING;")
+        self.assertRegex(str(assertion.exception), 'OPENING requires a FROM clause with an OPEN ON date')
+
+    def test_regular_query_is_not_opening(self):
+        query = self.compile("SELECT account FROM OPEN ON 2014-01-01;")
+        self.assertFalse(query.table.opening)

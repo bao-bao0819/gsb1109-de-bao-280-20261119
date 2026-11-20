@@ -12,6 +12,7 @@ from beancount.core.amount import from_string as A
 from beancount.core.number import D
 from beancount.core import inventory
 from beancount.core.inventory import from_string as I
+from beancount.core import position
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
 from beancount import loader
@@ -1881,3 +1882,296 @@ class TestCSVSource(unittest.TestCase):
         self.assertEqual(names, ['id', 'name', 'check', 'date', 'value'])
         types = [column.dtype for column in conn.tables['test'].columns.values()]
         self.assertEqual(types, [int, str, bool, datetime.date, Decimal])
+
+
+class TestDisplayAndOpening(QueryBase):
+    """A month report that shows only selected postings, with balances that
+    keep following the ledger, and a separate query for the opening balances.
+    """
+
+    INPUT = """
+
+      2024-01-01 open Assets:A
+      2024-01-01 open Assets:B
+      2024-01-01 open Equity:Init
+
+      2024-04-28 * "April USD"
+        Assets:A        100.00 USD
+        Equity:Init    -100.00 USD
+
+      2024-04-28 * "April EUR"
+        Assets:A         10.00 EUR {0.70 USD}
+        Equity:Init      -7.00 USD
+
+      2024-04-28 * "B opening"
+        Assets:B         50.00 USD
+        Equity:Init     -50.00 USD
+
+      2024-05-01 ! "Internal"
+        Assets:A         10.00 USD
+        Equity:Init     -10.00 USD
+
+      2024-05-02 * "Show"
+        Assets:A         -3.00 USD
+        Equity:Init       3.00 USD
+
+    """
+
+    def test_display_only_rows_but_balance_follows_ledger(self):
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT date, narration, position, balance
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            DISPLAY flag = '*'
+            """,
+            [
+                ('date', datetime.date),
+                ('narration', str),
+                ('position', position.Position),
+                ('balance', inventory.Inventory),
+            ],
+            [
+                (datetime.date(2024, 5, 2), 'Show',
+                 position.from_string('-3.00 USD'),
+                 I('107.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}')),
+            ])
+
+    def test_display_order_does_not_change_balance(self):
+        # Reordering the output leaves the running balance values untouched:
+        # balances keep following the ledger order.
+        for direction in ['ASC', 'DESC']:
+            with self.subTest(direction=direction):
+                self.check_query(
+                    self.INPUT,
+                    f"""
+                    SELECT date, narration, position, balance
+                    FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+                    WHERE account = 'Assets:A'
+                    DISPLAY flag = '*'
+                    ORDER BY narration {direction}
+                    """,
+                    [
+                        ('date', datetime.date),
+                        ('narration', str),
+                        ('position', position.Position),
+                        ('balance', inventory.Inventory),
+                    ],
+                    [
+                        (datetime.date(2024, 5, 2), 'Show',
+                         position.from_string('-3.00 USD'),
+                         I('107.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}')),
+                    ])
+
+    def test_display_with_balance_in_order_by(self):
+        # The same balance expression is used both in the output and in the
+        # ORDER BY clause. It is evaluated once per row.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT date, narration, balance
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            DISPLAY flag = '*'
+            ORDER BY balance
+            """,
+            [
+                ('date', datetime.date),
+                ('narration', str),
+                ('balance', inventory.Inventory),
+            ],
+            [
+                (datetime.date(2024, 5, 2), 'Show',
+                 I('107.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}')),
+            ])
+
+    def test_display_repeated_balance_does_not_reaccumulate(self):
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT narration, balance, balance
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            DISPLAY flag = '*'
+            """,
+            [
+                ('narration', str),
+                ('balance', inventory.Inventory),
+                ('balance', inventory.Inventory),
+            ],
+            [
+                ('Show',
+                 I('107.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}'),
+                 I('107.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}')),
+            ])
+
+    def test_display_hides_other_accounts(self):
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT date, narration, balance
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            DISPLAY flag = '*'
+            """,
+            [
+                ('date', datetime.date),
+                ('narration', str),
+                ('balance', inventory.Inventory),
+            ],
+            [
+                (datetime.date(2024, 5, 2), 'Show',
+                 I('107.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}')),
+            ])
+
+    def test_display_without_matching_rows(self):
+        # No rows are displayed, but the query still succeeds and reports the
+        # expected columns.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT date, narration, balance
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            DISPLAY narration = 'Does not exist'
+            """,
+            [
+                ('date', datetime.date),
+                ('narration', str),
+                ('balance', inventory.Inventory),
+            ],
+            [])
+
+    def test_display_does_not_hide_ledger_postings_from_balance(self):
+        # The WHERE clause still sees every posting; only the output is
+        # reduced by DISPLAY. Here the WHERE clause excludes the opening
+        # balance rows, so the balance starts from zero, but the hidden
+        # +10 USD adjustment still participates and the visible -3 USD row
+        # ends at 7 USD.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT date, narration, balance
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A' AND date >= 2024-05-01
+            DISPLAY narration = 'Show'
+            """,
+            [
+                ('date', datetime.date),
+                ('narration', str),
+                ('balance', inventory.Inventory),
+            ],
+            [
+                (datetime.date(2024, 5, 2), 'Show',
+                 I('7.00 USD')),
+            ])
+
+    def test_opening_query(self):
+        self.check_query(
+            self.INPUT,
+            """
+            OPENING FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            """,
+            [
+                ('account', str),
+                ('SUM((position))', inventory.Inventory),
+            ],
+            [
+                ('Assets:A', I('100.00 USD, 10.00 EUR {0.70 USD, 2024-04-28}')),
+            ])
+
+    def test_opening_query_at_cost(self):
+        self.check_query(
+            self.INPUT,
+            """
+            OPENING AT cost FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A'
+            """,
+            [
+                ('account', str),
+                ('SUM(cost(position))', inventory.Inventory),
+            ],
+            [
+                ('Assets:A', I('107.00 USD')),
+            ])
+
+    def test_opening_query_without_display_rows(self):
+        # The opening balance remains available even if the month report shows
+        # nothing. The WHERE clause restricts the account, not the visible
+        # postings.
+        self.check_query(
+            self.INPUT,
+            """
+            OPENING FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account = 'Assets:A' AND narration = 'Does not exist'
+            """,
+            [
+                ('account', str),
+                ('SUM((position))', inventory.Inventory),
+            ],
+            [])
+
+    def test_opening_query_at_cost_without_display_rows(self):
+        # The opening balance for both accounts is available whether or not
+        # the month report has rows.
+        self.check_query(
+            self.INPUT,
+            """
+            OPENING AT cost FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account ~ '^Assets:'
+            """,
+            [
+                ('account', str),
+                ('SUM(cost(position))', inventory.Inventory),
+            ],
+            [
+                ('Assets:A', I('107.00 USD')),
+                ('Assets:B', I('50.00 USD')),
+            ])
+
+    def test_display_aggregate(self):
+        # In an aggregate query the DISPLAY predicate selects whole groups and
+        # has to be an aggregate, like the HAVING clause.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, count(*) AS n
+            FROM OPEN ON 2024-05-01 CLOSE ON 2024-06-01
+            WHERE account ~ '^Assets:'
+            GROUP BY account
+            DISPLAY count(*) > 1
+            """,
+            [
+                ('account', str),
+                ('n', int),
+            ],
+            [
+                ('Assets:A', 4),
+            ])
+
+    def test_display_non_aggregate_rejected_in_aggregate_query(self):
+        with self.assertRaises(CompilationError) as assertion:
+            self.ctx.execute("""
+                SELECT account, count(*) AS n
+                FROM OPEN ON 2024-05-01
+                GROUP BY account
+                DISPLAY account = 'Assets:A'
+            """)
+        self.assertRegex(str(assertion.exception), 'DISPLAY clause must be an aggregate')
+
+    def test_display_mixed_aggregates_rejected(self):
+        with self.assertRaises(CompilationError) as assertion:
+            self.ctx.execute("""
+                SELECT account, count(*) AS n
+                FROM OPEN ON 2024-05-01
+                GROUP BY account
+                DISPLAY count(*) > number
+            """)
+        self.assertRegex(str(assertion.exception), 'mixed aggregates and non-aggregates')
+
+    def test_opening_requires_open_date(self):
+        with self.assertRaises(CompilationError) as assertion:
+            self.ctx.execute("OPENING;")
+        self.assertRegex(str(assertion.exception), 'OPENING requires a FROM clause with an OPEN ON date')

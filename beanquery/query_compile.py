@@ -618,6 +618,11 @@ EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 #     This list may refer to either aggregates or non-aggregates.
 #   limit: An optional integer used to cut off the number of result rows returned.
 #   distinct: An optional boolean that requests we should uniquify the result rows.
+#   display_index: An optional integer index of an invisible target used as a
+#     predicate. Rows for which the predicate is false are excluded from the
+#     result without affecting the values of the other targets, so that the
+#     balance column keeps accumulating every posting selected by the WHERE
+#     clause.
 @dataclasses.dataclass
 class EvalQuery:
     table: tables.Table
@@ -628,6 +633,7 @@ class EvalQuery:
     order_spec: list[tuple[int, ast.Ordering]]
     limit: int
     distinct: bool
+    display_index: int | None = None
 
     @property
     def columns(self):

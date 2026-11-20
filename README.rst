@@ -44,6 +44,50 @@ Example
 
 That's it.
 
+Read-only exports
+-----------------
+
+A ``File`` partd can export selected keys as a self-contained, read-only
+directory that another process can open without access to the source::
+
+    >>> source = partd.File('/path/to/dataset/')
+    >>> view = source.export('/path/to/export/', keys=['x', 'y'])
+    >>> view.get(['x', 'y'])
+    [b'Hello world!', b'123']
+
+    >>> view = partd.open_export('/path/to/export/')   # in another process
+    >>> view = partd.File('/path/to/export/', readonly=True)
+    >>> view = partd.File.readonly('/path/to/export/')
+
+All selected keys are captured at a single logical instant.  The source lock
+is held only while the key sizes and file descriptors are captured; the byte
+copy happens afterwards, so writers can keep appending (or drop and rebuild
+the same partition) without waiting for the export to finish.  Appends made
+after the captured instant, and a rebuilt partition, never change the view.
+
+Only the selected keys are included.  A key that exists with no bytes and a
+key that does not exist are distinct::
+
+    >>> view.status('empty')     # an existing zero-byte key
+    'empty'
+    >>> view.status('missing')   # a key that was not in the source
+    'missing'
+    >>> view.get('missing') is partd.MISSING
+    True
+
+A successful export is marked by a ``SUCCESS`` file written after every
+selected key and the manifest.  Readers refuse to open a directory that
+lacks it, so an interrupted export is never mistaken for a complete one::
+
+    >>> partd.is_published('/path/to/export/')
+    True
+    >>> partd.export_status('/path/to/export/').published
+    True
+
+The exported files use the normal partd filename layout, so an ordinary
+``File`` can also read them.  ``drop`` and other writes are not available on
+the read-only view.
+
 
 Implementations
 ---------------

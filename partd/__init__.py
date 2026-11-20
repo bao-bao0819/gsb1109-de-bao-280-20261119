@@ -1,6 +1,9 @@
 from contextlib import suppress
 
-from .file import File
+from .file import (File, FileSnapshot, FileView, ReadOnlyFile, ExportError,
+                   ExportNotPublished, ExportExists, ExportCorrupt,
+                   ReadOnlyError, MISSING, ExportStatus, export_status,
+                   open_export, is_published)
 from .dict import Dict
 from .buffer import Buffer
 from .encode import Encode

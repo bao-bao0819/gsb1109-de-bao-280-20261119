@@ -167,6 +167,27 @@ class SuitableVariantNotFoundError(ValueError):
         return s
 
 
+class DuplicatedVariantTagError(ValueError):
+    def __init__(
+        self,
+        tag: Any,
+        variants: tuple[type, ...],
+        discriminator_name: str | None = None,
+    ):
+        self.tag = tag
+        self.variants = variants
+        self.discriminator_name = discriminator_name
+
+    def __str__(self) -> str:
+        variant_names = ", ".join(
+            type_name(variant, short=True) for variant in self.variants
+        )
+        return (
+            f"Discriminator tag {self.tag!r} is declared by more than one "
+            f"variant: {variant_names}"
+        )
+
+
 class BadHookSignature(TypeError):
     pass
 

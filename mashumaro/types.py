@@ -1,5 +1,5 @@
 import decimal
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -98,6 +98,19 @@ class Discriminator:
     include_supertypes: bool = False
     include_subtypes: bool = False
     variant_tagger_fn: Callable[[Any], Any] | None = None
+    # Per-variant tag mappings. A tag is the only evidence that a payload
+    # belongs to a particular variant, so these mappings are keyed by the
+    # variant class rather than inferred from the field shape.
+    # Each variant accepts the tags it declares for decoding, while only
+    # the first tag is written back on serialization.
+    # A user supplied mapping is normalized into an immutable, hashable
+    # tuple of (variant, tags) pairs so that Discriminator stays hashable
+    # and two discriminators with different tags compare unequal.
+    variant_tags: (
+        Mapping[type | str, Sequence[Any]]
+        | tuple[tuple[type | str, tuple[Any, ...]], ...]
+        | None
+    ) = None
 
     def __post_init__(self) -> None:
         if not self.include_supertypes and not self.include_subtypes:
@@ -105,6 +118,36 @@ class Discriminator:
                 "Either 'include_supertypes' or 'include_subtypes' "
                 "must be enabled"
             )
+        if self.variant_tags is not None:
+            if not self.field:
+                raise ValueError(
+                    "'variant_tags' can only be used together with a "
+                    "discriminator field"
+                )
+            if isinstance(self.variant_tags, Mapping):
+                raw_items = self.variant_tags.items()
+            else:
+                # Accept an already normalized mapping, which happens when
+                # a Discriminator is reconstructed from another one.
+                raw_items = self.variant_tags
+            normalized = []
+            for variant, tags in raw_items:
+                if not isinstance(variant, (type, str)):
+                    raise ValueError(
+                        "Keys of 'variant_tags' must be classes or "
+                        "class names"
+                    )
+                if not isinstance(tags, (list, tuple)):
+                    raise ValueError(
+                        "Values of 'variant_tags' must be lists or tuples"
+                    )
+                if not tags:
+                    raise ValueError(
+                        "Each variant in 'variant_tags' must declare "
+                        "at least one tag"
+                    )
+                normalized.append((variant, tuple(tags)))
+            self.variant_tags = tuple(normalized)
 
 
 class Alias:

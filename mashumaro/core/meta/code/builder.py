@@ -26,6 +26,10 @@ from mashumaro.config import (
 from mashumaro.core.const import Sentinel
 from mashumaro.core.helpers import ConfigValue
 from mashumaro.core.meta.code.lines import CodeLines
+from mashumaro.core.meta.discriminator import (
+    get_variant_primary_tag,
+    variant_has_declared_tags,
+)
 from mashumaro.core.meta.helpers import (
     get_args,
     get_class_that_defines_field,
@@ -409,6 +413,7 @@ class CodeBuilder:
                     field=discr.field,
                     include_subtypes=discr.include_subtypes,
                     variant_tagger_fn=discr.variant_tagger_fn,
+                    variant_tags=discr.variant_tags,
                 )
                 self.add_type_modules(self.cls)
                 method = SubtypeUnpackerBuilder(discr).build(
@@ -997,8 +1002,14 @@ class CodeBuilder:
                             packer if packer != "value" else f"self.{fname}",
                         )
                     )
-                kwargs = ", ".join(f"'{k}': {v}" for k, v in kwargs_parts)
-                kwargs = f"{{{kwargs}}}"
+                kwargs_literal = ", ".join(
+                    f"'{k}': {v}" for k, v in kwargs_parts
+                )
+                self.add_line(f"kwargs = {{{kwargs_literal}}}")
+                kwargs = "kwargs"
+            self._add_discriminator_tag_pack_line(
+                config, field_types, serialize_by_alias
+            )
             post_serialize = self.get_declared_hook(__POST_SERIALIZE__)
             if self.encoder is not None:
                 if self.encoder_kwargs:
@@ -1024,6 +1035,43 @@ class CodeBuilder:
                 )
             else:
                 self.add_line(return_statement.format(kwargs))
+
+    def _add_discriminator_tag_pack_line(
+        self,
+        config: type[BaseConfig],
+        field_types: dict[str, typing.Any],
+        serialize_by_alias: bool,
+    ) -> None:
+        # Only a discriminator with explicitly specified per-variant tags
+        # takes over the serialized tag value. Legacy configurations keep
+        # serializing the discriminator field as an ordinary field.
+        discriminator = self.get_discriminator(look_in_parents=True)
+        if (
+            discriminator is None
+            or not discriminator.field
+            or not variant_has_declared_tags(discriminator, self.cls)
+        ):
+            return
+        fname = discriminator.field
+        metadata = self.metadatas.get(fname, {})
+        aliases = self.__get_field_aliases(
+            fname, field_types.get(fname), metadata, config
+        )
+        if serialize_by_alias and aliases:
+            key = aliases[0]
+        else:
+            key = fname
+        discr_global = f"discriminator_obj_{uuid.uuid4().hex}"
+        self.ensure_object_imported(
+            discriminator, discr_global
+        )
+        self.ensure_object_imported(
+            get_variant_primary_tag, "get_variant_primary_tag"
+        )
+        self.add_line(
+            f"kwargs[{key!r}] = get_variant_primary_tag("
+            f"{discr_global}, self.__class__)"
+        )
 
     def _pack_method_set_value(
         self,

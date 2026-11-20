@@ -22,6 +22,7 @@ from typing_extensions import Buffer, NotRequired, TypeForm
 
 from mashumaro.core.const import PY_311_MIN
 from mashumaro.core.meta.code.lines import CodeLines
+from mashumaro.core.meta.discriminator import get_variant_primary_tag
 from mashumaro.core.meta.helpers import (
     get_args,
     get_class_that_defines_method,
@@ -76,6 +77,7 @@ from mashumaro.exceptions import (
 )
 from mashumaro.helper import pass_through
 from mashumaro.types import (
+    Discriminator,
     GenericSerializableType,
     SerializableType,
     SerializationStrategy,
@@ -418,6 +420,66 @@ def pack_union(
         return f"{method_name}({method_args})"
 
 
+def pack_discriminated_union(
+    spec: ValueSpec,
+    args: tuple[TypeForm, ...],
+    discriminator: Discriminator,
+) -> Expression:
+    # Build the ordinary union packer against a local "value" binding so
+    # the generated call can be reused inside the wrapper below instead of
+    # referencing the outer field expression (e.g. "self.<field>").
+    inner_spec = spec.copy(
+        expression="value",
+        field_ctx=spec.field_ctx.copy(packer=None),
+    )
+    base_expr = pack_union(inner_spec, args)
+    if base_expr == "value":
+        return spec.expression
+
+    lines = CodeLines()
+    method_name = (
+        f"__pack_discriminated_{spec.builder.cls.__name__}_"
+        f"{spec.field_ctx.name}__{random_hex()}"
+    )
+    method_args = "self, value" if spec.builder.is_nailed else "value"
+    default_kwargs = spec.builder.get_pack_method_default_flag_values()
+    if default_kwargs:
+        lines.append(f"def {method_name}({method_args}, {default_kwargs}):")
+    else:
+        lines.append(f"def {method_name}({method_args}):")
+    with lines.indent():
+        lines.append(f"packed = {base_expr}")
+        discr_global = f"discriminator_obj_{random_hex()}"
+        lines.append(
+            f"packed[{discriminator.field!r}] = get_variant_primary_tag("
+            f"{discr_global}, value.__class__)"
+        )
+        lines.append("return packed")
+    lines.append(
+        f"setattr({spec.cls_attrs_name}, '{method_name}', {method_name})"
+    )
+    spec.builder.ensure_object_imported(
+        discriminator, discr_global
+    )
+    spec.builder.ensure_object_imported(
+        get_variant_primary_tag, "get_variant_primary_tag"
+    )
+    if spec.builder.get_config().debug:
+        print(f"{type_name(spec.builder.cls)}:")
+        print(lines.as_text())
+    exec(lines.as_text(), spec.builder.globals, spec.builder.__dict__)
+
+    call_args = ", ".join(
+        filter(None, (spec.expression, spec.builder.get_pack_method_flags()))
+    )
+    if spec.builder.is_nailed:
+        return f"{spec.self_attrs_name}.{method_name}({call_args})"
+    spec.builder.ensure_object_imported(
+        getattr(spec.attrs, method_name), method_name
+    )
+    return f"{method_name}({call_args})"
+
+
 def pack_literal(spec: ValueSpec) -> Expression:
     spec.builder.add_type_modules(spec.type)
     lines = CodeLines()
@@ -491,6 +553,20 @@ def pack_special_typing_primitive(spec: ValueSpec) -> Expression | None:
                 pv = PackerRegistry.get(spec.copy(type=arg))
                 return expr_or_maybe_none(spec, pv)
             else:
+                discriminator = next(
+                    (
+                        ann
+                        for ann in spec.annotations
+                        if isinstance(ann, Discriminator)
+                        and ann.variant_tags is not None
+                        and ann.field
+                    ),
+                    None,
+                )
+                if discriminator is not None:
+                    return pack_discriminated_union(
+                        spec, get_args(spec.type), discriminator
+                    )
                 return pack_union(spec, get_args(spec.type))
         elif spec.origin_type is typing.AnyStr:
             raise UnserializableDataError(

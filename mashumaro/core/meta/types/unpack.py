@@ -35,6 +35,7 @@ from typing_extensions import Buffer, NotRequired, TypeForm
 from mashumaro.core.const import PY_311_MIN
 from mashumaro.core.helpers import parse_timezone
 from mashumaro.core.meta.code.lines import CodeLines
+from mashumaro.core.meta.discriminator import build_variant_tags_map
 from mashumaro.core.meta.helpers import (
     get_args,
     get_class_that_defines_method,
@@ -410,13 +411,6 @@ class DiscriminatedUnionUnpackerBuilder(AbstractUnpackerBuilder):
                 setattr(variants_attr_holder, unpackers_attr, {})
             lines.append(f"unpackers = {self._get_unpackers_map(spec)}")
             unpacker_call = self._get_variant_method_call("unpacker", spec)
-        if discriminator.variant_tagger_fn:
-            spec.builder.ensure_object_imported(
-                discriminator.variant_tagger_fn, "variant_tagger_fn"
-            )
-            variant_tagger_expr = "variant_tagger_fn(variant)"
-        else:
-            variant_tagger_expr = f"variant.__dict__['{discriminator.field}']"
 
         if spec.builder.dialect:
             spec.builder.ensure_object_imported(
@@ -429,6 +423,13 @@ class DiscriminatedUnionUnpackerBuilder(AbstractUnpackerBuilder):
             )
 
         if discriminator.field:
+            discr_global = f"discriminator_obj_{random_hex()}"
+            spec.builder.ensure_object_imported(
+                build_variant_tags_map, "build_variant_tags_map"
+            )
+            spec.builder.ensure_object_imported(
+                discriminator, discr_global
+            )
             chosen_cls = f"{variants_map}[discriminator]"
             with lines.indent("try:"):
                 lines.append(f"discriminator = value['{discriminator.field}']")
@@ -446,19 +447,15 @@ class DiscriminatedUnionUnpackerBuilder(AbstractUnpackerBuilder):
                         f"[{chosen_cls}].{variant_method_call}"
                     )
             with lines.indent("except (KeyError, AttributeError):"):
-                lines.append(f"variants_map = {variants_map}")
+                # The whole tag -> variant map is built before any variant
+                # is selected, so a duplicated tag is reported even when the
+                # payload itself does not carry the colliding tag.
+                lines.append(
+                    f"variants_map = build_variant_tags_map("
+                    f"{discr_global}, {variants})"
+                )
+                lines.append(f"{variants_map}.update(variants_map)")
                 with lines.indent(f"for variant in {variants}:"):
-                    if discriminator.variant_tagger_fn is not None:
-                        self._add_register_variant_tags(
-                            lines, variant_tagger_expr
-                        )
-                    else:
-                        with lines.indent("try:"):
-                            self._add_register_variant_tags(
-                                lines, variant_tagger_expr
-                            )
-                        with lines.indent("except KeyError:"):
-                            lines.append("continue")
                     self._add_build_variant_unpacker(
                         spec, lines, variant_method_name, variant_method_call
                     )
@@ -573,19 +570,6 @@ class DiscriminatedUnionUnpackerBuilder(AbstractUnpackerBuilder):
                 "default_dialect=_default_dialect)"
                 ".add_unpack_method()"
             )
-
-    def _add_register_variant_tags(
-        self, lines: CodeLines, variant_tagger_expr: str
-    ) -> None:
-        if self.discriminator.variant_tagger_fn:
-            lines.append(f"variant_tags = {variant_tagger_expr}")
-            with lines.indent("if type(variant_tags) is list:"):
-                with lines.indent("for varint_tag in variant_tags:"):
-                    lines.append("variants_map[varint_tag] = variant")
-            with lines.indent("else:"):
-                lines.append("variants_map[variant_tags] = variant")
-        else:
-            lines.append(f"variants_map[{variant_tagger_expr}] = variant")
 
 
 class SubtypeUnpackerBuilder(DiscriminatedUnionUnpackerBuilder):

@@ -15,6 +15,7 @@ group: Advanced
 | `include_subtypes` | `False` | Include descendants of annotated/configured classes |
 | `include_supertypes` | `False` | Include the listed/annotated classes as fallback variants |
 | `variant_tagger_fn` | `None` | Compute one tag or a list of tags from a variant class |
+| `variant_tags` | `None` | Per-variant accepted input tags; the first one is also the tag written back on serialization |
 
 At least one of `include_subtypes` or `include_supertypes` must be true. Otherwise construction raises `ValueError`.
 
@@ -337,14 +338,76 @@ def compatible_tags(cls):
 
 Keep tag generation deterministic and collision-free. A tagger maps classes to accepted input tags; it does not automatically inject a missing tag into serialized output. Add a field, hook, or explicit strategy when output must contain it.
 
+## Migrating tags with `variant_tags`
+
+`variant_tags` declares, per variant, every tag accepted on input and the single tag written back on output. It needs a tagged discriminator (`field` set). Map each variant to a list or tuple of tags: the first tag is the current tag emitted on serialization, while the remaining tags are legacy aliases accepted only on input.
+
+Keys may be variant classes or, inside a base class `Config` where subclasses do not exist yet, their names as strings:
+
+```python
+from dataclasses import dataclass
+from typing import Annotated, Literal, Union
+
+from mashumaro import DataClassDictMixin
+from mashumaro.config import BaseConfig
+from mashumaro.types import Discriminator
+
+
+@dataclass
+class Device(DataClassDictMixin):
+    class Config(BaseConfig):
+        discriminator = Discriminator(
+            field="type",
+            include_subtypes=True,
+            variant_tags={
+                # new tag first, legacy tag accepted on input only
+                "Thermo": ("thermo", "thermo-legacy"),
+                "Pressure": ("pressure",),
+            },
+        )
+
+
+@dataclass
+class Thermo(Device):
+    value: int = 0
+    type: Literal["thermo", "thermo-legacy"] = "thermo"
+
+
+@dataclass
+class Pressure(Device):
+    value: int = 0
+    type: Literal["pressure"] = "pressure"
+
+
+# A legacy payload is decoded to Thermo ...
+legacy = Device.from_dict({"type": "thermo-legacy", "value": 7})
+assert isinstance(legacy, Thermo)
+
+# ... but serialization always writes the current tag.
+assert legacy.to_dict() == {"value": 7, "type": "thermo"}
+
+# The written value reads back as the same variant.
+assert isinstance(Device.from_dict(legacy.to_dict()), Thermo)
+```
+
+When a variant keeps a `Literal` tag field, widen that literal to cover every tag the variant accepts, so reading either spelling back stays valid.
+
+Tags are the only evidence used to choose a variant; matching never falls back to field shape. An unknown tag therefore raises `SuitableVariantNotFoundError` even when the rest of the payload matches a variant exactly.
+
+### Independent flows may reuse a spelling
+
+Each discriminator builds its own tag-to-variant map. Two independent data flows can legally use the same tag spelling for different variants; the resolution stays local to each flow. Within a single flow, however, two variants must not declare the same tag. That configuration raises `DuplicatedVariantTagError` before any variant is selected, even for a payload that only carries an unrelated legal tag, and regardless of the order in which the variants are defined.
+
 ## Error behavior
 
 | Situation | Exception |
 |---|---|
 | Configured tag key is missing | `MissingDiscriminatorError` |
 | Tag has no registered variant | `SuitableVariantNotFoundError` |
+| Same tag declared by two variants of one flow | `DuplicatedVariantTagError` |
 | Untagged candidates all fail inside a field | Usually wrapped as `InvalidFieldValue` |
 | Neither subtype nor supertype inclusion enabled | `ValueError` when creating `Discriminator` |
+| `variant_tags` used without a `field`, or with invalid keys/values | `ValueError` when creating `Discriminator` |
 
 Catch these exceptions at an input boundary to produce a stable API error. Their attributes expose the field/tag or variant information; see [Errors and Troubleshooting](#/docs/errors-and-troubleshooting).
 

@@ -66,6 +66,7 @@ Documentation
    signals
    history_diffing
    multiple_dbs
+   exporting_history
    utils
    common_issues
 

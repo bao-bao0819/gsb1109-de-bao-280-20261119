@@ -6,6 +6,9 @@ Unreleased
 
 **New features:**
 
+- Added ``simple_history.export`` with ``CustomerStatusExporter`` for reading
+  logical status changes of a model per calendar month in resumable batches,
+  including a serializable ``(history_date, history_id)`` cursor
 
 **Breaking changes:**
 

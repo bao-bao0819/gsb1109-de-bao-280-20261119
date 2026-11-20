@@ -1082,3 +1082,17 @@ class TestHistoricParticipantToHistoricOrganizationOneToOne(
         related_name="historic_participant",
     )
     history = HistoricalRecords()
+
+
+class Customer(models.Model):
+    class Status(models.TextChoices):
+        ENABLED = "enabled", "enabled"
+        DISABLED = "disabled", "disabled"
+
+    name = models.CharField(max_length=150)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.ENABLED
+    )
+    notes = models.TextField(blank=True, default="")
+
+    history = HistoricalRecords()

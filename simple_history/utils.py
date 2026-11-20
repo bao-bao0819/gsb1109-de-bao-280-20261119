@@ -208,6 +208,14 @@ def bulk_update_with_history(
     :param custom_historical_attrs: Optional dict of field `name`:`value` to specify
         values for custom fields
     :return: The number of model rows updated, not including any history objects
+
+    .. note::
+        When ``fields`` is non-empty, the history records are created from the
+        rows re-fetched from the database after the update (in one batched
+        query), so they reflect the values actually stored - e.g. when fields
+        were updated using ``F()`` expressions, or when the passed-in objects
+        were stale. Objects that no longer exist in the database get no history
+        records.
     """
     history_manager = get_history_manager_for_model(model)
     model_manager = manager or model._default_manager
@@ -220,12 +228,14 @@ def bulk_update_with_history(
             # records - e.g. with `custom_historical_attrs` provided
             # (Calling `bulk_update()` with no fields would have raised an error)
             rows_updated = 0
+            updated_objs = list(objs)
         else:
             rows_updated = model_manager.bulk_update(
                 objs, fields, batch_size=batch_size
             )
+            updated_objs = _refetch_updated_objects(model_manager, objs)
         history_manager.bulk_history_create(
-            objs,
+            updated_objs,
             batch_size=batch_size,
             update=True,
             default_user=default_user,
@@ -234,6 +244,33 @@ def bulk_update_with_history(
             custom_historical_attrs=custom_historical_attrs,
         )
     return rows_updated
+
+
+def _refetch_updated_objects(model_manager, objs):
+    """
+    Re-fetch the objects in ``objs`` from the database in one batched query, so
+    that history records reflect the values actually stored there - e.g. when
+    fields were updated using ``F()`` expressions, or when the passed-in objects
+    were stale. Objects that no longer exist in the database are skipped.
+    Any per-object history attributes (``_history_user``, ``_history_date``,
+    ``_change_reason``) set on the passed-in objects are carried over to the
+    re-fetched objects.
+    """
+    objs_by_pk = {obj.pk: obj for obj in objs}
+    updated_objs = []
+    for db_obj in model_manager.filter(pk__in=list(objs_by_pk)):
+        original_obj = objs_by_pk[db_obj.pk]
+        for attr in ("_history_user", "_history_date", "_change_reason"):
+            if hasattr(original_obj, attr):
+                try:
+                    setattr(db_obj, attr, getattr(original_obj, attr))
+                except AttributeError:
+                    # Read-only property on the model class (e.g. a
+                    # ``_history_date`` derived from a model field) - the
+                    # re-fetched object already computes it from the DB values
+                    pass
+        updated_objs.append(db_obj)
+    return updated_objs
 
 
 def get_change_reason_from_object(obj):

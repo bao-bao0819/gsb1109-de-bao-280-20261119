@@ -97,6 +97,11 @@ Bulk update was introduced with Django 2.2. We can use the utility function
     >>> Poll.objects.first().question
     'Duplicate Question``
 
+Note that the history records are created from the rows re-fetched from the
+database after the update, so they reflect the values actually stored - e.g.
+when fields were updated using ``F()`` expressions. Objects that no longer
+exist in the database get no history records.
+
 If your models require the use of an alternative model manager (usually because the
 default manager returns a filtered set), you can specify which manager to use with the
 ``manager`` argument:

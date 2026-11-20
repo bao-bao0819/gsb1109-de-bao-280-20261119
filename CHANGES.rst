@@ -12,6 +12,12 @@ Unreleased
 
 **Bug fixes:**
 
+- ``bulk_update_with_history`` now re-fetches the updated rows from the database
+  (in one batched query) before creating history records, so the history reflects
+  the values actually stored - e.g. when fields were updated using ``F()``
+  expressions, or when the passed-in objects were stale. Objects that no longer
+  exist in the database no longer get history records
+
 
 **Other changes:**
 

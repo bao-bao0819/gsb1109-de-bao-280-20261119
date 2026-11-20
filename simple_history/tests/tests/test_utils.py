@@ -6,12 +6,14 @@ from unittest.mock import Mock, patch
 import django
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
+from django.db.models import F
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from simple_history.exceptions import AlternativeManagerError, NotHistoricalModelError
 from simple_history.tests.models import (
     BulkCreateManyToManyModel,
+    Choice,
     Document,
     Place,
     Poll,
@@ -465,8 +467,10 @@ class BulkUpdateWithHistoryTestCase(TestCase):
             )
         )
 
-    def test_bulk_update_history_num_queries_is_two(self):
-        with self.assertNumQueries(2):
+    def test_bulk_update_history_num_queries(self):
+        # One UPDATE, one SELECT re-fetching the updated rows for the history,
+        # and one INSERT into the historical table
+        with self.assertNumQueries(3):
             bulk_update_with_history(
                 self.data,
                 Poll,
@@ -486,7 +490,9 @@ class BulkUpdateWithHistoryTestCase(TestCase):
             bulk_update_with_history(self.data, Place, fields=["name"])
 
     def test_num_queries_when_batch_size_is_less_than_total(self):
-        with self.assertNumQueries(6):
+        # Three batched UPDATEs, one SELECT re-fetching the updated rows,
+        # and three batched INSERTs into the historical table
+        with self.assertNumQueries(7):
             bulk_update_with_history(self.data, Poll, fields=["question"], batch_size=2)
 
     def test_bulk_update_history_with_batch_size(self):
@@ -502,6 +508,110 @@ class BulkUpdateWithHistoryTestCase(TestCase):
             fields=["question"],
         )
         self.assertEqual(rows_updated, 5)
+
+
+class BulkUpdateWithHistoryDatabaseStateTestCase(TestCase):
+    """
+    The history records written by ``bulk_update_with_history`` must reflect
+    the rows as actually stored in the database, not the (possibly stale)
+    Python objects that were passed in.
+    """
+
+    def setUp(self):
+        self.poll = Poll.objects.create(
+            id=1, question="Question 1", pub_date=timezone.now()
+        )
+        self.data = [
+            Choice(id=1, poll=self.poll, choice="Choice 1", votes=10),
+            Choice(id=2, poll=self.poll, choice="Choice 2", votes=20),
+        ]
+        bulk_create_with_history(self.data, Choice)
+
+    def test_history_reflects_f_expression_result(self):
+        for obj in self.data:
+            obj.votes = F("votes") + 5
+
+        rows_updated = bulk_update_with_history(
+            self.data,
+            Choice,
+            fields=["votes"],
+            default_change_reason="votes import",
+        )
+
+        self.assertEqual(rows_updated, 2)
+        self.assertEqual(Choice.objects.get(id=1).votes, 15)
+        self.assertEqual(Choice.objects.get(id=2).votes, 25)
+        updates = Choice.history.filter(history_type="~")
+        self.assertEqual(updates.count(), 2)
+        record = updates.get(id=1)
+        self.assertEqual(record.votes, 15)
+        self.assertEqual(record.choice, "Choice 1")
+        self.assertEqual(record.history_change_reason, "votes import")
+
+    def test_history_uses_committed_db_values_not_stale_objects(self):
+        # Changed in another, committed transaction after the importer
+        # fetched its objects
+        Choice.objects.filter(id=1).update(choice="Committed choice")
+        # Stale, uncommitted change on the importer's object
+        self.data[0].choice = "Uncommitted choice"
+        for obj in self.data:
+            obj.votes = F("votes") + 5
+
+        bulk_update_with_history(self.data, Choice, fields=["votes"])
+
+        record = Choice.history.get(id=1, history_type="~")
+        self.assertEqual(record.choice, "Committed choice")
+        self.assertEqual(record.votes, 15)
+
+    def test_no_history_for_objects_deleted_before_update(self):
+        Choice.objects.filter(id=2).delete()
+        for obj in self.data:
+            obj.votes = F("votes") + 5
+
+        rows_updated = bulk_update_with_history(self.data, Choice, fields=["votes"])
+
+        self.assertEqual(rows_updated, 1)
+        updates = Choice.history.filter(history_type="~")
+        self.assertEqual(updates.count(), 1)
+        self.assertEqual(updates.get().id, 1)
+
+    def test_per_object_history_attributes_survive_refetch(self):
+        user = User.objects.create_user("importer", "importer@example.com")
+        self.data[0]._history_user = user
+        self.data[0]._change_reason = "object-level reason"
+        for obj in self.data:
+            obj.votes = F("votes") + 5
+
+        bulk_update_with_history(
+            self.data,
+            Choice,
+            fields=["votes"],
+            default_change_reason="import reason",
+        )
+
+        record = Choice.history.get(id=1, history_type="~")
+        self.assertEqual(record.history_user, user)
+        self.assertEqual(record.history_change_reason, "object-level reason")
+        other_record = Choice.history.get(id=2, history_type="~")
+        self.assertEqual(other_record.history_change_reason, "import reason")
+
+
+class BulkUpdateWithHistoryTransactionTestCase(TransactionTestCase):
+    @patch(
+        "simple_history.manager.HistoryManager.bulk_history_create",
+        Mock(side_effect=Exception),
+    )
+    def test_transaction_rolls_back_if_bulk_history_create_fails(self):
+        poll = Poll.objects.create(
+            id=1, question="Question 1", pub_date=timezone.now()
+        )
+        poll.question = "Updated question"
+
+        with self.assertRaises(Exception):
+            bulk_update_with_history([poll], Poll, fields=["question"])
+
+        self.assertEqual(Poll.objects.get(id=1).question, "Question 1")
+        self.assertEqual(Poll.history.filter(history_type="~").count(), 0)
 
 
 class BulkUpdateWithHistoryAlternativeManagersTestCase(TestCase):
@@ -542,9 +652,11 @@ class BulkUpdateWithHistoryAlternativeManagersTestCase(TestCase):
             PollWithAlternativeManager.all_objects.get(id=4).question,
             "Updated question",
         )
-        self.assertEqual(PollWithAlternativeManager.history.count(), 10)
+        # The default manager excludes id=1, so that row is neither updated
+        # nor given a history record
+        self.assertEqual(PollWithAlternativeManager.history.count(), 9)
         self.assertEqual(
-            PollWithAlternativeManager.history.filter(history_type="~").count(), 5
+            PollWithAlternativeManager.history.filter(history_type="~").count(), 4
         )
 
     def test_bulk_update_history_other_manager(self):

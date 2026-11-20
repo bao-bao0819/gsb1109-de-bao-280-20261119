@@ -1,0 +1,95 @@
+
+==============================================================================
+STAGE A | lossy grouping: group_by='id' only, ignore_order=True
+==============================================================================
+Business key is (supplier, id), but grouping uses id alone.
+Source t1: [{'supplier': 'A', 'id': 7, 'desc': 'bolt M8 short'}, {'supplier': 'B', 'id': 7, 'desc': 'gasket blue'}, {'supplier': 'A', 'id': 8, 'desc': 'washer flat 10mm zinc'}]
+Grouped t1 (id -> single row): {7: {'supplier': 'B', 'desc': 'gasket blue'}, 8: {'supplier': 'A', 'desc': 'washer flat 10mm zinc'}}
+
+  --- SWAP import order
+  source t2: [{'supplier': 'B', 'id': 7, 'desc': 'gasket blue'}, {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 long and fully redesigned description'}, {'supplier': 'A', 'id': 8, 'desc': 'washer flat 10mm zinc'}]
+  grouped t2 (id -> single row): {7: {'supplier': 'A', 'desc': 'bolt M8 long and fully redesigned description'}, 8: {'supplier': 'A', 'desc': 'washer flat 10mm zinc'}}
+  cutoff_distance_for_pairs=1.0  -> {'values_changed': ["root[7]['desc']", "root[7]['supplier']"]}
+  cutoff_distance_for_pairs=0.3  -> {'values_changed': ["root[7]['desc']", "root[7]['supplier']"]}
+  cutoff_distance_for_pairs=0.05 -> {'values_changed': ["root[7]['desc']", "root[7]['supplier']"]}
+  cutoff_distance_for_pairs=0.0  -> {'values_changed': ["root[7]['desc']", "root[7]['supplier']"]}
+
+  --- ORIG import order
+  source t2: [{'supplier': 'A', 'id': 7, 'desc': 'bolt M8 long and fully redesigned description'}, {'supplier': 'B', 'id': 7, 'desc': 'gasket blue'}, {'supplier': 'A', 'id': 8, 'desc': 'washer flat 10mm zinc'}]
+  grouped t2 (id -> single row): {7: {'supplier': 'B', 'desc': 'gasket blue'}, 8: {'supplier': 'A', 'desc': 'washer flat 10mm zinc'}}
+  cutoff_distance_for_pairs=1.0  -> {}
+  cutoff_distance_for_pairs=0.3  -> {}
+  cutoff_distance_for_pairs=0.05 -> {}
+  cutoff_distance_for_pairs=0.0  -> {}
+
+  Observation: the A-7 record never reaches pairing under either
+  order. cutoff_distance_for_pairs has no effect because the grouped
+  structure is a dict keyed by id, aligned directly by key.
+
+==============================================================================
+STAGE B | faithful grouping: group_by=(supplier,id), all rows retained
+==============================================================================
+Grouped t1: {('A', 7): [{'supplier': 'A', 'id': 7, 'desc': 'bolt M8 short'}], ('B', 7): [{'supplier': 'B', 'id': 7, 'desc': 'gasket blue'}], ('A', 8): [{'supplier': 'A', 'id': 8, 'desc': 'washer flat 10mm zinc'}]}
+Grouped t2: {('B', 7): [{'supplier': 'B', 'id': 7, 'desc': 'gasket blue'}], ('A', 7): [{'supplier': 'A', 'id': 7, 'desc': 'bolt M8 long and fully redesigned description'}], ('A', 8): [{'supplier': 'A', 'id': 8, 'desc': 'washer flat 10mm zinc'}]}
+
+  cutoff_distance_for_pairs=1.0
+    pairs formed: 0
+    candidate distance 0.0714 | t1 {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 short'} | t2 {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 long and fully redesigned description'}
+    pairs formed: 1
+    pairs formed: 0
+  final report: {'values_changed': ["root['A'][7][0]['desc']"]}
+
+  cutoff_distance_for_pairs=0.3
+    pairs formed: 0
+    candidate distance 0.0714 | t1 {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 short'} | t2 {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 long and fully redesigned description'}
+    pairs formed: 1
+    pairs formed: 0
+  final report: {'values_changed': ["root['A'][7][0]['desc']"]}
+
+  cutoff_distance_for_pairs=0.05
+    pairs formed: 0
+    candidate distance 0.0714 | t1 {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 short'} | t2 {'supplier': 'A', 'id': 7, 'desc': 'bolt M8 long and fully redesigned description'}
+    pairs formed: 0
+    pairs formed: 0
+  final report: {'values_changed': ["root['A'][7][0]"]}
+
+  Observation: both A-7 rows stay in the candidate set at every
+  cutoff. At 0.05 the distance (0.0714) exceeds the threshold, the
+  pair is not formed, yet no record was overwritten: this is the
+  'still a candidate, rejected by distance' path, distinct from A.
+
+==============================================================================
+STAGE C | controls: identity change vs near-identical description
+==============================================================================
+  id 8 -> 9, description identical:
+    candidate distance 0.0714 | pairs formed 1
+  final report: {'values_changed': ["root[0]['id']"]}
+  id unchanged, one word added to description:
+    candidate distance 0.0714 | pairs formed 1
+  final report: {'values_changed': ["root[0]['desc']"]}
+
+  Same id change embedded among several business groups:
+  final report: {'dictionary_item_added': ["root['A'][9]"], 'dictionary_item_removed': ["root['A'][8]"]}
+  Observation: a changed business key surfaces as dictionary
+  add/remove of the group itself, while a description edit stays a
+  values_changed inside the surviving group.
+
+==============================================================================
+STAGE D | add/remove reporting, path merge, and intersection gate
+==============================================================================
+  Inner list, heavily rewritten row, tight cutoff (0.05):
+  raw reports before merge: [('values_changed', "root['desc']"), ('values_changed', "root['desc']"), ('iterable_item_added', "root['A'][7][0]"), ('iterable_item_removed', "root['A'][7][0]")]
+  final report: {'values_changed': ["root['A'][7][0]"]}
+  -> same-path add+remove is converted to values_changed by
+     TreeResult.mutual_add_removes_to_become_value_changes().
+
+  Mostly-changed list, default intersection cutoff 0.7:
+  final report: {'values_changed': ["root[0]['desc']", "root[0]['id']"], 'iterable_item_added': ['root[0]'], 'iterable_item_removed': ['root[1]']}
+  Same data, intersection cutoff lowered to 0.5 (pairing skipped):
+  final report: {'values_changed': ['root[0]', 'root[1]']}
+  -> distinct index paths keep iterable_item_added/removed visible;
+     the gate decides whether pairing runs at all.
+
+==============================================================================
+END | fixed snapshots only; no algorithm or threshold was changed
+==============================================================================

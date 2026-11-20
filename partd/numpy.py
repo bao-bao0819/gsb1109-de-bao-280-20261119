@@ -66,8 +66,8 @@ class Numpy(Interface):
         keys2 = [suffix(key, '.dtype') for key in keys]
         self.partd.delete(keys2, **kwargs)
 
-    def _iset(self, key, value):
-        return self.partd._iset(key, value)
+    def _iset(self, key, value, **kwargs):
+        return self.partd._iset(key, value, **kwargs)
 
     def drop(self):
         return self.partd.drop()

@@ -62,6 +62,25 @@ class File(Interface):
                 self.lock.release()
         return result
 
+    def _get_range(self, key, offset, nbytes, lock=True, **kwargs):
+        """ Read ``nbytes`` starting at absolute byte ``offset``.
+
+        Only the requested slice is touched on disk; the rest of the
+        append-only file is never read.
+        """
+        if lock:
+            self.lock.acquire()
+        try:
+            try:
+                with open(self.filename(key), 'rb') as f:
+                    f.seek(offset)
+                    return f.read(nbytes)
+            except OSError:
+                return b''
+        finally:
+            if lock:
+                self.lock.release()
+
     def _iset(self, key, value, lock=True):
         """ Idempotent set """
         fn = self.filename(key)

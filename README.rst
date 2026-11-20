@@ -74,6 +74,39 @@ consistently.  This can be done with a server
         >>> p = Client('ipc://server')  # Client machine talks to remote server
 
 
+Positional range reads
+----------------------
+
+``PandasColumns`` can read a window of rows without scanning earlier,
+non-overlapping appends.  Each append records the byte range of the index and
+of every column in a per-key block manifest, so a read seeks directly to the
+blocks and columns it needs:
+
+.. code-block:: python
+
+    p = PandasColumns('/path/to/dataset/')
+    p.append({'x': df1})
+    p.append({'x': df2})
+
+    p.get('x', range=slice(10, 20), columns=['a', 'b'])
+
+Ranges are *row positions* (``DataFrame.iloc`` semantics), never labels, so
+duplicated or unsorted indexes behave exactly like a positional slice of the
+full result:
+
+.. code-block:: python
+
+    p.get_range('x', start=10, stop=20, columns=['a'])
+
+Index names and duplicated index values are preserved per position.
+
+The manifest is published only after all of a block's bytes are written, so a
+reader sees whole committed blocks only and bytes left by a write that has not
+finished are ignored.  Directories written by an older partd have no manifest;
+those fall back to reading the complete arrays (and set
+``last_read_fallback``), as do non-file backends such as ``Dict`` and
+``Buffer``.  ``get`` without a range keeps its original behaviour.
+
 Encodings and Compression
 -------------------------
 

@@ -2,6 +2,7 @@ import datetime
 
 from peewee import *
 from playhouse.sqlite_changelog import ChangeLog
+from playhouse.sqlite_changelog import COMPOSITE_KEY
 
 from .base import ModelTestCase
 from .base import TestModel
@@ -33,6 +34,20 @@ class CT1(TestModel):
 
 class CT2(TestModel):
     data = JSONField()  # Diff of json?
+
+
+class Bin(TestModel):
+    zone = TextField()
+    slot = TextField()
+    qty = IntegerField(default=0)
+
+    class Meta:
+        primary_key = CompositeKey('zone', 'slot')
+
+
+class Legacy(TestModel):
+    name = TextField()
+    value = IntegerField(default=0)
 
 
 changelog = ChangeLog(database)
@@ -180,3 +195,261 @@ class TestChangeLog(ModelTestCase):
         ca.delete_instance()
         self.assertChanges([
             ('DELETE', 'ct2', {'data': [{'k1': 'v1-x'}, None]})])
+
+
+class TestChangeLogCompositeKey(ModelTestCase):
+    database = database
+    requires = [Bin, Legacy]
+
+    def setUp(self):
+        super(TestChangeLogCompositeKey, self).setUp()
+        changelog.install(Bin)
+        changelog.install(Legacy)
+
+    def raw(self):
+        return list(changelog.model.select().order_by(changelog.model.id))
+
+    def test_primary_key_columns(self):
+        rows = self.raw()
+        self.assertEqual(rows, [])
+
+        b = Bin.create(zone='A', slot='B', qty=1)
+        row, = self.raw()
+        self.assertEqual(row.primary_key, None)
+        self.assertEqual(row.primary_key_type, COMPOSITE_KEY)
+        self.assertEqual(row.primary_key_old, None)
+        self.assertEqual(row.primary_key_new, ['A', 'B'])
+        # Key columns are carried by the ordered key arrays, not duplicated
+        # as ordinary field changes.
+        self.assertEqual(row.changes, {'qty': [None, 1]})
+
+    def test_key_only_update(self):
+        b = Bin.create(zone='A', slot='B', qty=1)
+        # Change one key column only, leaving the ordinary field untouched.
+        (Bin.update(zone='Z')
+         .where((Bin.zone == 'A') & (Bin.slot == 'B'))
+         .execute())
+
+        insert, update = self.raw()
+        self.assertEqual(update.action, 'UPDATE')
+        # No ordinary field changed, but the ordered key arrays still describe
+        # the move.
+        self.assertEqual(update.changes, {})
+        self.assertEqual(update.primary_key_old, ['A', 'B'])
+        self.assertEqual(update.primary_key_new, ['Z', 'B'])
+
+    def test_same_name_after_concatenation(self):
+        # ('A', 'BC') and ('AB', 'C') collide as 'ABC' when joined naively.
+        a = Bin.create(zone='A', slot='BC', qty=1)
+        b = Bin.create(zone='AB', slot='C', qty=2)
+        self.assertEqual(Bin.select().count(), 2)
+
+        events = list(changelog.events())
+        self.assertEqual([e.new_key for e in events],
+                         [('A', 'BC'), ('AB', 'C')])
+
+        (Bin.update(zone='Z').where(
+            (Bin.zone == 'A') & (Bin.slot == 'BC')).execute())
+        dense = Bin.get((Bin.zone == 'Z') & (Bin.slot == 'BC'))
+        dense.delete_instance()
+        b.delete_instance()
+
+        events = list(changelog.events())
+        self.assertEqual(events[2].old_key, ('A', 'BC'))
+        self.assertEqual(events[2].new_key, ('Z', 'BC'))
+        self.assertEqual(events[3].old_key, ('Z', 'BC'))
+        self.assertEqual(events[4].old_key, ('AB', 'C'))
+        self.assertEqual(Bin.select().count(), 0)
+
+    def test_replay_and_rollback(self):
+        # Two inserts, a key-only update and a delete, in one transaction.
+        with self.database.atomic():
+            a = Bin.create(zone='A', slot='B', qty=1)
+            b = Bin.create(zone='AB', slot='', qty=2)
+            (Bin.update(zone='Z')
+             .where((Bin.zone == 'A') & (Bin.slot == 'B'))
+             .execute())
+            b.delete_instance()
+
+        # Replay the log in order onto an empty view of the table.
+        state = {}
+        for event in changelog.events():
+            if event.action == 'INSERT':
+                state[event.new_key] = dict(event.changes)
+            elif event.action == 'UPDATE':
+                state.pop(event.old_key)
+                state[event.new_key] = dict(event.changes)
+            else:
+                state.pop(event.old_key)
+        self.assertEqual(sorted(state), [('Z', 'B')])
+
+        # A rolled-back key change leaves no events behind.
+        try:
+            with self.database.atomic():
+                (Bin.update(zone='Q')
+                 .where((Bin.zone == 'Z') & (Bin.slot == 'B'))
+                 .execute())
+                raise ValueError('rollback')
+        except ValueError:
+            pass
+
+        self.assertEqual(Bin.get().zone, 'Z')
+        self.assertEqual(len(list(changelog.events())), 4)
+
+    def test_types_preserved(self):
+        class Warehouse(TestModel):
+            zone = CharField()
+            slot = CharField()
+            value = IntegerField(default=0)
+
+            class Meta:
+                database = database
+                primary_key = CompositeKey('zone', 'slot')
+
+        self.database.create_tables([Warehouse])
+        self.addCleanup(self.database.drop_tables, [Warehouse])
+        self.addCleanup(self.database.execute_sql,
+                        changelog.drop_trigger_sql(Warehouse, 'INSERT'))
+        self.addCleanup(self.database.execute_sql,
+                        changelog.drop_trigger_sql(Warehouse, 'UPDATE'))
+        self.addCleanup(self.database.execute_sql,
+                        changelog.drop_trigger_sql(Warehouse, 'DELETE'))
+
+        changelog.install(Warehouse)
+        Warehouse.create(zone='1', slot='0', value=1)
+        event, = list(changelog.events())
+        self.assertEqual(event.new_key, ('1', '0'))
+        self.assertIsInstance(event.new_key[0], str)
+        self.assertIsInstance(event.new_key[1], str)
+
+    def test_mixed_with_legacy_integer_key(self):
+        p = Legacy.create(name='p1', value=1)
+        p.value = 2
+        p.save()
+        p.delete_instance()
+        b = Bin.create(zone='A', slot='B', qty=1)
+
+        events = list(changelog.events())
+        self.assertEqual(events[0].table, 'legacy')
+        self.assertEqual(events[0].new_key, p.id)
+        self.assertIsInstance(events[0].new_key, int)
+        self.assertEqual(events[1].old_key, p.id)
+        self.assertEqual(events[1].new_key, p.id)
+        self.assertEqual(events[2].old_key, p.id)
+        self.assertEqual(events[3].table, 'bin')
+        self.assertEqual(events[3].new_key, ('A', 'B'))
+
+        # The legacy primary_key column keeps its original scalar form for
+        # legacy rows, and is untouched (NULL) for composite rows.
+        rows = self.raw()
+        self.assertEqual(rows[0].primary_key, p.id)
+        self.assertEqual(rows[0].primary_key_type, None)
+        self.assertEqual(rows[0].primary_key_old, None)
+        self.assertEqual(rows[0].primary_key_new, None)
+        self.assertEqual(rows[3].primary_key, None)
+        self.assertEqual(rows[3].primary_key_type, COMPOSITE_KEY)
+
+    def test_upgrade_legacy_changelog_table(self):
+        # Simulate the previous schema: NOT NULL integer primary_key and no
+        # composite columns.
+        db = database
+        db.execute_sql('DROP TABLE changelog')
+        db.execute_sql(
+            'CREATE TABLE changelog ('
+            'id INTEGER NOT NULL PRIMARY KEY, '
+            'timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, '
+            'action TEXT NOT NULL, "table" TEXT NOT NULL, '
+            'primary_key INTEGER NOT NULL, changes TEXT NOT NULL)')
+        db.execute_sql(
+            'INSERT INTO changelog (action, "table", primary_key, changes) '
+            "VALUES ('INSERT', 'legacy', 100, '{\"value\": [null, 1]}')")
+        try:
+            changelog.install(Bin)
+
+            columns = dict((c.name, c)
+                           for c in db.get_columns('changelog'))
+            self.assertTrue(columns['primary_key'].null)
+            self.assertTrue(columns['primary_key_type'].null)
+            self.assertTrue(columns['primary_key_old'].null)
+            self.assertTrue(columns['primary_key_new'].null)
+
+            Bin.create(zone='A', slot='B', qty=1)
+            events = list(changelog.events())
+            # History written before the upgrade is still readable.
+            self.assertEqual(events[0].table, 'legacy')
+            self.assertEqual(events[0].key, 100)
+            self.assertEqual(events[1].new_key, ('A', 'B'))
+        finally:
+            db.execute_sql('DROP TABLE changelog')
+            changelog._changelog_model.create_table()
+
+    def test_batch_consumer(self):
+        # One consumer folds legacy integer keys and composite keys into the
+        # same batch -- no need to move the old history to another database.
+        p = Legacy.create(name='p1', value=1)
+        p.value = 2
+        p.save()
+
+        with self.database.atomic():
+            a = Bin.create(zone='A', slot='B', qty=1)
+            b = Bin.create(zone='AB', slot='', qty=2)
+            (Bin.update(zone='Z')
+             .where((Bin.zone == 'A') & (Bin.slot == 'B'))
+             .execute())
+            b.delete_instance()
+
+        state = {}
+        for event in changelog.events():
+            key = event.new_key if event.action != 'DELETE' else event.old_key
+            # Values are read wholly from the event, never from the live table;
+            # in particular the deleted key is not reconstructed.
+            if event.action == 'INSERT':
+                state[key] = {'table': event.table, 'changes': event.changes}
+            elif event.action == 'UPDATE':
+                state.pop(event.old_key)
+                state[key] = {'table': event.table, 'changes': event.changes}
+            else:
+                del state[key]
+
+        self.assertEqual(list(state), [p.id, ('Z', 'B')])
+        self.assertEqual(state[p.id]['table'], 'legacy')
+        self.assertEqual(state[('Z', 'B')]['table'], 'bin')
+        self.assertEqual(state[('Z', 'B')]['changes'], {})
+
+    def test_key_columns_not_skippable(self):
+        # Passing a key column in skip_fields must not drop it from the key
+        # arrays; the old / new keys remain complete.
+        changelog.install(Bin, skip_fields=['zone'])
+        Bin.create(zone='A', slot='B', qty=1)
+        event, = list(changelog.events())
+        self.assertEqual(event.new_key, ('A', 'B'))
+
+    def test_source_columns_with_reserved_names(self):
+        class Weird(TestModel):
+            code = TextField()
+            primary_key_type = TextField()
+            primary_key_new = TextField()
+
+            class Meta:
+                database = database
+                primary_key = CompositeKey('code', 'primary_key_type')
+
+        self.database.create_tables([Weird])
+        self.addCleanup(self.database.drop_tables, [Weird])
+        for action in ('INSERT', 'UPDATE', 'DELETE'):
+            self.addCleanup(self.database.execute_sql,
+                            changelog.drop_trigger_sql(Weird, action))
+
+        changelog.install(Weird)
+        Weird.create(code='c1', primary_key_type='t1', primary_key_new='n1')
+        (Weird.update(primary_key_type='t2')
+         .where(Weird.code == 'c1')
+         .execute())
+
+        insert, update = list(changelog.events())
+        self.assertEqual(insert.new_key, ('c1', 't1'))
+        self.assertEqual(insert.changes, {'primary_key_new': [None, 'n1']})
+        self.assertEqual(update.old_key, ('c1', 't1'))
+        self.assertEqual(update.new_key, ('c1', 't2'))
+        self.assertEqual(update.changes, {})
+

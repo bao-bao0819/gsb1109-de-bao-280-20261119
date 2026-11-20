@@ -7,6 +7,14 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* `playhouse.sqlite_changelog` tracks models with a `CompositeKey`. The
+  changelog table gains `primary_key_type`, `primary_key_old` and
+  `primary_key_new` columns; key values are stored as ordered JSON arrays so
+  text containing a separator is preserved exactly, and a key change records
+  both the old and new key in a single update. Existing changelog tables are
+  upgraded in place, legacy integer `primary_key` values keep their original
+  form, and `ChangeLogEvent` / `ChangeLog.events()` let a consumer fold old and
+  new rows into one batch.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.

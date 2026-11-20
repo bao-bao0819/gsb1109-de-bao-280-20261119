@@ -2,6 +2,10 @@
 
 _In development_
 
+- Add `merge_tiles` to combine encoded MVT tiles without decoding geometry, preserving feature order, geometry
+  commands, ids and value representations, and reporting same-named layers that cannot be merged due to conflicting
+  versions or extents
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

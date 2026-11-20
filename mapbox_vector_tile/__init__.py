@@ -1,6 +1,10 @@
 import warnings
 
 from mapbox_vector_tile import decoder, encoder
+from mapbox_vector_tile.merge import MergeReport as MergeReport
+from mapbox_vector_tile.merge import merge_tiles as merge_tiles
+
+__all__ = ["MergeReport", "decoder", "encoder", "merge_tiles"]
 
 
 def decode(tile, per_layer_options=None, default_options=None, **kwargs):

@@ -362,6 +362,40 @@ Here's how you might decode a tile from a file.
 The `decode` function has a `geojson` option which enforces a GeoJson RFC7946 compatible result. Its default value
 is `True`. To enforce the behaviour of versions <2.0.0, please use `geojson=False`.
 
+## Merging encoded tiles
+
+`merge_tiles` combines already-encoded MVT tiles in the provided order without decoding their geometry. Geometry
+command streams, feature ids and the on-the-wire representation of dictionary values are copied verbatim, so
+quantized and previously validated geometry is never re-encoded.
+
+Same-named layers are only merged when their `version` and `extent` match. The merged layer keeps the feature order
+of the inputs, rebuilds the key/value dictionaries and remaps feature tags accordingly. Values that no feature
+references are dropped; identical values that are actually used share one dictionary entry. Importantly, values are
+identified by both their type and their content, so an `int_value` 9 and a `uint_value` 9 remain distinct entries,
+each pointed to by the tags of the features using that representation.
+
+Same-named layers whose `version` or `extent` conflict, or which contain a referenced value whose representation
+cannot be preserved, are refused. The first occurrence is then kept unchanged and the reason is reported; unique
+layers and other compatible layers are still delivered. No layer is ever partially appended.
+
+```python
+  >>> import mapbox_vector_tile
+  >>> merged, report = mapbox_vector_tile.merge_tiles([tile_one, tile_two])
+  >>> report.merged_layers
+  ['roads']
+  >>> report.preserved_layers
+  [(0, 'only_in_first'), (1, 'only_in_second')]
+  >>> [(conflict.name, conflict.reason) for conflict in report.conflicts]
+  [('water', "Layer 'water' cannot be merged: ... extents (2048, 4096).")]
+  >>> mapbox_vector_tile.decode(merged)
+```
+
+The same operation is available from the command line:
+
+```shell
+python -m mapbox_vector_tile.merge tile_one.mvt tile_two.mvt --output-file merged.mvt
+```
+
 ## Use native protobuf library for performance
 
 The c++ implementation of the underlying protobuf library is more performant than the pure python one. Depending on your operating system, you might need to [compile the C++ library](https://github.com/google/protobuf/tree/master/python#c-implementation) or install it.

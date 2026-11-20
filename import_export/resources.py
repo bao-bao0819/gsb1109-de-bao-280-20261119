@@ -649,6 +649,15 @@ class Resource(metaclass=DeclarativeMetaclass):
                 original_value = (
                     [] if original.pk is None else field.get_value(original).all()
                 )
+                if field.m2m_add:
+                    # m2m_add fields are persisted with add(), so the
+                    # effective relation is the union of the persisted and
+                    # imported values: importing a subset of the persisted
+                    # relations changes nothing.
+                    persisted_pks = {v.pk for v in original_value}
+                    instance_value = list(original_value) + [
+                        v for v in instance_value if v.pk not in persisted_pks
+                    ]
             else:
                 instance_value = field.get_value(instance)
                 original_value = field.get_value(original)

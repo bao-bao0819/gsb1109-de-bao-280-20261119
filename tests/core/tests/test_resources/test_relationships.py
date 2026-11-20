@@ -1,3 +1,5 @@
+from unittest import mock
+
 import tablib
 from core.models import Book, Category, Person, Role, UUIDBook, UUIDCategory
 from core.tests.resources import BookResource
@@ -234,3 +236,190 @@ class ManyToManyWidgetDiffTest(TestCase):
         result = book_resource.import_data(dataset, dry_run=False)
         self.assertEqual(result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP)
         self.assertEqual(1, book.categories.count())
+
+
+class HistoricalNameWidget(widgets.ManyToManyWidget):
+    """
+    Resolves historical tag names to the current tag and rejects
+    unknown names instead of silently dropping them.
+    """
+
+    HISTORICAL_NAMES = {"emerald": "green", "lime": "green"}
+
+    def clean(self, value, row=None, **kwargs):
+        if not value:
+            return self.model.objects.none()
+        names = [n.strip() for n in str(value).split(self.separator)]
+        names = [self.HISTORICAL_NAMES.get(n, n) for n in names if n]
+        queryset = self.get_queryset(value, row, **kwargs)
+        lookup = {"%s__in" % self.field: names}
+        known = set(queryset.filter(**lookup).values_list(self.field, flat=True))
+        unknown = sorted({n for n in names if n not in known})
+        if unknown:
+            raise ValueError("unknown tag name(s): %s" % ", ".join(unknown))
+        return queryset.filter(**lookup)
+
+
+class ManyToManySkipUnchangedWriteModesTest(TestCase):
+    """
+    skip_unchanged must agree with the actual write semantics of the two
+    m2m association modes: additive (``m2m_add=True``) and replace (default).
+    """
+
+    def setUp(self):
+        self.blue = Category.objects.create(name="blue")
+        self.green = Category.objects.create(name="green")
+        self.book = Book.objects.create(name="Test Book")
+
+    def make_resource(self, m2m_add):
+        class _BookResource(resources.ModelResource):
+            categories = fields.Field(
+                column_name="categories",
+                attribute="categories",
+                widget=HistoricalNameWidget(Category, field="name"),
+                m2m_add=m2m_add,
+            )
+
+            class Meta:
+                model = Book
+                fields = ("id", "name", "categories")
+                skip_unchanged = True
+
+        return _BookResource()
+
+    def make_dataset(self, categories_value):
+        dataset = tablib.Dataset(headers=["id", "name", "categories"])
+        dataset.append([self.book.id, self.book.name, categories_value])
+        return dataset
+
+    def assert_categories(self, *categories):
+        self.assertEqual(set(categories), set(self.book.categories.all()))
+
+    def test_import_with_duplicate_historical_names(self):
+        # both historical names resolve to 'green', so the row holds
+        # the relations {blue, green} despite repeated / reordered input
+        resource = self.make_resource(m2m_add=False)
+        result = resource.import_data(self.make_dataset("blue,emerald,lime"))
+        self.assertFalse(result.has_errors())
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_UPDATE
+        )
+        self.assert_categories(self.blue, self.green)
+
+        # re-importing the same relations in another order, with
+        # duplicates, changes nothing and is skipped
+        result = resource.import_data(self.make_dataset("lime,blue,emerald,blue"))
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP
+        )
+        self.assert_categories(self.blue, self.green)
+
+    def test_subset_row_additive_skips_replace_updates(self):
+        self.book.categories.set([self.blue, self.green])
+
+        # additive mode: 'blue' is already present, nothing is added
+        additive_resource = self.make_resource(m2m_add=True)
+        result = additive_resource.import_data(self.make_dataset("blue"))
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP
+        )
+        self.assert_categories(self.blue, self.green)
+
+        # replace mode: 'green' is actually removed
+        replace_resource = self.make_resource(m2m_add=False)
+        result = replace_resource.import_data(self.make_dataset("blue"))
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_UPDATE
+        )
+        self.assert_categories(self.blue)
+
+    def test_consecutive_imports_update_then_skip(self):
+        self.book.categories.set([self.blue, self.green])
+        resource = self.make_resource(m2m_add=False)
+
+        first = resource.import_data(self.make_dataset("blue"))
+        self.assertEqual(
+            first.rows[0].import_type, results.RowResult.IMPORT_TYPE_UPDATE
+        )
+        self.assert_categories(self.blue)
+
+        # resending the same row is skipped based on the persisted state
+        second = resource.import_data(self.make_dataset("blue"))
+        self.assertEqual(
+            second.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP
+        )
+        self.assert_categories(self.blue)
+
+    def test_unknown_historical_name_is_reported(self):
+        self.book.categories.set([self.blue, self.green])
+        for m2m_add in (True, False):
+            with self.subTest(m2m_add=m2m_add):
+                resource = self.make_resource(m2m_add=m2m_add)
+                result = resource.import_data(self.make_dataset("blue,mauve"))
+                # the unknown name must be reported, not silently skipped
+                # because the resolved names happen to match the persisted
+                # relations
+                self.assertTrue(result.has_errors())
+                self.assertEqual(
+                    result.rows[0].import_type,
+                    results.RowResult.IMPORT_TYPE_ERROR,
+                )
+                self.assertIn("mauve", str(result.rows[0].errors[0].error))
+                self.assert_categories(self.blue, self.green)
+
+    def test_missing_column_vs_explicit_empty(self):
+        self.book.categories.set([self.blue, self.green])
+
+        # a missing column leaves the relations untouched in both modes
+        for m2m_add in (True, False):
+            with self.subTest(m2m_add=m2m_add):
+                resource = self.make_resource(m2m_add=m2m_add)
+                dataset = tablib.Dataset(headers=["id", "name"])
+                dataset.append([self.book.id, self.book.name])
+                result = resource.import_data(dataset)
+                self.assertEqual(
+                    result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP
+                )
+                self.assert_categories(self.blue, self.green)
+
+        # an explicit empty value clears the relations in replace mode
+        replace_resource = self.make_resource(m2m_add=False)
+        result = replace_resource.import_data(self.make_dataset(""))
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_UPDATE
+        )
+        self.assert_categories()
+
+        # but adds nothing in additive mode
+        self.book.categories.set([self.blue, self.green])
+        additive_resource = self.make_resource(m2m_add=True)
+        result = additive_resource.import_data(self.make_dataset(""))
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP
+        )
+        self.assert_categories(self.blue, self.green)
+
+    def test_skipped_row_does_not_write_relations(self):
+        self.book.categories.set([self.blue, self.green])
+        resource = self.make_resource(m2m_add=True)
+        with mock.patch.object(resource, "save_m2m") as mocked_save_m2m:
+            result = resource.import_data(self.make_dataset("blue"))
+        self.assertEqual(
+            result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP
+        )
+        mocked_save_m2m.assert_not_called()
+
+    def test_dry_run_matches_actual_import(self):
+        for m2m_add, expected in (
+            (True, results.RowResult.IMPORT_TYPE_SKIP),
+            (False, results.RowResult.IMPORT_TYPE_UPDATE),
+        ):
+            with self.subTest(m2m_add=m2m_add):
+                self.book.categories.set([self.blue, self.green])
+                resource = self.make_resource(m2m_add=m2m_add)
+                preview = resource.import_data(self.make_dataset("blue"), dry_run=True)
+                self.assertEqual(preview.rows[0].import_type, expected)
+                # the preview must not persist anything
+                self.assert_categories(self.blue, self.green)
+                actual = resource.import_data(self.make_dataset("blue"), dry_run=False)
+                self.assertEqual(actual.rows[0].import_type, expected)

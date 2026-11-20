@@ -108,6 +108,10 @@ import patsy.design_info
 
 _reexport(patsy.design_info)
 
+import patsy.portable_design_info
+
+_reexport(patsy.portable_design_info)
+
 import patsy.eval
 
 _reexport(patsy.eval)

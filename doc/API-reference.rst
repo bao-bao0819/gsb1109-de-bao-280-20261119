@@ -156,6 +156,39 @@ Design metadata
 
    .. automethod:: __new__
 
+Portable design descriptions
+----------------------------
+
+These functions convert a :class:`DesignInfo` into a self-contained,
+human-readable JSON description, and rebuild an equivalent
+:class:`DesignInfo` in another process -- one that has neither the
+original training data nor any of the training process's local
+variables. The description records column names and ordering, factor
+expressions, categorical levels and their ordering, contrast matrices,
+interaction structure, and the learned state of every built-in
+stateful transform (such as the means used by :func:`center`). Learned
+statistics are reused as-is when processing new data; they are never
+re-estimated from the new batch.
+
+Only formulas built from column names, :func:`Q`, :func:`C`,
+arithmetic, interactions and Patsy's built-in stateful transforms can
+be described. Formulas that call functions or stateful transforms
+defined in the training process are rejected at export time with a
+:class:`PatsyError`, rather than producing a description that would
+fail later in the target process.
+
+.. autofunction:: design_info_to_dict
+
+.. autofunction:: design_info_from_dict
+
+.. autofunction:: design_info_to_json
+
+.. autofunction:: design_info_from_json
+
+.. autofunction:: save_design_info
+
+.. autofunction:: load_design_info
+
 .. _stateful-transforms-list:
 
 Stateful transforms

@@ -855,6 +855,159 @@ POINT (4095 3664), LINESTRING (2889 0, 2912 158, 3757 1700, 3732 1999, 4095 3277
         self.assertEqual(0, len(features))
 
 
+class DropDegenerateTestCase(unittest.TestCase):
+    def setUp(self):
+        self.layer_name = "water"
+        # quantize a 100x100 source extent onto a coarse 16x16 integer grid, so that small rings collapse
+        self.quantize_options = {"quantize_bounds": (0.0, 0.0, 100.0, 100.0), "extents": 16}
+        # a multi-island feature: the first island keeps its shell but its lake collapses to a line, the
+        # second island and its lake are both representable, and the third, narrow island collapses to a
+        # line along with its lake
+        self.islands_geometry = (
+            "MULTIPOLYGON ("
+            "((5 5, 5 35, 35 35, 35 5, 5 5), (14 15, 14 15.4, 18 15.4, 18 15, 14 15)), "
+            "((45 5, 45 35, 75 35, 75 5, 45 5), (52 12, 52 22, 62 22, 62 12, 52 12)), "
+            "((85 5, 85 8, 95 8, 95 5, 85 5), (87 6, 87 7, 93 7, 93 6, 87 6)))"
+        )
+        # a feature whose only island collapses to a line
+        self.collapsed_geometry = "POLYGON ((40 60, 40 62, 60 62, 60 60, 40 60))"
+
+    def source_layers(self):
+        return [
+            {
+                "name": self.layer_name,
+                "features": [
+                    {"geometry": self.islands_geometry, "properties": {"kind": "islands"}, "id": 1},
+                    {"geometry": self.collapsed_geometry, "properties": {"kind": "collapsed"}, "id": 2},
+                ],
+            }
+        ]
+
+    def encode_decode(self, y_coord_down, **encode_options):
+        options = dict(self.quantize_options, y_coord_down=y_coord_down, **encode_options)
+        encoded = encode(self.source_layers(), default_options=options)
+        return decode(encoded, default_options={"y_coord_down": y_coord_down})
+
+    def assert_surviving_islands(self, feature):
+        from shapely.geometry import Polygon
+        from shapely.geometry import shape as shapely_shape
+
+        self.assertEqual(1, feature["id"])
+        self.assertEqual({"kind": "islands"}, feature["properties"])
+
+        geometry = shapely_shape(feature["geometry"])
+        self.assertEqual("MultiPolygon", geometry.geom_type)
+        self.assertEqual(2, len(geometry.geoms))
+
+        # the islands survive in source order; only the second one retains its lake
+        first = Polygon([(1, 1), (1, 6), (6, 6), (6, 1), (1, 1)])
+        second = Polygon(
+            [(7, 1), (7, 6), (12, 6), (12, 1), (7, 1)],
+            [[(8, 2), (8, 4), (10, 4), (10, 2), (8, 2)]],
+        )
+        self.assertTrue(geometry.geoms[0].equals(first))
+        self.assertTrue(geometry.geoms[1].equals(second))
+        self.assertEqual(0, len(geometry.geoms[0].interiors))
+        self.assertEqual(1, len(geometry.geoms[1].interiors))
+
+    def test_drop_degenerate_y_up(self):
+        decoded = self.encode_decode(y_coord_down=False, drop_degenerate=True)
+        features = decoded[self.layer_name]["features"]
+        # the feature whose only island collapsed is omitted entirely
+        self.assertEqual(1, len(features))
+        self.assert_surviving_islands(features[0])
+
+    def test_drop_degenerate_y_down(self):
+        decoded = self.encode_decode(y_coord_down=True, drop_degenerate=True)
+        features = decoded[self.layer_name]["features"]
+        self.assertEqual(1, len(features))
+        self.assert_surviving_islands(features[0])
+
+    def test_drop_degenerate_same_islands_in_both_directions(self):
+        from shapely.geometry import shape as shapely_shape
+
+        up_features = self.encode_decode(y_coord_down=False, drop_degenerate=True)[self.layer_name]["features"]
+        down_features = self.encode_decode(y_coord_down=True, drop_degenerate=True)[self.layer_name]["features"]
+        self.assertEqual(len(up_features), len(down_features))
+        for up_feature, down_feature in zip(up_features, down_features):
+            self.assertEqual(up_feature["id"], down_feature["id"])
+            self.assertTrue(shapely_shape(up_feature["geometry"]).equals(shapely_shape(down_feature["geometry"])))
+
+    def test_drop_degenerate_drops_rings_from_encoded_tile(self):
+        from mapbox_vector_tile.Mapbox import vector_tile_pb2 as vector_tile
+
+        encoded = encode(self.source_layers(), default_options=dict(self.quantize_options, drop_degenerate=True))
+        tile = vector_tile.tile()
+        tile.ParseFromString(encoded)
+        layer = tile.layers[0]
+        # the feature whose only island collapsed is omitted entirely
+        self.assertEqual(1, len(layer.features))
+        feature = layer.features[0]
+        self.assertEqual(1, feature.id)
+        # each encoded ring ends with a close path command (15); only the two surviving shells and the
+        # lake of the second island are emitted, the collapsed rings are not
+        self.assertEqual(3, sum(1 for cmd in feature.geometry if cmd == 15))
+
+    def test_degenerate_rings_kept_by_default(self):
+        from mapbox_vector_tile.Mapbox import vector_tile_pb2 as vector_tile
+
+        encoded = encode(self.source_layers(), default_options=self.quantize_options)
+        tile = vector_tile.tile()
+        tile.ParseFromString(encoded)
+        layer = tile.layers[0]
+        # without drop_degenerate, the collapsed rings are still encoded and no feature is omitted
+        self.assertEqual(2, len(layer.features))
+        self.assertEqual(6, sum(1 for cmd in layer.features[0].geometry if cmd == 15))
+        self.assertEqual(1, sum(1 for cmd in layer.features[1].geometry if cmd == 15))
+
+    def test_drop_degenerate_without_quantize_bounds(self):
+        from shapely.geometry import Polygon
+        from shapely.geometry import shape as shapely_shape
+
+        # the lake rounds to a point on the integer grid
+        geometry = "POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0), (4 4, 4 4.4, 4.4 4.4, 4.4 4, 4 4))"
+        source = [{"name": self.layer_name, "features": [{"geometry": geometry, "properties": {}}]}]
+        encoded = encode(source, default_options={"drop_degenerate": True})
+        decoded = decode(encoded)
+        features = decoded[self.layer_name]["features"]
+        self.assertEqual(1, len(features))
+        geometry = shapely_shape(features[0]["geometry"])
+        self.assertEqual(0, len(geometry.interiors))
+        self.assertTrue(geometry.equals(Polygon([(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)])))
+
+    def test_drop_degenerate_drops_inner_outside_shell(self):
+        from shapely.geometry import Polygon
+        from shapely.geometry import shape as shapely_shape
+
+        # the lake pokes outside its island, so its containment cannot be faithfully represented
+        geometry = "POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0), (8 8, 8 14, 14 14, 14 8, 8 8))"
+        source = [{"name": self.layer_name, "features": [{"geometry": geometry, "properties": {}}]}]
+        encoded = encode(source, default_options={"drop_degenerate": True})
+        decoded = decode(encoded)
+        features = decoded[self.layer_name]["features"]
+        self.assertEqual(1, len(features))
+        geometry = shapely_shape(features[0]["geometry"])
+        self.assertEqual(0, len(geometry.interiors))
+        self.assertTrue(geometry.equals(Polygon([(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)])))
+
+    def test_drop_degenerate_passes_other_geometries_through(self):
+        source = [
+            {
+                "name": self.layer_name,
+                "features": [
+                    {"geometry": "POINT (1 2)", "properties": {}},
+                    {"geometry": "LINESTRING (0 0, 5 5)", "properties": {}},
+                ],
+            }
+        ]
+        encoded = encode(source, default_options={"drop_degenerate": True})
+        decoded = decode(encoded)
+        features = decoded[self.layer_name]["features"]
+        self.assertEqual(2, len(features))
+        self.assertEqual({"type": "Point", "coordinates": [1, 2]}, features[0]["geometry"])
+        self.assertEqual({"type": "LineString", "coordinates": [[0, 0], [5, 5]]}, features[1]["geometry"])
+
+
 class LowLevelEncodingTestCase(unittest.TestCase):
     def test_example_multi_polygon(self):
         from mapbox_vector_tile.encoder import VectorTile
@@ -1099,6 +1252,7 @@ class OptionsTestCase(unittest.TestCase):
             {
                 **layer_options_1,
                 "check_winding_order": True,
+                "drop_degenerate": False,
                 "extents": 42,
                 "max_geometry_validate_tries": 5,
                 "on_invalid_geometry": None,
@@ -1110,6 +1264,7 @@ class OptionsTestCase(unittest.TestCase):
             {
                 **layer_options_2,
                 "check_winding_order": True,
+                "drop_degenerate": False,
                 "extents": 42,
                 "max_geometry_validate_tries": 5,
                 "on_invalid_geometry": None,
@@ -1122,6 +1277,7 @@ class OptionsTestCase(unittest.TestCase):
             {
                 **layer_options_2,
                 "check_winding_order": True,
+                "drop_degenerate": False,
                 "extents": 4096,
                 "max_geometry_validate_tries": 5,
                 "on_invalid_geometry": None,
@@ -1134,6 +1290,7 @@ class OptionsTestCase(unittest.TestCase):
             {
                 **layer_options_1,
                 "check_winding_order": True,
+                "drop_degenerate": False,
                 "extents": 4096,
                 "max_geometry_validate_tries": 5,
                 "on_invalid_geometry": None,

@@ -250,6 +250,33 @@ In this example, the coordinate that would get encoded would be (2048, 2048)
 Additionally, if the data is already in a coordinate system with y values going down, the encoder supports an
 option, `y_coord_down`, that can be set to True. This will suppress flipping the y coordinate values during encoding.
 
+### Dropping degenerate rings
+
+Quantizing to a coarse integer grid can collapse small polygon rings to lines or points. By default these
+degenerate rings are still encoded, which produces zero-area artefacts in the tile. Setting the `drop_degenerate`
+option to `True` drops them before encoding instead: an interior ring which has no area on the integer grid, or
+which is not contained within its quantized shell, is dropped on its own, while an exterior ring which has no
+area on the grid is dropped along with its interior rings. A feature whose parts are all dropped is omitted
+entirely.
+
+```python
+mapbox_vector_tile.encode([
+      {
+        "name": "water",
+        "features": [
+          {
+            "geometry":"POLYGON((0 0, 0 10, 10 10, 10 0, 0 0), (4 4, 4 4.4, 4.4 4.4, 4.4 4, 4 4))",
+            "properties":{
+              "foo":"bar",
+            }
+          }
+        ]
+      }
+    ], default_options={"drop_degenerate": True})
+```
+
+In this example, the interior ring collapses to a line on the integer grid and only the exterior ring is encoded.
+
 ### Custom extents
 
 The encoder also supports passing in custom extents. These will be passed through to the layer in the pbf, and honored during any quantization or y coordinate flipping.

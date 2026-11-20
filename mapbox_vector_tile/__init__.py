@@ -78,6 +78,10 @@ def encode(layers, per_layer_options=None, default_options=None, **kwargs):
             * `check_winding_order`: it forces the check of the winding order for polygons. Default to True.
             * `max_geometry_validate_tries`: the number of tries when trying to enforce the good winding order. Default
             to 5.
+            * `drop_degenerate`: when set to `True`, polygon rings and parts which have no area on the tile's
+            integer grid, or whose containment within their shell cannot be faithfully represented, are dropped
+            before encoding instead of being emitted as degenerate artefacts. A feature whose parts are all
+            dropped is omitted entirely. Default to `False`.
     """
     if kwargs:
         warnings.warn("`encode` signature has changed, use `default_options` instead", DeprecationWarning, stacklevel=2)

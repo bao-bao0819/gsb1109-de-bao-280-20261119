@@ -2,6 +2,10 @@
 
 _In development_
 
+- Add the `drop_degenerate` encode option to drop polygon rings and parts which have no area on the tile's
+  integer grid, or whose containment within their shell cannot be faithfully represented, instead of encoding
+  them as degenerate artefacts. Features whose parts are all dropped are omitted entirely.
+
 ## Version 2.2.0
 
 - Do not install docs into site-packages in binary distributions

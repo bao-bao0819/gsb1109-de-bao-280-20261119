@@ -73,11 +73,70 @@ class VectorTile:
 
             if self.layer_options["quantize_bounds"]:
                 shape = self.quantize(shape)
-            if self.layer_options["check_winding_order"]:
+            if self.layer_options["drop_degenerate"]:
+                shape = self.drop_degenerate(shape)
+            if shape is not None and self.layer_options["check_winding_order"]:
                 shape = self.enforce_winding_order(shape)
 
             if shape is not None and not shape.is_empty:
                 self.add_feature(feature, shape)
+
+    def drop_degenerate(self, shape):
+        """Drop the polygon rings and parts which cannot be faithfully represented on the tile's integer
+        grid, so that they are not emitted as zero-area artefacts which decoders could misinterpret.
+
+        An exterior ring which has no area on the grid is dropped along with its interior rings, as a hole
+        cannot exist without its shell. An interior ring is dropped on its own when it has no area on the
+        grid, or when it is not contained within its quantized shell. A feature whose parts are all dropped
+        is omitted entirely.
+        """
+        if shape.geom_type == "MultiPolygon":
+            parts = []
+            for part in shape.geoms:
+                part = self.drop_degenerate_polygon(part)
+                if part is not None:
+                    parts.append(part)
+
+            if not parts:
+                return None
+
+            return parts[0] if len(parts) == 1 else MultiPolygon(parts)
+
+        elif shape.geom_type == "Polygon":
+            return self.drop_degenerate_polygon(shape)
+
+        # other shapes just get passed through
+        return shape
+
+    def drop_degenerate_polygon(self, shape):
+        assert shape.geom_type == "Polygon"
+
+        exterior = self.round_ring(shape.exterior.coords)
+        if self.ring_area(exterior) < 0.5:
+            return None
+
+        exterior_poly = Polygon(exterior)
+        inners = []
+        for ring in shape.interiors:
+            inner = self.round_ring(ring.coords)
+            if self.ring_area(inner) < 0.5:
+                continue
+            inner_poly = Polygon(inner)
+            if exterior_poly.is_valid and inner_poly.is_valid and not exterior_poly.covers(inner_poly):
+                continue
+            inners.append(inner)
+
+        return Polygon(exterior, inners)
+
+    @staticmethod
+    def round_ring(coords):
+        return [(round(x), round(y)) for x, y in coords]
+
+    @staticmethod
+    def ring_area(coords):
+        # the area of the ring filled as a polygon on the integer grid; the smallest representable ring is
+        # a triangle of height and width 1, which has an area of 0.5.
+        return abs(Polygon(coords).area)
 
     def enforce_winding_order(self, shape, n_try=1):
         if shape.geom_type == "MultiPolygon":

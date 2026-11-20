@@ -1082,3 +1082,12 @@ class TestHistoricParticipantToHistoricOrganizationOneToOne(
         related_name="historic_participant",
     )
     history = HistoricalRecords()
+
+
+class AuditProduct(models.Model):
+    """Product whose price and status changes are exported for audit."""
+
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=32)
+
+    history = HistoricalRecords()

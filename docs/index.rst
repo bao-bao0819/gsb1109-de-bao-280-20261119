@@ -67,6 +67,7 @@ Documentation
    history_diffing
    multiple_dbs
    utils
+   audit
    common_issues
 
 

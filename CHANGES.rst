@@ -6,6 +6,11 @@ Unreleased
 
 **New features:**
 
+- Added opt-in, read-only audit download helpers (``simple_history.audit``)
+  that fold consecutive equal price/status history rows into segments, support
+  boundary-safe sharded exports, corrections and idempotent redelivery without
+  changing the historical table or legacy downloads.
+
 
 **Breaking changes:**
 

@@ -1,7 +1,7 @@
 from unittest import mock
 
 import tablib
-from core.models import Author, Book
+from core.models import Author, Book, Store
 from core.tests.resources import (
     AuthorResource,
     BookResource,
@@ -11,7 +11,7 @@ from core.tests.resources import (
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.test import TestCase
 
-from import_export import exceptions, resources, results
+from import_export import exceptions, fields, resources, results, widgets
 
 
 class ErrorHandlingTest(TestCase):
@@ -174,3 +174,158 @@ class ErrorHandlingTest(TestCase):
         self.assertEqual(
             res.failed_dataset.dict[0], {"id": "1", "Error": "{'__all__': ['fail!']}"}
         )
+
+
+class HookError(Exception):
+    pass
+
+
+class StoreResource(resources.ModelResource):
+    # column names deliberately differ from the model attribute names
+    amount = fields.Field(
+        attribute="amount", column_name="AMT", widget=widgets.DecimalWidget()
+    )
+    start_date = fields.Field(
+        attribute="start_date", column_name="START", widget=widgets.DateWidget()
+    )
+    end_date = fields.Field(
+        attribute="end_date", column_name="END", widget=widgets.DateWidget()
+    )
+
+    class Meta:
+        model = Store
+        clean_model_instances = True
+
+    def before_import_row(self, row, **kwargs):
+        if row.get("name") == "bad-hook":
+            raise HookError("hook failed")
+
+
+class ImportErrorOrganizationTest(TestCase):
+    """
+    A file whose first row has a column which cannot be converted to a
+    decimal, plus a start/end date error which is independently detectable
+    from two other valid fields.  The second row raises a plain error from a
+    resource hook.  Later rows are valid.
+    """
+
+    def setUp(self):
+        self.resource = StoreResource()
+        self.dataset = tablib.Dataset(headers=["name", "AMT", "START", "END"])
+        self.dataset.append(["store-1", "not-a-number", "2026-05-01", "2026-04-01"])
+        self.dataset.append(["bad-hook", "10.00", "2026-01-01", "2026-02-01"])
+        self.dataset.append(["store-3", "20.00", "2026-01-01", "2026-02-01"])
+
+    def test_collect_mode_first_row_reports_both_problems(self):
+        result = self.resource.import_data(
+            self.dataset,
+            raise_errors=False,
+            collect_failed_rows=True,
+            use_transactions=False,
+        )
+        self.assertEqual(
+            results.RowResult.IMPORT_TYPE_INVALID, result.rows[0].import_type
+        )
+        self.assertEqual(1, len(result.invalid_rows))
+        invalid_row = result.invalid_rows[0]
+        self.assertEqual(1, invalid_row.number)
+        # both independently determinable problems are reported,
+        # keyed by model attribute name
+        self.assertEqual(
+            {"amount", "end_date"}, set(invalid_row.field_specific_errors)
+        )
+        self.assertEqual(2, invalid_row.error_count)
+        # values are presented in original (source) column order
+        self.assertEqual(["id", "name", "AMT", "START", "END"], result.diff_headers)
+        self.assertEqual(
+            ("---", "store-1", "not-a-number", "2026-05-01", "2026-04-01"),
+            invalid_row.values,
+        )
+
+    def test_collect_mode_failed_dataset_reports_both_problems(self):
+        result = self.resource.import_data(
+            self.dataset,
+            raise_errors=False,
+            collect_failed_rows=True,
+            use_transactions=False,
+        )
+        self.assertEqual(
+            ["name", "AMT", "START", "END", "Error"], result.failed_dataset.headers
+        )
+        failed = result.failed_dataset.dict
+        self.assertEqual(2, len(failed))
+        self.assertEqual("store-1", failed[0]["name"])
+        self.assertEqual("not-a-number", failed[0]["AMT"])
+        self.assertIn("amount", failed[0]["Error"])
+        self.assertIn("end_date", failed[0]["Error"])
+
+    def test_collect_mode_hook_error_remains_generic_error(self):
+        result = self.resource.import_data(
+            self.dataset,
+            raise_errors=False,
+            collect_failed_rows=True,
+            use_transactions=False,
+        )
+        self.assertEqual(
+            results.RowResult.IMPORT_TYPE_ERROR, result.rows[1].import_type
+        )
+        self.assertEqual(1, len(result.error_rows))
+        error_row = result.error_rows[0]
+        self.assertEqual(2, error_row.number)
+        self.assertEqual(1, len(error_row.errors))
+        error = error_row.errors[0]
+        self.assertIsInstance(error.error, HookError)
+        # the original row is retained on the error
+        self.assertEqual(
+            {
+                "name": "bad-hook",
+                "AMT": "10.00",
+                "START": "2026-01-01",
+                "END": "2026-02-01",
+            },
+            dict(error.row),
+        )
+        failed = result.failed_dataset.dict
+        self.assertEqual("bad-hook", failed[1]["name"])
+        self.assertEqual("hook failed", failed[1]["Error"])
+
+    def test_collect_mode_valid_rows_after_errors_are_saved(self):
+        result = self.resource.import_data(
+            self.dataset,
+            raise_errors=False,
+            collect_failed_rows=True,
+            use_transactions=False,
+        )
+        self.assertEqual(1, result.totals[results.RowResult.IMPORT_TYPE_NEW])
+        self.assertEqual(["store-3"], [s.name for s in Store.objects.all()])
+
+    def test_raise_errors_mode(self):
+        with self.assertRaises(exceptions.ImportError) as cm:
+            self.resource.import_data(
+                self.dataset, raise_errors=True, use_transactions=False
+            )
+        self.assertEqual(1, cm.exception.number)
+        self.assertIsInstance(cm.exception.error, ValidationError)
+        self.assertEqual(
+            {"amount", "end_date"}, set(cm.exception.error.error_dict.keys())
+        )
+        self.assertEqual(0, Store.objects.count())
+
+    def test_rollback_on_validation_errors(self):
+        result = self.resource.import_data(
+            self.dataset,
+            raise_errors=False,
+            use_transactions=True,
+            rollback_on_validation_errors=True,
+        )
+        self.assertTrue(result.has_validation_errors())
+        self.assertEqual(0, Store.objects.count())
+
+    def test_hook_error_rolls_back_when_using_transactions(self):
+        result = self.resource.import_data(
+            self.dataset,
+            raise_errors=False,
+            use_transactions=True,
+        )
+        self.assertTrue(result.has_errors())
+        self.assertEqual(0, Store.objects.count())

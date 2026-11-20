@@ -378,7 +378,7 @@ The ``raise_errors`` parameter can be used during programmatic import to halt th
 
     rows = [
         (1, 'Lord of the Rings', '999'),
-        (2, 'The Hobbit', 'x'),
+        ('x', 'The Hobbit', '10.00'),
     ]
     dataset = tablib.Dataset(*rows, headers=['id', 'name', 'price'])
     resource = BookResource()
@@ -389,8 +389,8 @@ The ``raise_errors`` parameter can be used during programmatic import to halt th
 
 The above process will exit with a row number and error (formatted for clarity)::
 
-  ImportError: 1: [<class 'decimal.ConversionSyntax'>]
-    (OrderedDict({'id': 1, 'name': 'Lord of the Rings', 'price': '1x'}))
+  ImportError: 2: [<class 'decimal.ConversionSyntax'>]
+    (OrderedDict({'id': 'x', 'name': 'The Hobbit', 'price': '10.00'}))
 
 To iterate over all generic errors produced from an import, pass ``False`` to ``raise_errors``::
 

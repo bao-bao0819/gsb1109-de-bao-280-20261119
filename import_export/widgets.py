@@ -4,7 +4,7 @@ import numbers
 import sys
 from collections import defaultdict, namedtuple
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import django
 from django.apps import apps
@@ -320,11 +320,18 @@ class DecimalWidget(NumberWidget):
         :param row: The current row being processed.
         :param **kwargs: Optional keyword arguments.
         :returns: A Python Decimal instance, or None if value is empty.
-        :raises InvalidOperation: If the value cannot be converted to Decimal.
+        :raises ValueError: If the value cannot be converted to Decimal.
+            Raised from the underlying ``decimal.InvalidOperation`` so that the
+            failure is collected as a field level validation error during
+            import (rather than surfacing as a generic row error), which
+            allows any remaining validation of the row to proceed.
         """
         if self.is_empty(value):
             return None
-        return Decimal(force_str(sanitize_separators(value)))
+        try:
+            return Decimal(force_str(sanitize_separators(value)))
+        except InvalidOperation as e:
+            raise ValueError(e) from e
 
 
 class CharWidget(Widget):

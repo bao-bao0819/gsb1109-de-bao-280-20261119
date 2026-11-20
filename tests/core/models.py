@@ -193,3 +193,17 @@ class UUIDBook(models.Model):
 class WithPositiveIntegerFields(models.Model):
     big = models.PositiveBigIntegerField(null=True)
     small = models.PositiveSmallIntegerField(null=True)
+
+
+class Store(models.Model):
+    name = models.CharField(max_length=100)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+
+    def clean(self):
+        super().clean()
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValidationError(
+                {"end_date": "End date must not be before start date."}
+            )

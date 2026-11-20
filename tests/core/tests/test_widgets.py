@@ -649,6 +649,12 @@ class DecimalWidgetTest(TestCase):
         self.assertEqual(self.widget.clean("11.111"), self.value)
         self.assertEqual(self.widget.clean(11.111), self.value)
 
+    def test_clean_invalid_value_raises_valueerror(self):
+        # a failed conversion must surface as a ValueError so that it is
+        # collected as a field level validation error during import
+        with self.assertRaises(ValueError):
+            self.widget.clean("not-a-number")
+
     @override_settings(USE_THOUSAND_SEPARATOR=True)
     def test_clean_numeric_separators(self):
         self.assertEqual(self.widget.clean("1,234.5"), Decimal("1234.5"))

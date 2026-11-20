@@ -1500,6 +1500,15 @@ You can filter the data returned by the table based on column values using a que
 
     This is only available if the ``json1`` SQLite extension is enabled.
 
+``?column__arraycontainsjson=value``
+    Works against columns that contain JSON arrays - matches if any of the values in that array is exactly the provided JSON value, including its type.
+
+    The value must be valid JSON, so the string ``1`` is matched using ``?column__arraycontainsjson="1"`` while the integer ``1`` uses ``?column__arraycontainsjson=1`` and the boolean true uses ``?column__arraycontainsjson=true``. Unlike ``__arraycontains``, values of different JSON types are never conflated.
+
+    Values that are not valid JSON arrays are ignored by this filter, so rows with unparseable values do not cause errors.
+
+    This is only available if the ``json1`` SQLite extension is enabled.
+
 ``?column__date=value``
     Column is a datestamp occurring on the specified YYYY-MM-DD date, e.g. ``2018-01-02``.
 

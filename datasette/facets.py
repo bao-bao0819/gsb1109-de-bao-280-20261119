@@ -4,6 +4,7 @@ import urllib
 
 from datasette import hookimpl
 from datasette.database import QueryInterrupted
+from datasette.filters import _valid_json_array_sql
 from datasette.utils import (
     detect_json1,
     escape_sqlite,
@@ -79,7 +80,7 @@ def load_facet_configs(request, table_config):
 def register_facet_classes():
     classes = [ColumnFacet, DateFacet]
     if detect_json1():
-        classes.append(ArrayFacet)
+        classes.extend([ArrayFacet, TypedArrayFacet])
     return classes
 
 
@@ -495,6 +496,124 @@ class ArrayFacet(Facet):
                 facets_timed_out.append(column)
 
         return facet_results, facets_timed_out
+
+
+class TypedArrayFacet(Facet):
+    # Enabled with ?_facet_array_typed=column. Facets a JSON array column
+    # by the real JSON type of each item, so the string "1", the integer 1
+    # and the boolean true are counted as separate values. Values that are
+    # not valid JSON arrays are treated as unparseable: they contribute no
+    # tags but do not break the counts for other rows. Selections are
+    # applied with the type-aware __arraycontainsjson filter.
+    type = "array_typed"
+
+    async def facet_results(self):
+        facet_results = []
+        facets_timed_out = []
+
+        facet_size = self.get_facet_size()
+        for source_and_config in self.get_configs():
+            config = source_and_config["config"]
+            source = source_and_config["source"]
+            column = config.get("column") or config["simple"]
+            # json_each() raises "malformed JSON" on invalid values, so it is
+            # fed through a guard that turns unparseable values into NULL -
+            # those rows then contribute no items to the counts
+            guarded_column = _valid_json_array_sql(f"[inner].{escape_sqlite(column)}")
+            facet_sql = f"""
+                with inner as ({self.sql}),
+                deduped_array_items as (
+                    select
+                        distinct j.type as item_type,
+                        j.value as item_value,
+                        inner.*
+                    from
+                        inner,
+                        json_each({guarded_column}) j
+                )
+                select
+                    item_type,
+                    item_value as value,
+                    count(*) as count
+                from
+                    deduped_array_items
+                group by
+                    item_type,
+                    item_value
+                order by
+                    count(*) desc, value, item_type limit {facet_size + 1}
+            """
+            try:
+                facet_rows_results = await self.ds.execute(
+                    self.database,
+                    facet_sql,
+                    self.params,
+                    truncate=False,
+                    custom_time_limit=self.ds.setting("facet_time_limit_ms"),
+                )
+                facet_results_values = []
+                facet_results.append(
+                    {
+                        "name": column,
+                        "type": self.type,
+                        "results": facet_results_values,
+                        "hideable": source != "metadata",
+                        "toggle_url": self.ds.urls.modify(
+                            self.request, remove={"_facet_array_typed": column}
+                        ),
+                        "truncated": len(facet_rows_results) > facet_size,
+                    }
+                )
+                facet_rows = facet_rows_results.rows[:facet_size]
+                pairs = self.get_querystring_pairs()
+                for row in facet_rows:
+                    value = _typed_json_value(row["item_type"], row["value"])
+                    json_value = json.dumps(value, separators=(",", ":"))
+                    selected = (f"{column}__arraycontainsjson", json_value) in pairs
+                    if selected:
+                        toggle_path = self.ds.urls.modify(
+                            self.request,
+                            remove=[
+                                (f"{column}__arraycontainsjson", json_value),
+                                "_next",
+                            ],
+                        )
+                    else:
+                        toggle_path = self.ds.urls.modify(
+                            self.request,
+                            add={f"{column}__arraycontainsjson": json_value},
+                            remove="_next",
+                        )
+                    facet_results_values.append(
+                        {
+                            "value": value,
+                            "label": json_value,
+                            "count": row["count"],
+                            "toggle_url": self.ds.absolute_url(
+                                self.request, toggle_path
+                            ),
+                            "selected": selected,
+                        }
+                    )
+            except QueryInterrupted:
+                facets_timed_out.append(column)
+
+        return facet_results, facets_timed_out
+
+
+def _typed_json_value(item_type, value):
+    # json_each() reports the JSON type of each item separately from its
+    # SQLite value - use it to restore the real JSON value, since SQLite
+    # represents JSON true/false/null as 1/0/NULL
+    if item_type == "true":
+        return True
+    if item_type == "false":
+        return False
+    if item_type == "null":
+        return None
+    if item_type in ("object", "array"):
+        return json.loads(value)
+    return value
 
 
 class DateFacet(Facet):

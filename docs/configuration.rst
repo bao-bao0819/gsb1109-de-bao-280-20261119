@@ -1043,6 +1043,13 @@ You can also specify :ref:`array <facet_by_json_array>` or :ref:`date <facet_by_
     - array: tags
     - date: created
 
+Use ``array_typed`` for the :ref:`type-aware JSON array facet <facet_by_json_array_typed>`:
+
+.. code-block:: yaml
+
+    facets:
+    - array_typed: tags
+
 .. _table_configuration_fts:
 
 ``fts_table`` / ``fts_pk`` / ``searchmode``

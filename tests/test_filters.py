@@ -1,7 +1,7 @@
 import pytest
 
 from datasette.filters import Filters, search_filters, through_filters, where_filters
-from datasette.utils.asgi import Request
+from datasette.utils.asgi import BadRequest, Request
 
 
 @pytest.mark.parametrize(
@@ -74,6 +74,34 @@ from datasette.utils.asgi import Request
             [':p0 not in (select value from json_each("table"."Availability+Info"))'],
             ["yes"],
         ),
+        # Type-aware JSON arraycontainsjson
+        (
+            (("tags__arraycontainsjson", '"1"'),),
+            [
+                'exists (select 1 from json_each(case when json_valid("table"."tags") '
+                "then case when json_type(\"table\".\"tags\") = 'array' "
+                'then "table"."tags" end end) j where j.type = :p0 and j.value is :p1)'
+            ],
+            ["text", "1"],
+        ),
+        (
+            (("tags__arraycontainsjson", "1"),),
+            [
+                'exists (select 1 from json_each(case when json_valid("table"."tags") '
+                "then case when json_type(\"table\".\"tags\") = 'array' "
+                'then "table"."tags" end end) j where j.type = :p0 and j.value is :p1)'
+            ],
+            ["integer", 1],
+        ),
+        (
+            (("tags__arraycontainsjson", "true"),),
+            [
+                'exists (select 1 from json_each(case when json_valid("table"."tags") '
+                "then case when json_type(\"table\".\"tags\") = 'array' "
+                'then "table"."tags" end end) j where j.type = :p0 and j.value is :p1)'
+            ],
+            ["true", 1],
+        ),
     ],
 )
 def test_build_where(args, expected_where, expected_params):
@@ -110,6 +138,32 @@ def test_build_where_escapes_table_name():
     filters = Filters((("tags__arraycontains", "value"),))
     sql_bits, _ = filters.build_where_clauses("items]bracket")
     assert sql_bits == [':p0 in (select value from json_each("items]bracket"."tags"))']
+
+
+@pytest.mark.parametrize(
+    "value,expected_type,expected_bind",
+    (
+        ('"tag"', "text", "tag"),
+        ("1", "integer", 1),
+        ("1.5", "real", 1.5),
+        ("true", "true", 1),
+        ("false", "false", 0),
+        ("null", "null", None),
+        ('{"a": 1}', "object", '{"a":1}'),
+        ("[1, 2]", "array", "[1,2]"),
+    ),
+)
+def test_arraycontainsjson_binds_json_types(value, expected_type, expected_bind):
+    filters = Filters((("tags__arraycontainsjson", value),))
+    sql_bits, params = filters.build_where_clauses("table")
+    assert params == {"p0": expected_type, "p1": expected_bind}
+    assert sql_bits[0].startswith("exists (select 1 from json_each(")
+
+
+def test_arraycontainsjson_rejects_invalid_json():
+    filters = Filters((("tags__arraycontainsjson", "not json"),))
+    with pytest.raises(BadRequest):
+        filters.build_where_clauses("table")
 
 
 async def test_through_filters_from_request(ds_client):

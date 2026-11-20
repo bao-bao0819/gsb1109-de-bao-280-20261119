@@ -310,6 +310,64 @@ class NotInFilter(InFilter):
         return f"{column} not in {json.dumps(self.split_value(value))}"
 
 
+def _valid_json_array_sql(column_expression):
+    # Evaluates to the column value if it holds a valid JSON array, else
+    # NULL. Nested case-when guards ensure json_type() is never evaluated
+    # against malformed JSON, which SQLite cannot reliably short-circuit.
+    return (
+        f"case when json_valid({column_expression}) "
+        f"then case when json_type({column_expression}) = 'array' "
+        f"then {column_expression} end end"
+    )
+
+
+class ArrayContainsJsonFilter(Filter):
+    key = "arraycontainsjson"
+    display = "array contains JSON value"
+
+    def where_clause(self, table, column, value, param_counter):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            raise BadRequest(f"Invalid JSON value: {value}")
+        value_sql = f":p{param_counter + 1}"
+        if isinstance(parsed, bool):
+            json_type = "true" if parsed else "false"
+            bind = int(parsed)
+        elif parsed is None:
+            json_type = "null"
+            bind = None
+        elif isinstance(parsed, str):
+            json_type = "text"
+            bind = parsed
+        elif isinstance(parsed, int):
+            json_type = "integer"
+            bind = parsed
+        elif isinstance(parsed, float):
+            json_type = "real"
+            bind = parsed
+        else:
+            # Objects and arrays are compared using canonical JSON text
+            json_type = "object" if isinstance(parsed, dict) else "array"
+            bind = json.dumps(parsed, separators=(",", ":"))
+            value_sql = f"json(:p{param_counter + 1})"
+        column_sql = "{}.{}".format(
+            _quote_sqlite_identifier(table), _quote_sqlite_identifier(column)
+        )
+        sql = (
+            "exists (select 1 from json_each({guarded}) j "
+            "where j.type = :p{param_counter} and j.value is {value_sql})"
+        ).format(
+            guarded=_valid_json_array_sql(column_sql),
+            param_counter=param_counter,
+            value_sql=value_sql,
+        )
+        return sql, [json_type, bind]
+
+    def human_clause(self, column, value):
+        return f"{column} array contains JSON value {value}"
+
+
 class Filters:
     _filters = (
         [
@@ -384,6 +442,7 @@ class Filters:
                     """:{p} not in (select value from json_each({t}.{c}))""",
                     '{c} does not contain "{v}"',
                 ),
+                ArrayContainsJsonFilter(),
             ]
             if detect_json1()
             else []

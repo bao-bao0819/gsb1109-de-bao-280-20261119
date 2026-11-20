@@ -1,6 +1,6 @@
 import json
 from types import SimpleNamespace
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import pytest
 
@@ -11,6 +11,7 @@ from datasette.facets import (
     ColumnFacet,
     DateFacet,
     Facet,
+    TypedArrayFacet,
     load_facet_configs,
 )
 from datasette.utils import detect_json1
@@ -1014,3 +1015,216 @@ async def test_facet_suggest_total_time_limit(
             assert suggestion_queries == 4
     finally:
         ds.close()
+
+
+TICKETS = [
+    # One ticket mixes the string "1", the integer 1, the boolean true and
+    # the same string tag twice - duplicates count once per ticket
+    (1, "web", '["1", 1, true, "x", "x"]'),
+    (2, "web", "[1]"),
+    # Empty arrays and NULLs stay as rows but contribute no tags
+    (3, "web", "[]"),
+    (4, "web", None),
+    # Filtered out by the source=web condition
+    (5, "email", '["1"]'),
+]
+
+
+async def make_tickets_ds(rows=TICKETS, memory_name="test_typed_array_facet"):
+    ds = Datasette([], memory=True)
+    db = ds.add_database(Database(ds, memory_name=memory_name))
+    await db.execute_write(
+        "create table tickets(id integer primary key, source text, tags text)"
+    )
+    for row in rows:
+        await db.execute_write("insert into tickets values (?, ?, ?)", row)
+    return ds
+
+
+def path_and_query(url):
+    split = urlsplit(url)
+    return split.path + ("?" + split.query if split.query else "")
+
+
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+async def test_typed_array_facet_counts_by_json_type():
+    ds = await make_tickets_ds()
+    try:
+        response = await ds.client.get(
+            "/test_typed_array_facet/tickets.json?source=web&_facet_array_typed=tags&_size=2&_extra=count"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        # Still one row per ticket, paginated into two pages
+        assert [row["id"] for row in data["rows"]] == [1, 2]
+        page2 = await ds.client.get(path_and_query(data["next_url"]))
+        assert [row["id"] for row in page2.json()["rows"]] == [3, 4]
+        # Total row count is not inflated by expanding the tags
+        assert data["count"] == 4
+        # Facet counts span the whole filtered source, not just this page,
+        # and are separated by real JSON type
+        facet = data["facet_results"]["results"]["tags"]
+        assert facet["type"] == "array_typed"
+        assert [
+            (type(result["value"]).__name__, result["label"], result["count"])
+            for result in facet["results"]
+        ] == [
+            ("int", "1", 2),
+            ("bool", "true", 1),
+            ("str", '"1"', 1),
+            ("str", '"x"', 1),
+        ]
+        # Following each toggle URL returns exactly the tickets containing
+        # that typed value
+        expected_ids = {"1": [1, 2], "true": [1], '"1"': [1], '"x"': [1]}
+        for result in facet["results"]:
+            back = await ds.client.get(path_and_query(result["toggle_url"]))
+            assert [row["id"] for row in back.json()["rows"]] == expected_ids[
+                result["label"]
+            ]
+    finally:
+        ds.close()
+
+
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+async def test_typed_array_facet_toggle_urls():
+    ds = await make_tickets_ds()
+    try:
+        response = await ds.client.get(
+            "/test_typed_array_facet/tickets.json?source=web&_facet_array_typed=tags"
+        )
+        facet = response.json()["facet_results"]["results"]["tags"]
+        querystrings = {
+            result["label"]: dict(parse_qsl(urlsplit(result["toggle_url"]).query))
+            for result in facet["results"]
+        }
+        assert querystrings["1"]["tags__arraycontainsjson"] == "1"
+        assert querystrings["true"]["tags__arraycontainsjson"] == "true"
+        assert querystrings['"1"']["tags__arraycontainsjson"] == '"1"'
+        assert querystrings['"x"']["tags__arraycontainsjson"] == '"x"'
+    finally:
+        ds.close()
+
+
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+@pytest.mark.parametrize(
+    "filter_value,expected_selected",
+    (
+        ("1", "1"),
+        ("true", "true"),
+        ('"1"', '"1"'),
+    ),
+)
+async def test_typed_array_facet_selected(filter_value, expected_selected):
+    ds = await make_tickets_ds()
+    try:
+        response = await ds.client.get(
+            "/test_typed_array_facet/tickets.json?_facet_array_typed=tags&tags__arraycontainsjson={}".format(
+                quote(filter_value)
+            )
+        )
+        facet = response.json()["facet_results"]["results"]["tags"]
+        selected = {result["label"]: result["selected"] for result in facet["results"]}
+        assert selected[expected_selected] is True
+        assert sum(1 for value in selected.values() if value) == 1
+        # The toggle URL for the selected value removes the filter again
+        for result in facet["results"]:
+            if result["label"] == expected_selected:
+                assert "tags__arraycontainsjson" not in dict(
+                    parse_qsl(urlsplit(result["toggle_url"]).query)
+                )
+    finally:
+        ds.close()
+
+
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+async def test_typed_array_facet_tolerates_malformed_json():
+    ds = await make_tickets_ds(
+        rows=[
+            (1, "web", '["1", 1, true]'),
+            (2, "web", "not json at all"),
+            (3, "web", "[broken"),
+            (4, "web", "[2]"),
+            (5, "web", "[]"),
+            (6, "web", None),
+        ],
+        memory_name="test_typed_array_facet_malformed",
+    )
+    try:
+        response = await ds.client.get(
+            "/test_typed_array_facet_malformed/tickets.json?_facet_array_typed=tags"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        # Every ticket is still returned, including the unparseable ones
+        assert [row["id"] for row in data["rows"]] == [1, 2, 3, 4, 5, 6]
+        facet = data["facet_results"]["results"]["tags"]
+        # Unparseable values contribute no tags and do not block valid rows
+        assert [
+            (result["label"], result["count"]) for result in facet["results"]
+        ] == [("1", 1), ("true", 1), ("2", 1), ('"1"', 1)]
+        # Filtering still works against the dirty data
+        back = await ds.client.get(
+            "/test_typed_array_facet_malformed/tickets.json?tags__arraycontainsjson=2"
+        )
+        assert [row["id"] for row in back.json()["rows"]] == [4]
+    finally:
+        ds.close()
+
+
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+async def test_typed_array_facet_results(ds_client):
+    facet = TypedArrayFacet(
+        ds_client.ds,
+        Request.fake("/?_facet_array_typed=tags"),
+        database="fixtures",
+        sql="select * from facetable",
+        table="facetable",
+    )
+    buckets, timed_out = await facet.facet_results()
+    assert timed_out == []
+    assert buckets == [
+        {
+            "name": "tags",
+            "type": "array_typed",
+            "results": [
+                {
+                    "value": "tag1",
+                    "label": '"tag1"',
+                    "count": 2,
+                    "toggle_url": "http://localhost/?_facet_array_typed=tags&tags__arraycontainsjson=%22tag1%22",
+                    "selected": False,
+                },
+                {
+                    "value": "tag2",
+                    "label": '"tag2"',
+                    "count": 1,
+                    "toggle_url": "http://localhost/?_facet_array_typed=tags&tags__arraycontainsjson=%22tag2%22",
+                    "selected": False,
+                },
+                {
+                    "value": "tag3",
+                    "label": '"tag3"',
+                    "count": 1,
+                    "toggle_url": "http://localhost/?_facet_array_typed=tags&tags__arraycontainsjson=%22tag3%22",
+                    "selected": False,
+                },
+            ],
+            "hideable": True,
+            "toggle_url": "/",
+            "truncated": False,
+        }
+    ]
+
+
+@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
+async def test_array_facet_still_string_only(ds_client):
+    # The existing _facet_array interface is unchanged
+    response = await ds_client.get("/fixtures/facetable.json?_facet_array=tags")
+    facet = response.json()["facet_results"]["results"]["tags"]
+    assert facet["type"] == "array"
+    assert [
+        (result["value"], result["count"]) for result in facet["results"]
+    ] == [("tag1", 2), ("tag2", 1), ("tag3", 1)]
+    for result in facet["results"]:
+        assert "tags__arraycontains=" in result["toggle_url"]

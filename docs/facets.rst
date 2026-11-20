@@ -287,6 +287,23 @@ This is useful for modelling things like tags without needing to break them out 
 
 Example here: `latest.datasette.io/fixtures/facetable?_facet_array=tags <https://latest.datasette.io/fixtures/facetable?_facet_array=tags>`__
 
+.. _facet_by_json_array_typed:
+
+Facet by JSON array with types
+------------------------------
+
+The ``_facet_array=`` interface described above is designed for arrays of strings. If your arrays mix JSON types - for example the string ``"1"``, the integer ``1`` and the boolean ``true`` - you can instead facet by the real JSON type of each array item::
+
+    ?_facet_array_typed=tags
+
+This counts each distinct typed value separately: ``"1"``, ``1`` and ``true`` are three different facet values, each with its own count. Each item is counted at most once per row, even if it appears multiple times in the same array, and counts always reflect the full set of filtered rows rather than just the current page. Rows with empty arrays or ``null`` values contribute no facet values.
+
+Selecting a facet value applies the :ref:`type-aware __arraycontainsjson filter <table_arguments>`, so the rows returned are exactly those containing that JSON value with that type.
+
+Values that cannot be parsed as JSON arrays are treated as unparseable: those rows still appear in the table results, but they contribute no facet values and do not prevent the values from other rows being counted.
+
+This facet is not suggested automatically - enable it explicitly with ``?_facet_array_typed=column`` or through :ref:`table metadata <configuration>`. It is only available if the ``json1`` SQLite extension is enabled.
+
 .. _facet_by_date:
 
 Facet by date

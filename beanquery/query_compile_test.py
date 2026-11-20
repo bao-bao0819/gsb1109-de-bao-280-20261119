@@ -659,7 +659,7 @@ class TestTranslationBalance(CompileSelectBase):
     group_by = ast.GroupBy([
         ast.Column('account'),
         ast.Function('account_sortkey', [
-            ast.Column(name='account')])], None)
+            ast.Column(name='account')])])
 
     order_by = [ast.OrderBy(ast.Function('account_sortkey', [ast.Column('account')]), ast.Ordering.ASC)]
 

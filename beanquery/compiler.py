@@ -120,7 +120,12 @@ class Compiler:
             c_where = c_from_expr if c_where is None else EvalAnd([c_from_expr, c_where])
 
         # Process the GROUP-BY clause.
-        new_targets, group_indexes, having_index = self._compile_group_by(node.group_by, c_targets)
+        new_targets, group_indexes = self._compile_group_by(node.group_by, c_targets)
+        c_targets.extend(new_targets)
+
+        # Process the HAVING clause.
+        new_targets, having_index, group_indexes = self._compile_having(
+            node.having, c_targets, group_indexes)
         c_targets.extend(new_targets)
 
         # Process the ORDER-BY clause.
@@ -374,7 +379,6 @@ class Compiler:
         c_target_expressions = [c_target.c_expr for c_target in c_targets]
 
         group_indexes = []
-        having_index = None
 
         if group_by:
             assert group_by.columns, "Internal error with GROUP-BY parsing"
@@ -439,15 +443,6 @@ class Compiler:
                 if not issubclass(c_expr.dtype, collections.abc.Hashable):
                     raise CompilationError(f'GROUP-BY a non-hashable type is not supported: "{column}"')
 
-            # Compile HAVING clause.
-            if group_by.having is not None:
-                c_expr = self._compile(group_by.having)
-                if not is_aggregate(c_expr):
-                    raise CompilationError('the HAVING clause must be an aggregate expression')
-                having_index = len(new_targets)
-                new_targets.append(EvalTarget(c_expr, None, True))
-                c_target_expressions.append(c_expr)
-
         else:
             # If it does not have a GROUP-BY clause...
             aggregate_bools = [c_target.is_aggregate for c_target in c_targets]
@@ -473,7 +468,48 @@ class Compiler:
                 # anything useful, we won't need it.
                 group_indexes = None
 
-        return new_targets[len(c_targets):], group_indexes, having_index
+        return new_targets[len(c_targets):], group_indexes
+
+    def _compile_having(self, having, c_targets, group_indexes):
+        """Process a HAVING clause.
+
+        Args:
+          having: An expression tree for the HAVING clause, or None if absent.
+          c_targets: A list of compiled target expressions.
+          group_indexes: The group indexes computed for the query, or None for a
+            non-aggregate query.
+        Returns:
+          A tuple of
+           new_targets: A list of new compiled target nodes.
+           having_index: The index of the compiled HAVING expression among the
+             targets, or None if the clause is absent.
+           group_indexes: The group indexes to use for the query. This is the
+             value passed in, possibly updated to turn a non-aggregate query
+             into an aggregate one.
+        """
+        if having is None:
+            return [], None, group_indexes
+
+        c_expr = self._compile(having)
+        if not is_aggregate(c_expr):
+            raise CompilationError('the HAVING clause must be an aggregate expression')
+        if group_indexes is None:
+            # A HAVING clause turns the query into an aggregate one even
+            # without an explicit GROUP-BY. Targets are implicitly grouped
+            # by just like in any other aggregate query.
+            aggregate_bools = [c_target.is_aggregate for c_target in c_targets]
+            if all(aggregate_bools):
+                group_indexes = []
+            elif SUPPORT_IMPLICIT_GROUPBY:
+                group_indexes = [
+                    index for index, c_target in enumerate(c_targets)
+                    if not c_target.is_aggregate]
+            else:
+                raise CompilationError(
+                    'aggregate query with HAVING clause should have only aggregates '
+                    '(or a GROUP-BY clause)')
+
+        return [EvalTarget(c_expr, None, True)], len(c_targets), group_indexes
 
     @_compile.register
     def _column(self, node: ast.Column):

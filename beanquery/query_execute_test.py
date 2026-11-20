@@ -1112,6 +1112,235 @@ class TestExecuteAggregatedQuery(QueryBase):
                 ('Expenses:Foo', D(1.0)),
             ])
 
+    def test_aggregated_empty_input(self):
+        # No posting matches: a global aggregate still returns one row with
+        # zero counts and a NULL sum, while a grouped aggregate returns none.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT count(*), count(number), sum(number)
+            WHERE account = 'Expenses:Nonexistent'
+            """,
+            [
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                (0, 0, None),
+            ])
+
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, count(*), count(number), sum(number)
+            WHERE account = 'Expenses:Nonexistent'
+            GROUP BY account
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [])
+
+    def test_aggregated_empty_input_with_having(self):
+        # HAVING is evaluated on the single global aggregate row, so the query
+        # keeps it only when the aggregate condition matches.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT count(*), count(number), sum(number)
+            WHERE account = 'Expenses:Nonexistent'
+            HAVING count(*) = 0
+            """,
+            [
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                (0, 0, None),
+            ])
+
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT count(*), count(number), sum(number)
+            WHERE account = 'Expenses:Nonexistent'
+            HAVING count(*) = 2
+            """,
+            [
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [])
+
+    def test_aggregated_cancelled_values(self):
+        # Two postings that cancel out: the counts are non-zero and the total
+        # is a real zero, not NULL.
+        self.check_query(
+            """
+            2010-02-21 * "Cancelling"
+              Assets:Bank:Checking       -1.00 USD
+              Expenses:Restaurant         1.00 USD
+            """,
+            """
+            SELECT count(*), count(number), sum(number)
+            """,
+            [
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                (2, 2, D(0.0)),
+            ])
+
+        self.check_query(
+            """
+            2010-02-21 * "Cancelling"
+              Assets:Bank:Checking       -1.00 USD
+              Expenses:Restaurant         1.00 USD
+            """,
+            """
+            SELECT account, count(*), count(number), sum(number)
+            GROUP BY account
+            ORDER BY account
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                ('Assets:Bank:Checking', 1, 1, D(-1.0)),
+                ('Expenses:Restaurant', 1, 1, D(1.0)),
+            ])
+
+        # The same cancellation inside a single account: the group's sum is a
+        # real zero with two rows counted, not NULL.
+        self.check_query(
+            """
+            2010-02-21 * "Cancelling in one account"
+              Assets:Bank:Checking       -1.00 USD
+              Assets:Bank:Checking        1.00 USD
+              Expenses:Restaurant         0.00 USD
+            """,
+            """
+            SELECT account, count(*), count(number), sum(number)
+            GROUP BY account
+            HAVING count(*) = 2
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+                ('count(number)', int),
+                ('sum(number)', Decimal),
+            ],
+            [
+                ('Assets:Bank:Checking', 2, 2, D(0.0)),
+            ])
+
+    def test_aggregated_rows_without_values(self):
+        # Rows are present but the aggregated expression is NULL: COUNT(*)
+        # counts the rows, COUNT(field) does not, and the sum is NULL.
+        self.check_query(
+            """
+            2010-02-21 * "Without cost number"
+              Assets:Bank:Checking        1.00 USD
+              Expenses:Restaurant        -1.00 USD
+            """,
+            """
+            SELECT count(*), count(cost_number), sum(cost_number)
+            """,
+            [
+                ('count(*)', int),
+                ('count(cost_number)', int),
+                ('sum(cost_number)', Decimal),
+            ],
+            [
+                (2, 0, None),
+            ])
+
+        self.check_query(
+            """
+            2010-02-21 * "Without cost number"
+              Assets:Bank:Checking        1.00 USD
+              Expenses:Restaurant        -1.00 USD
+            """,
+            """
+            SELECT account, count(*), count(cost_number), sum(cost_number)
+            GROUP BY account
+            ORDER BY account
+            """,
+            [
+                ('account', str),
+                ('count(*)', int),
+                ('count(cost_number)', int),
+                ('sum(cost_number)', Decimal),
+            ],
+            [
+                ('Assets:Bank:Checking', 1, 0, None),
+                ('Expenses:Restaurant', 1, 0, None),
+            ])
+
+    def test_aggregated_subquery_empty_input(self):
+        # The outer query reads the three aggregates from a global aggregate
+        # subquery, by name and with their original types.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT nrows, nvalues, total FROM (
+              SELECT count(*) AS nrows, count(number) AS nvalues, sum(number) AS total
+              WHERE account = 'Expenses:Nonexistent'
+            )
+            """,
+            [
+                ('nrows', int),
+                ('nvalues', int),
+                ('total', Decimal),
+            ],
+            [
+                (0, 0, None),
+            ])
+
+    def test_aggregated_subquery_having(self):
+        # The subquery with a global aggregate and HAVING emits a single row
+        # only when the aggregate condition matches.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT nrows FROM (
+              SELECT count(*) AS nrows
+              WHERE account = 'Expenses:Nonexistent'
+              HAVING count(*) = 0
+            )
+            """,
+            [
+                ('nrows', int),
+            ],
+            [
+                (0,),
+            ])
+
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT nrows FROM (
+              SELECT count(*) AS nrows
+              WHERE account = 'Expenses:Nonexistent'
+              HAVING count(*) = 2
+            )
+            """,
+            [
+                ('nrows', int),
+            ],
+            [])
+
 
 class TestExecuteOptions(QueryBase):
 

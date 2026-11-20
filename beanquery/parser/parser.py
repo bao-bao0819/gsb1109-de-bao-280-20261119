@@ -25,34 +25,34 @@ from tatsu.util import re, generic_main
 
 
 KEYWORDS: set[str] = {
-    'USING',
-    'GROUP',
-    'INSERT',
-    'AND',
-    'WHERE',
     'SELECT',
-    'FROM',
-    'DISTINCT',
+    'INSERT',
+    'LIMIT',
     'BALANCES',
-    'ORDER',
+    'WHERE',
+    'NOT',
     'PRINT',
     'DESC',
-    'INTO',
-    'IN',
-    'CREATE',
-    'OR',
+    'DISTINCT',
     'BY',
-    'LIMIT',
-    'FALSE',
+    'ASC',
+    'TABLE',
+    'FROM',
     'AS',
     'HAVING',
-    'ASC',
-    'IS',
-    'TABLE',
-    'NOT',
     'TRUE',
+    'GROUP',
     'PIVOT',
+    'USING',
+    'AND',
     'JOURNAL',
+    'OR',
+    'IS',
+    'IN',
+    'CREATE',
+    'INTO',
+    'FALSE',
+    'ORDER',
 }
 
 
@@ -177,6 +177,11 @@ class BQLParser(Parser):
             self.name_last_node('group_by')
             self._define(['group_by'], [])
         with self._optional():
+            self._token('HAVING')
+            self._expression_()
+            self.name_last_node('having')
+            self._define(['having'], [])
+        with self._optional():
             self._token('ORDER')
             self._token('BY')
 
@@ -199,7 +204,7 @@ class BQLParser(Parser):
             self._integer_()
             self.name_last_node('limit')
             self._define(['limit'], [])
-        self._define(['distinct', 'from_clause', 'group_by', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
+        self._define(['distinct', 'from_clause', 'group_by', 'having', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
 
     @tatsumasu()
     def _subselect_(self):
@@ -354,12 +359,6 @@ class BQLParser(Parser):
                     )
         self._positive_gather(block1, sep0)
         self.name_last_node('columns')
-        with self._optional():
-            self._token('HAVING')
-            self._expression_()
-            self.name_last_node('having')
-            self._define(['having'], [])
-        self._define(['columns', 'having'], [])
 
     @tatsumasu('OrderBy')
     def _order_(self):

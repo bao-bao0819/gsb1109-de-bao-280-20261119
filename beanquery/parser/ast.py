@@ -64,11 +64,20 @@ class Node:
 
 
 def node(name, fields):
-    """Manufacture an AST node class."""
+    """Manufacture an AST node class.
 
+    Fields with a trailing '?' are optional and default to None.
+    """
+    field_defs = []
+    for field in fields.split():
+        if field.endswith('?'):
+            field_defs.append((field[:-1], 'typing.Any', dataclasses.field(default=None)))
+        else:
+            field_defs.append((field, 'typing.Any'))
+    field_defs.append(('parseinfo', None, dataclasses.field(default=None, compare=False, repr=False)))
     return dataclasses.make_dataclass(
         name,
-        [*fields.split(), ('parseinfo', None, dataclasses.field(default=None, compare=False, repr=False))],
+        field_defs,
         bases=(Node,),
         **({'slots': True} if sys.version_info[:2] >= (3, 10) else {}))
 
@@ -85,7 +94,8 @@ def node(name, fields):
 #   pivot_by: An instance of 'PivotBy', or None if absent.
 #   limit: An integer, or None is absent.
 #   distinct: A boolean value (True), or None if absent.
-Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct')
+#   having: An expression tree for the optional HAVING clause, or None.
+Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct having?')
 
 # A select query that produces final balances for accounts.
 # This is equivalent to
@@ -149,8 +159,8 @@ class From(Node):
 #
 # Attributes:
 #   columns: A list of group-by expressions, simple Column() or otherwise.
-#   having: An expression tree for the optional HAVING clause, or None.
-GroupBy = node('GroupBy', 'columns having')
+GroupBy = node('GroupBy', 'columns')
+
 
 # An ORDER BY clause.
 #

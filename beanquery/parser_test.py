@@ -309,7 +309,7 @@ class TestSelectGroupBy(QueryParserTestBase):
         self.assertParse(
             "SELECT * GROUP BY a;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([ast.Column('a')], None)))
+                   group_by=ast.GroupBy([ast.Column('a')])))
 
     def test_groupby_many(self):
         self.assertParse(
@@ -318,7 +318,7 @@ class TestSelectGroupBy(QueryParserTestBase):
                    group_by=ast.GroupBy([
                        ast.Column('a'),
                        ast.Column('b'),
-                       ast.Column('c')], None)))
+                       ast.Column('c')])))
 
     def test_groupby_expr(self):
         self.assertParse(
@@ -329,28 +329,50 @@ class TestSelectGroupBy(QueryParserTestBase):
                            ast.Function('length', [
                                ast.Column('a')]),
                            ast.Constant(0)),
-                       ast.Column('b')], None)))
+                       ast.Column('b')])))
 
     def test_groupby_having(self):
         self.assertParse(
             "SELECT * GROUP BY a HAVING sum(x) = 0;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([ast.Column('a')],
-                        ast.Equal(
-                            ast.Function('sum', [
-                                ast.Column('x')]),
-                            ast.Constant(0)))))
+                   group_by=ast.GroupBy([ast.Column('a')]),
+                   having=ast.Equal(
+                       ast.Function('sum', [
+                           ast.Column('x')]),
+                       ast.Constant(0))))
+
+    def test_having_without_groupby(self):
+        self.assertParse(
+            "SELECT sum(x) HAVING sum(x) = 0;",
+            Select([
+                ast.Target(ast.Function('sum', [ast.Column('x')]), None),
+            ],
+                having=ast.Equal(
+                    ast.Function('sum', [
+                        ast.Column('x')]),
+                    ast.Constant(0))))
+
+    def test_having_before_orderby(self):
+        self.assertParse(
+            "SELECT * GROUP BY a HAVING sum(x) = 0 ORDER BY a;",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy([ast.Column('a')]),
+                   having=ast.Equal(
+                       ast.Function('sum', [
+                           ast.Column('x')]),
+                       ast.Constant(0)),
+                   order_by=[ast.OrderBy(ast.Column('a'), ast.Ordering.ASC)]))
 
     def test_groupby_numbers(self):
         self.assertParse(
             "SELECT * GROUP BY 1;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([1], None)))
+                   group_by=ast.GroupBy([1])))
 
         self.assertParse(
             "SELECT * GROUP BY 2, 4, 5;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([2, 4, 5], None)))
+                   group_by=ast.GroupBy([2, 4, 5])))
 
     def test_groupby_empty(self):
         with self.assertRaises(parser.ParseError):

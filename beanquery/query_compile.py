@@ -618,6 +618,8 @@ EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 #     This list may refer to either aggregates or non-aggregates.
 #   limit: An optional integer used to cut off the number of result rows returned.
 #   distinct: An optional boolean that requests we should uniquify the result rows.
+#   having_index: The index of the compiled HAVING expression in 'c_targets', or
+#     None if the query has no HAVING clause.
 @dataclasses.dataclass
 class EvalQuery:
     table: tables.Table

@@ -788,19 +788,29 @@ class SumInt(query_compile.EvalAggregator):
     def __init__(self, context, operands):
         super().__init__(context, operands, operands[0].dtype)
 
+    def initialize(self, store):
+        # No input value has been seen yet: the result is NULL until then.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle] += value
+            current = store[self.handle]
+            store[self.handle] = value if current is None else current + value
 
 
 @aggregator([Decimal], name='sum')
 class SumDecimal(query_compile.EvalAggregator):
     """Calculate the sum of the numerical argument."""
+    def initialize(self, store):
+        # No input value has been seen yet: the result is NULL until then.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle] += value
+            current = store[self.handle]
+            store[self.handle] = value if current is None else current + value
 
 
 @aggregator([amount.Amount], name='sum')
@@ -809,10 +819,17 @@ class SumAmount(query_compile.EvalAggregator):
     def __init__(self, context, operands):
         super().__init__(context, operands, inventory.Inventory)
 
+    def initialize(self, store):
+        # No input value has been seen yet: the result is NULL until then.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle].add_amount(value)
+            current = store[self.handle]
+            if current is None:
+                current = store[self.handle] = inventory.Inventory()
+            current.add_amount(value)
 
 
 @aggregator([position.Position], name='sum')
@@ -821,10 +838,17 @@ class SumPosition(query_compile.EvalAggregator):
     def __init__(self, context, operands):
         super().__init__(context, operands, inventory.Inventory)
 
+    def initialize(self, store):
+        # No input value has been seen yet: the result is NULL until then.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle].add_position(value)
+            current = store[self.handle]
+            if current is None:
+                current = store[self.handle] = inventory.Inventory()
+            current.add_position(value)
 
 
 @aggregator([inventory.Inventory], name='sum')
@@ -833,10 +857,17 @@ class SumInventory(query_compile.EvalAggregator):
     def __init__(self, context, operands):
         super().__init__(context, operands, inventory.Inventory)
 
+    def initialize(self, store):
+        # No input value has been seen yet: the result is NULL until then.
+        store[self.handle] = None
+
     def update(self, store, context):
         value = self.operands[0](context)
         if value is not None:
-            store[self.handle].add_inventory(value)
+            current = store[self.handle]
+            if current is None:
+                current = store[self.handle] = inventory.Inventory()
+            current.add_inventory(value)
 
 
 @aggregator([types.Any], name='first')

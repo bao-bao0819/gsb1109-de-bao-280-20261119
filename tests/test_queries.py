@@ -594,6 +594,67 @@ async def test_query_store_api_creates_read_only_query():
     assert data["query"]["owner_id"] == "root"
 
 
+async def test_query_store_and_update_api_support_declared_columns():
+    ds = Datasette(memory=True, default_deny=True)
+    ds.root_enabled = True
+    db = ds.add_memory_database("query_columns_api", name="data")
+    await db.execute_write("create table dogs (id integer primary key, name text)")
+    await ds.invoke_startup()
+
+    response = await ds.client.post(
+        "/data/-/queries/store",
+        actor={"id": "root"},
+        json={
+            "query": {
+                "name": "by_name",
+                "sql": "select id, name from dogs where name = :name",
+                "columns": ["id", "name"],
+            }
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["query"]["columns"] == ["id", "name"]
+    query = await ds.get_query("data", "by_name")
+    assert query.columns == ["id", "name"]
+
+    # Update the declared columns through the update API
+    response = await ds.client.post(
+        "/data/by_name/-/update",
+        actor={"id": "root"},
+        json={"update": {"columns": ["name", "id"]}, "return": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["query"]["columns"] == ["name", "id"]
+    query = await ds.get_query("data", "by_name")
+    assert query.columns == ["name", "id"]
+
+    # Clear the declaration by passing None
+    response = await ds.client.post(
+        "/data/by_name/-/update",
+        actor={"id": "root"},
+        json={"update": {"columns": None}, "return": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["query"]["columns"] is None
+    query = await ds.get_query("data", "by_name")
+    assert query.columns is None
+
+    # Invalid columns values are rejected
+    response = await ds.client.post(
+        "/data/-/queries/store",
+        actor={"id": "root"},
+        json={
+            "query": {
+                "name": "bad_columns",
+                "sql": "select id, name from dogs",
+                "columns": ["id", 3],
+            }
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == ["columns must be a list of strings"]
+
+
 async def test_query_store_api_creates_query_for_immutable_database(tmp_path):
     db_path = tmp_path / "immutable.db"
     conn = sqlite3.connect(str(db_path))

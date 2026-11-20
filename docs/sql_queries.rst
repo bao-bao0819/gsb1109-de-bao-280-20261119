@@ -400,6 +400,27 @@ This example demonstrates both ``fragment`` and ``hide_sql``:
 
 `See here <https://latest.datasette.io/fixtures#queries>`__ for a demo of this in action.
 
+columns
++++++++
+
+A stored query can declare the exact column names and order it promises to return, using the ``"columns"`` key:
+
+.. code-block:: yaml
+
+    databases:
+      fixtures:
+        queries:
+          daily_report:
+            sql: select day, opened, closed from tickets where day = :day
+            columns:
+            - day
+            - opened
+            - closed
+
+When a query declares its columns, every execution checks the columns the SQL actually returns against that declaration - including executions that return zero rows, so an empty result still counts as a successful batch with the promised column definitions. If the returned columns differ in names, order or number, the query page reports an error listing the expected columns and the actual column positions instead of returning data. This applies to every output format, including JSON and CSV.
+
+The JSON output for a query with declared columns always includes the ``columns`` key, without needing ``?_extra=columns``. Queries that do not declare columns are not validated and behave as before.
+
 .. _queries_writable:
 
 Writable queries

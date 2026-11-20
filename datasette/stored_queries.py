@@ -13,6 +13,7 @@ UNCHANGED = object()
 QUERY_OPTION_FIELDS = (
     "hide_sql",
     "fragment",
+    "columns",
     "on_success_message",
     "on_success_message_sql",
     "on_success_redirect",
@@ -43,6 +44,7 @@ class StoredQuery:
     on_error_message: str | None
     on_error_redirect: str | None
     private: bool | None = None
+    columns: list[str] | None = None
 
 
 @dataclass
@@ -74,6 +76,7 @@ def stored_query_to_dict(query: StoredQuery) -> dict[str, Any]:
         "on_success_redirect": query.on_success_redirect,
         "on_error_message": query.on_error_message,
         "on_error_redirect": query.on_error_redirect,
+        "columns": list(query.columns) if query.columns is not None else None,
     }
     if query.private is not None:
         data["private"] = query.private
@@ -106,6 +109,7 @@ async def save_queries_from_config(datasette: Any) -> None:
                 description_html=query_config.get("description_html"),
                 hide_sql=bool(query_config.get("hide_sql")),
                 fragment=query_config.get("fragment"),
+                columns=query_config.get("columns"),
                 parameters=query_config.get("params"),
                 is_write=bool(query_config.get("write")),
                 is_trusted=bool(query_config.get("is_trusted", True)),
@@ -145,7 +149,35 @@ def query_row_to_stored_query(
         on_success_redirect=options.get("on_success_redirect"),
         on_error_message=options.get("on_error_message"),
         on_error_redirect=options.get("on_error_redirect"),
+        columns=(
+            list(options["columns"]) if options.get("columns") is not None else None
+        ),
         private=private,
+    )
+
+
+def declared_columns_mismatch(
+    declared_columns: Iterable[str], actual_columns: Iterable[str]
+) -> str | None:
+    """Return a message describing how ``actual_columns`` differs from the
+    declared column names and order, or ``None`` if they match exactly."""
+    declared = list(declared_columns)
+    actual = list(actual_columns)
+    if declared == actual:
+        return None
+    if len(declared) != len(actual):
+        detail = "expected {} columns but got {}".format(len(declared), len(actual))
+    else:
+        index = next(
+            i
+            for i, (expected, got) in enumerate(zip(declared, actual))
+            if expected != got
+        )
+        detail = "column {} should be {!r} but is {!r}".format(
+            index + 1, declared[index], actual[index]
+        )
+    return "Declared columns: {!r}. Actual columns: {!r}. First mismatch: {}.".format(
+        declared, actual, detail
     )
 
 
@@ -172,6 +204,7 @@ async def add_query(
     description_html: str | None = None,
     hide_sql: bool = False,
     fragment: str | None = None,
+    columns: Iterable[str] | None = None,
     parameters: Iterable[str] | None = None,
     is_write: bool = False,
     is_private: bool = False,
@@ -190,6 +223,7 @@ async def add_query(
         {
             "hide_sql": hide_sql,
             "fragment": fragment,
+            "columns": list(columns) if columns is not None else None,
             "on_success_message": on_success_message,
             "on_success_message_sql": on_success_message_sql,
             "on_success_redirect": on_success_redirect,
@@ -250,6 +284,7 @@ async def update_query(
     description_html=UNCHANGED,
     hide_sql=UNCHANGED,
     fragment=UNCHANGED,
+    columns=UNCHANGED,
     parameters=UNCHANGED,
     is_write=UNCHANGED,
     is_private=UNCHANGED,
@@ -277,6 +312,7 @@ async def update_query(
     option_fields = {
         "hide_sql": hide_sql,
         "fragment": fragment,
+        "columns": columns,
         "on_success_message": on_success_message,
         "on_success_message_sql": on_success_message_sql,
         "on_success_redirect": on_success_redirect,

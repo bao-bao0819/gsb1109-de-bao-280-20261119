@@ -503,3 +503,213 @@ async def test_stored_write_query_disabled_for_immutable_database(
     )
     assert response.status_code == 403
     assert "Database is immutable" in response.text
+
+
+@pytest_asyncio.fixture
+async def declared_columns_client():
+    ds = await make_ds(
+        extra_databases={
+            "data": """
+                create table tickets (day text, opened integer, closed integer);
+                insert into tickets (day, opened, closed) values
+                    ('2026-11-19', 5, 5),
+                    ('2026-11-19', 3, 1),
+                    ('2026-11-18', 2, 4);
+            """
+        },
+        config={
+            "databases": {
+                "data": {
+                    "queries": {
+                        "daily_tickets": {
+                            "sql": "select day, opened, closed from tickets where day = :day",
+                            "columns": ["day", "opened", "closed"],
+                        },
+                        "daily_opened": {
+                            "sql": "select day, opened from tickets where day = :day",
+                            "columns": ["day", "opened"],
+                        },
+                        "legacy_tickets": {
+                            "sql": "select day, opened, closed from tickets where day = :day",
+                        },
+                    }
+                }
+            }
+        },
+    )
+    return ds.client
+
+
+async def test_declared_columns_with_rows(declared_columns_client):
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=2026-11-19&_shape=arrays"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["columns"] == ["day", "opened", "closed"]
+    # opened and closed happen to have identical values in the first row -
+    # both values must survive positionally
+    assert data["rows"] == [["2026-11-19", 5, 5], ["2026-11-19", 3, 1]]
+
+
+async def test_declared_columns_zero_rows_still_success(declared_columns_client):
+    # A legal empty result still carries the promised field order
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=1999-01-01"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["columns"] == ["day", "opened", "closed"]
+    assert data["rows"] == []
+    # Same for CSV - header row only
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.csv?day=1999-01-01"
+    )
+    assert response.status_code == 200
+    assert response.text == "day,opened,closed\r\n"
+
+
+async def test_declared_columns_csv_with_rows(declared_columns_client):
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.csv?day=2026-11-19"
+    )
+    assert response.status_code == 200
+    assert response.text == (
+        "day,opened,closed\r\n2026-11-19,5,5\r\n2026-11-19,3,1\r\n"
+    )
+
+
+async def test_declared_columns_swapped_outputs_error(declared_columns_client):
+    # Replace the query definition, swapping two output positions
+    await declared_columns_client.ds.update_query(
+        "data",
+        "daily_tickets",
+        sql="select day, closed, opened from tickets where day = :day",
+    )
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=1999-01-01"
+    )
+    assert response.status_code == 500
+    data = response.json()
+    assert data["ok"] is False
+    assert data["expected_columns"] == ["day", "opened", "closed"]
+    assert data["actual_columns"] == ["day", "closed", "opened"]
+    assert "'opened'" in data["error"]
+    assert "'closed'" in data["error"]
+    # CSV must not silently succeed with a header-only response either
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.csv?day=1999-01-01"
+    )
+    assert response.status_code == 500
+    assert "opened" in response.text
+
+
+async def test_declared_columns_duplicate_alias_error(declared_columns_client):
+    # Replace the query definition, renaming the first column's alias to the
+    # second column's name - a dict-based consumer would deduplicate these
+    await declared_columns_client.ds.update_query(
+        "data",
+        "daily_tickets",
+        sql="select day, opened as closed, closed from tickets where day = :day",
+    )
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=1999-01-01"
+    )
+    assert response.status_code == 500
+    data = response.json()
+    assert data["ok"] is False
+    assert data["expected_columns"] == ["day", "opened", "closed"]
+    assert data["actual_columns"] == ["day", "closed", "closed"]
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.csv?day=1999-01-01"
+    )
+    assert response.status_code == 500
+
+
+async def test_declared_columns_other_queries_unaffected(declared_columns_client):
+    # Replace one query definition with a mismatched one
+    await declared_columns_client.ds.update_query(
+        "data",
+        "daily_tickets",
+        sql="select day, closed, opened from tickets where day = :day",
+    )
+    # The other declared query still works, including with zero rows
+    response = await declared_columns_client.get(
+        "/data/daily_opened.json?day=1999-01-01"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["columns"] == ["day", "opened"]
+    assert data["rows"] == []
+    # Queries with no declared columns work as before, whatever they return
+    response = await declared_columns_client.get(
+        "/data/legacy_tickets.json?day=1999-01-01&_extra=columns"
+    )
+    assert response.status_code == 200
+    assert response.json()["columns"] == ["day", "opened", "closed"]
+    await declared_columns_client.ds.update_query(
+        "data",
+        "legacy_tickets",
+        sql="select closed, day, opened from tickets where day = :day",
+    )
+    response = await declared_columns_client.get(
+        "/data/legacy_tickets.json?day=1999-01-01&_extra=columns"
+    )
+    assert response.status_code == 200
+    assert response.json()["columns"] == ["closed", "day", "opened"]
+
+
+async def test_declared_columns_can_be_updated(declared_columns_client):
+    # Updating the declaration to match the new SQL makes it succeed again
+    await declared_columns_client.ds.update_query(
+        "data",
+        "daily_tickets",
+        sql="select day, closed, opened from tickets where day = :day",
+    )
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=1999-01-01"
+    )
+    assert response.status_code == 500
+    await declared_columns_client.ds.update_query(
+        "data",
+        "daily_tickets",
+        columns=["day", "closed", "opened"],
+    )
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=1999-01-01"
+    )
+    assert response.status_code == 200
+    assert response.json()["columns"] == ["day", "closed", "opened"]
+    # And the declaration can be cleared entirely
+    await declared_columns_client.ds.update_query(
+        "data",
+        "daily_tickets",
+        columns=None,
+    )
+    query = await declared_columns_client.ds.get_query("data", "daily_tickets")
+    assert query.columns is None
+    response = await declared_columns_client.get(
+        "/data/daily_tickets.json?day=1999-01-01"
+    )
+    assert response.status_code == 200
+
+
+async def test_add_query_with_declared_columns():
+    ds = await make_ds(extra_databases={"data": "create table t (a text, b text)"})
+    await ds.add_query(
+        "data",
+        "declared",
+        "select a, b from t",
+        columns=["a", "b"],
+    )
+    query = await ds.get_query("data", "declared")
+    assert query.columns == ["a", "b"]
+    options_row = (
+        await ds.get_internal_database().execute(
+            "SELECT options FROM queries WHERE database_name = ? AND name = ?",
+            ["data", "declared"],
+        )
+    ).first()
+    assert json.loads(options_row["options"]) == {"columns": ["a", "b"]}

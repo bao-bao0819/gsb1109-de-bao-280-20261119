@@ -203,7 +203,7 @@ class BaseView:
         return view
 
 
-def page_for_renderer(datasette, request, format_, data):
+def page_for_renderer(datasette, request, format_, data, extra_names=None):
     """
     The page= dictionary passed to an output renderer's render function.
 
@@ -212,9 +212,14 @@ def page_for_renderer(datasette, request, format_, data):
     for tables), the extras the renderer declared when it was registered
     and any requested using ?_extra=. Extras that are not available for
     this type of page are omitted.
+
+    extra_names lists additional keys, such as columns for a stored query
+    that declares its columns, to treat as requested extras.
     """
     names = set(datasette._renderer_extras.get(format_) or [])
     names.update(extra_names_from_request(request))
+    if extra_names:
+        names.update(extra_names)
     return {
         key: value
         for key, value in data.items()
@@ -292,6 +297,7 @@ async def render_with_output_renderer(
     truncated,
     error,
     fetch_next_page=None,
+    page_extra_names=None,
 ):
     """
     Call the output renderer registered for format_ and return its Response.
@@ -317,7 +323,9 @@ async def render_with_output_renderer(
         view_name=view_name,
         truncated=truncated,
         error=error,
-        page=page_for_renderer(datasette, request, format_, data),
+        page=page_for_renderer(
+            datasette, request, format_, data, extra_names=page_extra_names
+        ),
         # These will be deprecated in Datasette 1.0:
         args=request.args,
         data=data,

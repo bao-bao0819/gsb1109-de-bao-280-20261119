@@ -1314,7 +1314,8 @@ The following extras are available for arbitrary SQL query responses and stored,
           "on_success_message_sql": null,
           "on_success_redirect": null,
           "on_error_message": null,
-          "on_error_redirect": null
+          "on_error_redirect": null,
+          "columns": null
         }
 
 ``extras``

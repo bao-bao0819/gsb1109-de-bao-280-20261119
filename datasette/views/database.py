@@ -13,7 +13,11 @@ from datasette.database import QueryInterrupted
 from datasette.extras import ExtraScope, extra_names_from_request
 from datasette.plugins import pm
 from datasette.resources import DatabaseResource, QueryResource
-from datasette.stored_queries import StoredQuery, stored_query_to_dict
+from datasette.stored_queries import (
+    StoredQuery,
+    declared_columns_mismatch,
+    stored_query_to_dict,
+)
 from datasette.utils import (
     InvalidSql,
     add_cors_headers,
@@ -879,6 +883,28 @@ class QueryView(View):
             except DatasetteError:
                 raise
 
+        # Stored queries can declare the column names and order they promise
+        # to return - validate the actual columns against that declaration,
+        # even when the query returned zero rows
+        if (
+            stored_query is not None
+            and stored_query.columns is not None
+            and sql
+            and not stored_query_write
+            and query_error is None
+        ):
+            mismatch = declared_columns_mismatch(stored_query.columns, columns)
+            if mismatch is not None:
+                raise DatasetteError(
+                    mismatch,
+                    title="Stored query columns do not match declared columns",
+                    status=500,
+                    error_dict={
+                        "expected_columns": list(stored_query.columns),
+                        "actual_columns": list(columns),
+                    },
+                )
+
         async def query_metadata():
             if stored_query:
                 metadata = stored_query_to_dict(stored_query)
@@ -926,6 +952,11 @@ class QueryView(View):
                 view_name="query",
                 truncated=results.truncated if results else False,
                 error=query_error,
+                page_extra_names=(
+                    {"columns"}
+                    if stored_query is not None and stored_query.columns is not None
+                    else None
+                ),
             )
         elif format_ == "html":
             headers = {}

@@ -36,6 +36,7 @@ _query_fields = {
     "description",
     "hide_sql",
     "fragment",
+    "columns",
     "parameters",
     "is_private",
     "on_success_message",
@@ -137,6 +138,22 @@ def _coerce_query_parameters(value, derived):
     if set(parameters) != set(derived):
         raise QueryValidationError("parameters must match SQL named parameters")
     return parameters
+
+
+def _coerce_query_columns(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        columns = [
+            column.strip() for column in re.split(r"[\s,]+", value) if column.strip()
+        ]
+    elif isinstance(value, list):
+        columns = value
+    else:
+        raise QueryValidationError("columns must be a list of strings")
+    if not all(isinstance(column, str) for column in columns):
+        raise QueryValidationError("columns must be a list of strings")
+    return columns
 
 
 def _analysis_is_write(analysis: SQLAnalysis) -> bool:
@@ -565,6 +582,7 @@ async def _prepare_query_create(datasette, request, db, data):
         "description": data.get("description"),
         "hide_sql": _as_bool(data.get("hide_sql")),
         "fragment": data.get("fragment"),
+        "columns": _coerce_query_columns(data.get("columns")),
         "parameters": parameters,
         "is_write": is_write,
         "is_private": _as_bool(data.get("is_private", True)),
@@ -617,6 +635,7 @@ async def _prepare_query_update(datasette, request, db, existing: StoredQuery, u
         "description": update.get("description"),
         "hide_sql": update.get("hide_sql"),
         "fragment": update.get("fragment"),
+        "columns": _coerce_query_columns(update.get("columns")),
         "parameters": parameters,
         "is_write": query_is_write,
         "is_private": update.get("is_private"),

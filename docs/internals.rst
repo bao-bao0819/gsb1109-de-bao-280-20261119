@@ -1094,6 +1094,7 @@ Adds a stored query.
         description_html=None,
         hide_sql=False,
         fragment=None,
+        columns=None,
         parameters=None,
         is_write=False,
         is_private=False,
@@ -1124,6 +1125,8 @@ Adds a stored query.
     Set to ``True`` to hide the SQL by default on the query page.
 ``fragment`` - string, optional
     A URL fragment to append to query links, for example ``"chart"``.
+``columns`` - list of strings, optional
+    Declared column names and order for the query, see :ref:`queries_options`. Every execution validates the returned columns against this list, even when no rows are returned.
 ``parameters`` - list of strings, optional
     Explicit parameter names for the query form. If omitted, Datasette derives parameters from the SQL.
 ``is_write`` - boolean, optional
@@ -1181,9 +1184,9 @@ await .get_query(database, name)
 
 Returns a ``StoredQuery`` dataclass instance, or ``None`` if the query does not exist.
 
-``StoredQuery`` has the following attributes: ``database``, ``name``, ``sql``, ``title``, ``description``, ``description_html``, ``hide_sql``, ``fragment``, ``parameters``, ``is_write``, ``is_private``, ``is_trusted``, ``source``, ``owner_id``, ``on_success_message``, ``on_success_message_sql``, ``on_success_redirect``, ``on_error_message`` and ``on_error_redirect``.
+``StoredQuery`` has the following attributes: ``database``, ``name``, ``sql``, ``title``, ``description``, ``description_html``, ``hide_sql``, ``fragment``, ``columns``, ``parameters``, ``is_write``, ``is_private``, ``is_trusted``, ``source``, ``owner_id``, ``on_success_message``, ``on_success_message_sql``, ``on_success_redirect``, ``on_error_message`` and ``on_error_redirect``.
 
-``parameters`` is a list of explicit parameter names.
+``parameters`` is a list of explicit parameter names. ``columns`` is the list of declared column names, or ``None`` if the query does not declare its columns.
 
 .. _datasette_list_queries:
 

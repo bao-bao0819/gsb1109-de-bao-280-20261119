@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import re
 import warnings
+import weakref
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -7,6 +10,7 @@ from typing import (
     Collection,
     Dict,
     Iterable,
+    Iterator,
     List,
     Optional,
     Set,
@@ -46,6 +50,7 @@ supports_attach: bool = duckdb_version >= "0.7.0"
 supports_user_agent: bool = duckdb_version >= "0.9.2"
 
 if TYPE_CHECKING:
+    import pyarrow as pa
     from sqlalchemy.base import Connection
     from sqlalchemy.engine.interfaces import _IndexDict
     from sqlalchemy.sql.type_api import _ResultProcessor
@@ -59,8 +64,16 @@ __all__ = [
     "CursorWrapper",
     "DBAPI",
     "DuckDBEngineWarning",
+    "StaleRecordBatchReaderError",
     "insert",  # reexport of sqlalchemy.dialects.postgresql.insert
 ]
+
+
+class StaleRecordBatchReaderError(RuntimeError):
+    """Raised when a record batch reader is consumed after its connection
+    has been used to run another query or after the connection was returned
+    to the pool.
+    """
 
 
 class DBAPI:
@@ -88,6 +101,79 @@ class DuckDBInspector(PGInspector):
             raise NotImplementedError() from e
 
 
+class ArrowBatchReaderRegistry:
+    """Tracks the live Arrow record batch readers of a single physical
+    DuckDB connection so that they can be explicitly invalidated when the
+    connection is reused (a new query, a rollback on pool checkin, ...).
+
+    DuckDB keeps only one result on a connection at a time: running another
+    statement tears down the previous one. Without explicit invalidation a
+    stale reader fails lazily and inconsistently (``StopIteration`` or an
+    empty table from ``read_all``), which can silently masquerade as an
+    exhausted result set instead of a usage error.
+
+    Readers are held by weak reference: the registry never extends the
+    lifetime of a reader, it only needs to be able to mark the ones that are
+    still around as stale.
+    """
+
+    def __init__(self) -> None:
+        self._live_readers: weakref.WeakSet[pa.RecordBatchReader] = weakref.WeakSet()
+        self._stale_readers: weakref.WeakSet[pa.RecordBatchReader] = weakref.WeakSet()
+
+    def register(self, native_reader: pa.RecordBatchReader) -> None:
+        self._live_readers.add(native_reader)
+
+    def invalidate_all(self) -> None:
+        for native_reader in self._live_readers:
+            # release the DuckDB-side result deterministically instead of
+            # waiting for the reader to be garbage collected; closing an
+            # already closed reader is safe
+            native_reader.close()
+            self._stale_readers.add(native_reader)
+        self._live_readers.clear()
+
+    def is_stale(self, native_reader: pa.RecordBatchReader) -> bool:
+        return native_reader in self._stale_readers
+
+
+def _wrap_record_batch_reader(
+    native_reader: pa.RecordBatchReader,
+    registry: ArrowBatchReaderRegistry,
+) -> pa.RecordBatchReader:
+    """Wrap a native DuckDB record batch reader so that batches are pulled
+    from DuckDB one at a time and the reader fails explicitly once the
+    connection moves on to another result.
+
+    The returned object is a plain pyarrow ``RecordBatchReader`` (produced via
+    ``from_batches``); only batches that the caller actually asks for are
+    pulled from DuckDB, never the whole result converted up front.
+    """
+    import pyarrow as pa
+
+    def _iter_batches() -> Iterator[pa.RecordBatch]:
+        try:
+            while True:
+                if registry.is_stale(native_reader):
+                    raise StaleRecordBatchReaderError(
+                        "record batch reader is no longer valid: the underlying "
+                        "connection has executed another statement or been "
+                        "returned to the pool"
+                    )
+                try:
+                    yield native_reader.read_next_batch()
+                except StopIteration:
+                    return
+        finally:
+            # runs on natural exhaustion and when the reader is garbage
+            # collected; closing twice is safe for the native reader
+            native_reader.close()
+
+    reader = pa.RecordBatchReader.from_batches(native_reader.schema, _iter_batches())
+    registry.register(native_reader)
+    return reader
+
+
 class ConnectionWrapper:
     __c: duckdb.DuckDBPyConnection
     notices: List[str]
@@ -97,6 +183,7 @@ class ConnectionWrapper:
     def __init__(self, c: duckdb.DuckDBPyConnection) -> None:
         self.__c = c
         self.notices = list()
+        self.arrow_readers = ArrowBatchReaderRegistry()
 
     def cursor(self) -> "CursorWrapper":
         return CursorWrapper(self.__c, self)
@@ -104,7 +191,18 @@ class ConnectionWrapper:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.__c, name)
 
+    def rollback(self) -> None:
+        # the pool calls rollback when the connection is checked back in;
+        # batch readers handed out during the checkout must not survive it
+        self.arrow_readers.invalidate_all()
+        return self.__c.rollback()
+
+    def commit(self) -> None:
+        self.arrow_readers.invalidate_all()
+        return self.__c.commit()
+
     def close(self) -> None:
+        self.arrow_readers.invalidate_all()
         self.__c.close()
         self.closed = True
 
@@ -125,6 +223,7 @@ class CursorWrapper:
         parameters: Optional[List[Dict]] = None,
         context: Optional[Any] = None,
     ) -> None:
+        self.__connection_wrapper.arrow_readers.invalidate_all()
         self.__c.executemany(statement, list(parameters) if parameters else [])
 
     def execute(
@@ -133,6 +232,9 @@ class CursorWrapper:
         parameters: Optional[Tuple] = None,
         context: Optional[Any] = None,
     ) -> None:
+        # a DuckDB connection holds a single result, so any arrow reader
+        # still pointing at the previous result becomes stale here
+        self.__connection_wrapper.arrow_readers.invalidate_all()
         try:
             if statement.lower() == "commit":  # this is largely for ipython-sql
                 self.__c.commit()
@@ -162,6 +264,14 @@ class CursorWrapper:
     @property
     def connection(self) -> "Connection":
         return self.__connection_wrapper
+
+    def fetch_record_batch(
+        self, rows_per_batch: int = 1_000_000
+    ) -> pa.RecordBatchReader:
+        native_reader = self.__c.fetch_record_batch(rows_per_batch)
+        return _wrap_record_batch_reader(
+            native_reader, self.__connection_wrapper.arrow_readers
+        )
 
     def close(self) -> None:
         pass  # closing cursors is not supported in duckdb

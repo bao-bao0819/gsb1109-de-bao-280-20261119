@@ -11,6 +11,7 @@ Basic SQLAlchemy driver for [DuckDB](https://duckdb.org/)
   - [Usage in IPython/Jupyter](#usage-in-ipythonjupyter)
   - [Configuration](#configuration)
   - [How to register a pandas DataFrame](#how-to-register-a-pandas-dataframe)
+  - [Streaming Arrow record batches](#streaming-arrow-record-batches)
   - [Things to keep in mind](#things-to-keep-in-mind)
     - [Auto-incrementing ID columns](#auto-incrementing-id-columns)
     - [Pandas `read_sql()` chunksize](#pandas-read_sql-chunksize)
@@ -98,6 +99,33 @@ conn.execute(text("register(:name, :df)"), {"name": "test_df", "df": df})
 
 conn.execute("select * from dataframe_name")
 ```
+
+## Streaming Arrow record batches
+
+After executing a statement you can consume the result as a stream of
+[`pyarrow.RecordBatch`](https://arrow.apache.org/docs/python/generated/pyarrow.RecordBatch.html)
+objects instead of Python rows. Batches are pulled from DuckDB on demand, so a
+caller that only needs the first batch never converts the whole result into
+Arrow (or rows) up front:
+
+```python
+from sqlalchemy import create_engine, text
+
+engine = create_engine("duckdb:///:memory:")
+with engine.connect() as conn:
+    result = conn.execute(text("SELECT * FROM large_table"))
+    reader = result.cursor.fetch_record_batch(rows_per_batch=1000)
+    first_batch = reader.read_next_batch()  # only this batch is produced now
+```
+
+A DuckDB connection holds a single result at a time. When the connection runs
+another statement, is committed/rolled back, or is returned to the pool, every
+reader still pointing at the previous result is invalidated. The next read on
+such a reader raises `duckdb_engine.StaleRecordBatchReaderError` (and subsequent
+reads signal a clean end); it never returns rows from the new query, and it
+does not interfere with the new result. Batches already handed to the caller
+remain usable independently. Ordinary row interfaces (`fetchall`,
+`fetchmany`, ...) are unaffected.
 
 ## Things to keep in mind
 Duckdb's SQL parser is based on the PostgreSQL parser, but not all features in PostgreSQL are supported in duckdb. Because the `duckdb_engine` dialect is derived from the `postgresql` dialect, `SQLAlchemy` may try to use PostgreSQL-only features. Below are some caveats to look out for.

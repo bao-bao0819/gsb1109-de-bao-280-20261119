@@ -1,0 +1,111 @@
+openapi: 3.0.3
+info:
+  title: Ingest API
+  version: 1.0.0
+  description: Old collector/parser contract.
+paths:
+  /events:
+    post:
+      operationId: ingestEvent
+      parameters:
+        - name: region
+          in: query
+          required: false
+          description: Optional routing region in the old contract.
+          schema:
+            type: string
+            enum: [us, eu]
+        - name: X-Tenant
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/EventEnvelope'
+components:
+  responses:
+    EventEnvelope:
+      description: A table-routed event envelope.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/EventResponse'
+  schemas:
+    EventRequest:
+      type: object
+      required: [kind, payload]
+      properties:
+        kind:
+          type: string
+          enum: [single, bulk]
+        payload:
+          type: string
+          maxLength: 4096
+        trace:
+          type: string
+          pattern: '^[a-f0-9]{8}$'
+    EventNode:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          maxLength: 64
+        edge:
+          $ref: '#/components/schemas/EventEdge'
+    EventEdge:
+      type: object
+      required: [weight]
+      properties:
+        weight:
+          type: integer
+          minimum: 0
+        from:
+          $ref: '#/components/schemas/EventNode'
+        to:
+          $ref: '#/components/schemas/EventNode'
+    BulkCountEvent:
+      x-collector-table: bulk_count
+      description: Bulk branch selected when a count is present.
+      type: object
+      required: [marker, count]
+      properties:
+        marker:
+          type: string
+          enum: [bulk]
+        count:
+          type: integer
+          minimum: 0
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EventNode'
+    BulkItemsEvent:
+      x-collector-table: bulk_items
+      description: Bulk branch selected when items are present; old also accepted the single marker.
+      type: object
+      required: [marker, items]
+      properties:
+        marker:
+          type: string
+          enum: [bulk, single]
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EventNode'
+        count:
+          type: integer
+          minimum: 0
+    EventResponse:
+      oneOf:
+        - $ref: '#/components/schemas/BulkCountEvent'
+        - $ref: '#/components/schemas/BulkItemsEvent'

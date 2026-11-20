@@ -445,6 +445,9 @@ class CodeBuilder:
             add_kwargs = False
             kw_only_fields = set()
             field_blocks = []
+            preserve_explicit_fields = config.preserve_explicit_fields
+            if preserve_explicit_fields:
+                self.add_line("__explicit_fields = set()")
             for fname, ftype in field_types.items():
                 field = self.dataclass_fields.get(fname)
                 if field and not field.init:
@@ -542,6 +545,14 @@ class CodeBuilder:
             if add_kwargs:
                 args.append("**kwargs")
             cls_inst = f"cls({', '.join(args)})"
+            if preserve_explicit_fields:
+                self.add_line(f"__obj = {cls_inst}")
+                self.add_line(
+                    "object.__setattr__("
+                    "__obj, '__mashumaro_explicit_fields__', "
+                    "__explicit_fields)"
+                )
+                cls_inst = "__obj"
 
             if post_deserialize:
                 self.add_line(f"return cls.{__POST_DESERIALIZE__}({cls_inst})")
@@ -880,6 +891,9 @@ class CodeBuilder:
             omit_default = self.get_dialect_or_config_option(
                 "omit_default", False
             )
+            preserve_explicit_fields = (
+                omit_default and config.preserve_explicit_fields
+            )
             force_value = omit_default
             packers = {}
             aliases = {}
@@ -914,6 +928,11 @@ class CodeBuilder:
             ):
                 kwargs = "kwargs"
                 self.add_line("kwargs = {}")
+                if preserve_explicit_fields:
+                    self.add_line(
+                        "__explicit_fields = "
+                        "getattr(self, '__mashumaro_explicit_fields__', ())"
+                    )
                 for fname, packer in packers.items():
                     if force_value:
                         self.add_line(f"value = self.{fname}")
@@ -940,6 +959,9 @@ class CodeBuilder:
                                     "value" if force_value else f"self.{fname}"
                                 ),
                                 omit_default=omit_default,
+                                preserve_explicit_fields=(
+                                    preserve_explicit_fields
+                                ),
                             )
                             continue
                         if not force_value:  # to add it only once
@@ -953,10 +975,24 @@ class CodeBuilder:
                                 omit_default=(
                                     omit_default and default is not None
                                 ),
+                                preserve_explicit_fields=(
+                                    preserve_explicit_fields
+                                ),
                             )
                         if omit_none and not omit_none_feature:
                             continue  # noqa: SIM114
                         elif omit_default and default is None:
+                            if preserve_explicit_fields:
+                                with self.indent("else:"):
+                                    with self.indent(
+                                        f"if '{fname}' in __explicit_fields:"
+                                    ):
+                                        self.__pack_method_set_value(
+                                            fname,
+                                            alias,
+                                            by_alias_feature,
+                                            "None",
+                                        )
                             continue
                         with self.indent("else:"):
                             if omit_none_feature:
@@ -983,6 +1019,7 @@ class CodeBuilder:
                             by_alias_feature=by_alias_feature,
                             packed_value=packer,
                             omit_default=omit_default,
+                            preserve_explicit_fields=preserve_explicit_fields,
                         )
             else:
                 kwargs_parts = []
@@ -1032,6 +1069,7 @@ class CodeBuilder:
         by_alias_feature: bool,
         packed_value: str,
         omit_default: bool,
+        preserve_explicit_fields: bool = False,
     ) -> None:
         if omit_default:
             default = self.get_field_default(fname, call_factory=True)
@@ -1046,6 +1084,10 @@ class CodeBuilder:
                     comp_expr = "not isnan(value)"
                 else:
                     comp_expr = f"value != {default_literal}"
+                if preserve_explicit_fields:
+                    comp_expr = (
+                        f"({comp_expr}) or '{fname}' in __explicit_fields"
+                    )
                 with self.indent(f"if {comp_expr}:"):
                     return self.__pack_method_set_value(
                         fname, alias, by_alias_feature, packed_value
@@ -1444,6 +1486,8 @@ class FieldUnpackerCodeBlockBuilder:
                     )
         else:
             with self.indent(f"if {packed_value} is not MISSING:"):
+                if self.parent.get_config().preserve_explicit_fields:
+                    self.add_line(f"__explicit_fields.add('{fname}')")
                 if could_be_none:
                     if unpacked_value != "value":
                         with self.indent(f"if {packed_value} is not None:"):

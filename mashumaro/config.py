@@ -53,6 +53,7 @@ class BaseConfig:
     dialect: type[Dialect] | None = None
     omit_none: bool | Literal[Sentinel.MISSING] = Sentinel.MISSING
     omit_default: bool | Literal[Sentinel.MISSING] = Sentinel.MISSING
+    preserve_explicit_fields: bool = False
     orjson_options: int | None = 0
     json_schema: Mapping[str, Any] = MappingProxyType({})
     discriminator: Discriminator | None = None

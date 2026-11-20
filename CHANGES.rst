@@ -6,6 +6,16 @@ Unreleased
 
 **New features:**
 
+- Added optional bitemporal columns to historical models - a business
+  effective date (``history_effective_date_field``), an import batch id
+  (``history_batch_id_field``) and a self-referential correction pointer
+  (``history_correction_field``) - together with ``effective_as_of()``,
+  ``state_events()`` and idempotent ``replay_batch()`` queries. They keep
+  entry time and business effective time separate, so any past export can be
+  reproduced and late backfills/corrections can be restated along the original
+  business day without losing the source rows. Legacy rows with no business
+  effective date keep using their entry date and the existing ``as_of()``
+  behavior.
 
 **Breaking changes:**
 

@@ -116,6 +116,9 @@ class HistoricalRecords:
         m2m_fields=(),
         m2m_fields_model_field_name="_history_m2m_fields",
         m2m_bases=(models.Model,),
+        history_effective_date_field=None,
+        history_batch_id_field=None,
+        history_correction_field=None,
     ):
         self.user_set_verbose_name = verbose_name
         self.user_set_verbose_name_plural = verbose_name_plural
@@ -139,6 +142,9 @@ class HistoricalRecords:
         self.historical_queryset = historical_queryset
         self.m2m_fields = m2m_fields
         self.m2m_fields_model_field_name = m2m_fields_model_field_name
+        self.history_effective_date_field = history_effective_date_field
+        self.history_batch_id_field = history_batch_id_field
+        self.history_correction_field = history_correction_field
 
         if isinstance(no_db_index, str):
             no_db_index = [no_db_index]
@@ -298,6 +304,7 @@ class HistoricalRecords:
             "_history_m2m_fields": self.get_m2m_fields_from_model(model),
             "tracked_fields": self.fields_included(model),
         }
+        attrs.update(self._get_effective_dating_config())
 
         app_module = "%s.models" % model._meta.app_label
 
@@ -495,6 +502,51 @@ class HistoricalRecords:
 
         return extra_fields
 
+    def _get_effective_dating_config(self):
+        """Class-level attributes describing the optional bitemporal columns."""
+        return {
+            "_has_effective_dates": self.history_effective_date_field is not None,
+            "_history_effective_date_field": self.history_effective_date_field,
+            "_history_batch_id_field": self.history_batch_id_field,
+            "_history_correction_field": self.history_correction_field,
+        }
+
+    def _get_effective_dating_fields(self):
+        """
+        Optional columns separating the business timeline from the entry
+        timeline:
+
+        - business effective date: when the fact is valid from a business
+          perspective; null on legacy rows, which then treat their entry date
+          (``history_date``) as the effective date;
+        - batch id: identifies the backfill/import batch a fact arrived in,
+          which makes batch replay idempotent;
+        - correction: points at the historical record this row corrects or
+          withdraws, keeping both the original fact and its correction.
+        """
+        extra_fields = {}
+        if self.history_effective_date_field:
+            extra_fields[self.history_effective_date_field] = models.DateTimeField(
+                null=True,
+                blank=True,
+                db_index=True,
+            )
+        if self.history_batch_id_field:
+            extra_fields[self.history_batch_id_field] = models.CharField(
+                max_length=100, null=True, blank=True, db_index=True
+            )
+        if self.history_correction_field:
+            correction_field = models.ForeignKey(
+                "self",
+                null=True,
+                blank=True,
+                related_name="+",
+                on_delete=models.DO_NOTHING,
+                db_constraint=False,
+            )
+            extra_fields[self.history_correction_field] = correction_field
+        return extra_fields
+
     def get_extra_fields(self, model, fields):
         """Return dict of extra fields added to the historical record model"""
 
@@ -587,6 +639,7 @@ class HistoricalRecords:
 
         extra_fields.update(self._get_history_related_field(model))
         extra_fields.update(self._get_history_user_fields())
+        extra_fields.update(self._get_effective_dating_fields())
 
         return extra_fields
 
@@ -757,6 +810,8 @@ class HistoricalRecords:
         if relation_field is not None:
             attrs["history_relation"] = instance
 
+        attrs.update(self._get_effective_dating_record_attrs(instance, manager.model))
+
         history_instance = manager.model(
             history_date=history_date,
             history_type=history_type,
@@ -787,6 +842,29 @@ class HistoricalRecords:
             history_change_reason=history_change_reason,
             using=using,
         )
+
+    def _get_effective_dating_record_attrs(self, instance, history_model):
+        """
+        Carry the optional business-timeline values from the saved instance
+        onto the historical record. Each value can be provided either as a
+        plain attribute (e.g. ``instance._history_effective_date``) or as a
+        property on the tracked model, mirroring how ``_history_date`` works.
+        """
+        attrs = {}
+        source_names = (
+            (history_model._history_effective_date_field, "_history_effective_date"),
+            (history_model._history_batch_id_field, "_history_batch_id"),
+            (history_model._history_correction_field, "_history_correction"),
+        )
+        for field_name, fallback_name in source_names:
+            if not field_name:
+                continue
+            value = getattr(instance, field_name, None)
+            if value is None and fallback_name != field_name:
+                value = getattr(instance, fallback_name, None)
+            if value is not None:
+                attrs[field_name] = value
+        return attrs
 
     def get_history_user(self, instance):
         """Get the modifying user from instance or middleware."""

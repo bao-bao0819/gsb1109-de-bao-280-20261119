@@ -1082,3 +1082,45 @@ class TestHistoricParticipantToHistoricOrganizationOneToOne(
         related_name="historic_participant",
     )
     history = HistoricalRecords()
+
+
+class CustomerStatus(models.Model):
+    """
+    Bitemporal customer status: each fact carries both an entry date
+    (``history_date``) and a business effective date, may belong to an import
+    batch, and may correct/withdraw an earlier historical record.
+    """
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    STATUS_CHOICES = ((ACTIVE, "active"), (INACTIVE, "inactive"))
+
+    customer = models.ForeignKey("Customer", on_delete=models.CASCADE)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+
+    history = HistoricalRecords(
+        history_effective_date_field="business_effective_date",
+        history_batch_id_field="import_batch_id",
+        history_correction_field="corrected_record",
+    )
+
+
+class Customer(models.Model):
+    name = models.CharField(max_length=100)
+    history = HistoricalRecords()
+
+
+class LegacyCustomer(models.Model):
+    """
+    Historical rows exist but have no business effective time: entry time
+    (``history_date``) keeps acting as the effective time, and the legacy
+    single-cutoff ``as_of`` query remains reproducible.
+    """
+
+    name = models.CharField(max_length=100)
+    status = models.CharField(max_length=20)
+
+    history = HistoricalRecords(
+        history_effective_date_field="business_effective_date",
+        history_batch_id_field="import_batch_id",
+    )

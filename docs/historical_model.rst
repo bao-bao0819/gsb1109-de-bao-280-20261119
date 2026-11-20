@@ -86,6 +86,47 @@ model, will work too.
     my_poll.save()
 
 
+Business effective date, batch id and correction fields
+--------------------------------------------------------
+
+``history_date`` always records when a fact entered the warehouse. When facts
+also have a business meaning of time (a backfill may be entered late but be
+valid from an earlier day), name an extra field to store the **business
+effective date** separately:
+
+.. code-block:: python
+
+    class CustomerStatus(models.Model):
+        status = models.CharField(max_length=20)
+
+        history = HistoricalRecords(
+            history_effective_date_field="business_effective_date",
+            history_batch_id_field="import_batch_id",
+            history_correction_field="corrected_record",
+        )
+
+All three parameters are optional:
+
+- ``history_effective_date_field`` adds a nullable indexed
+  ``DateTimeField``. Rows where it is ``NULL`` fall back to using
+  ``history_date`` as their effective date, so existing data needs no
+  backfill. See :doc:`querying_history` for the ``effective_as_of`` and
+  ``state_events`` queries that use it.
+- ``history_batch_id_field`` adds a nullable indexed ``CharField`` recording
+  which import/backfill batch a fact came from. It powers the idempotent
+  ``replay_batch`` manager method.
+- ``history_correction_field`` adds a nullable self-referential foreign key
+  naming the historical record that this row corrects or withdraws. The
+  corrected row is never deleted or overwritten; both the original fact and
+  its correction remain auditable.
+
+When saving an instance, the values for these columns are taken from
+same-named attributes on the instance (e.g.
+``instance.business_effective_date``) or, alternatively, from the
+``_history_effective_date``, ``_history_batch_id`` and
+``_history_correction`` fallback attributes.
+
+
 Indexed ``history_date``
 ------------------------
 

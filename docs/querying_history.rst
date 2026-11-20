@@ -137,6 +137,109 @@ When the queryset is returning historical records, `pk` refers to the
 `history_id` primary key.
 
 
+Bitemporal history (business effective dates)
+---------------------------------------------
+
+So far ``as_of`` only knows one timeline: ``history_date``, the moment a fact
+was *entered* into the warehouse.  Some facts also carry a **business
+effective date** - when the fact is valid from the business's point of view,
+which may be earlier than the entry date (a backfill) or later (a future-dated
+change).  Keeping the two timelines separate lets you both:
+
+- reproduce any past export exactly, by replaying only the facts that had been
+  entered by a given system cutoff, and
+- restate history along the original business day once late backfills or
+  corrections arrive.
+
+Enable the second timeline by naming a business effective date field on
+``HistoricalRecords`` (optionally together with a batch identifier and a
+pointer to the record being corrected):
+
+.. code-block:: python
+
+    class CustomerStatus(models.Model):
+        status = models.CharField(max_length=20)
+
+        history = HistoricalRecords(
+            history_effective_date_field="business_effective_date",
+            history_batch_id_field="import_batch_id",
+            history_correction_field="corrected_record",
+        )
+
+The historical model then gains:
+
+- ``business_effective_date`` (nullable): the business effective date;
+- ``import_batch_id`` (nullable): which import/backfill batch the fact came
+  from, used to make batch replay idempotent;
+- ``corrected_record`` (nullable FK to the historical model itself): the
+  earlier historical record this row corrects or withdraws. The original row
+  is always retained.
+
+The values can be supplied when saving by setting same-named attributes (or
+the ``_history_effective_date`` / ``_history_batch_id`` /
+``_history_correction`` fallbacks) on the instance, exactly like
+``_history_date``.
+
+effective_as_of
+^^^^^^^^^^^^^^^
+
+``effective_as_of(business_date, system_date=None)`` returns the state of the
+world on business day ``business_date`` using only facts entered by the system
+cutoff ``system_date``:
+
+.. code-block:: python
+
+    # what did the export produced on June 9 say about business day June 3?
+    CustomerStatus.history.effective_as_of(
+        business_date=datetime(2026, 6, 3),
+        system_date=datetime(2026, 6, 9),
+    )
+
+For every primary key, the candidate rows are those with
+``history_date <= system_date`` and an effective date no later than
+``business_date``; the row with the greatest effective date wins, with ties
+resolved by entry date and then ``history_id``. This is what makes a
+same-effective-day correction deterministic: the correction entered later
+supersedes the row it withdraws, while the withdrawn row stays in the table
+and remains visible to earlier cutoffs. The same call is available as
+``as_of(system_date, business_date=business_date)``.
+
+Facts whose business effective date is ``NULL`` keep their legacy behavior:
+their effective date is taken to be their entry date (``history_date``), so
+old rows need no backfill and the single-cutoff ``as_of(date)`` query keeps
+returning exactly what the old system saw.
+
+state_events
+^^^^^^^^^^^^
+
+``state_events(business_date, system_date=None)`` returns the winning record
+per object in business-timeline order. Each event is a dict with the object
+primary key (``pk``), the historical record actually adopted (``record``, so
+you can tell which fact produced the state) and the derived instance
+(``instance``; ``None`` for a deletion). Facts that a later correction
+withdrew never appear, because the correction replaces them on the business
+timeline.
+
+Replaying backfill batches
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``replay_batch(records, batch_id=None)`` re-enters a batch of historical
+records idempotently. Records already present - matched on the batch id and
+every stored column - are skipped, so replaying the same export file changes
+nothing and creates no duplicate state events. It returns
+``(created, skipped)`` counts:
+
+.. code-block:: python
+
+    created, skipped = CustomerStatus.history.replay_batch(
+        replay_rows, batch_id="backfill-0608"
+    )
+
+Because matching never uses the surrogate ``history_id``, replaying into an
+empty warehouse rebuilds identical facts, while replaying against an
+already-loaded warehouse is a no-op for that batch.
+
+
 is_historic and to_historic
 ---------------------------
 

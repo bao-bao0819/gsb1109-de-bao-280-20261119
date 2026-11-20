@@ -188,13 +188,32 @@ class Amount(Column):
         return parsed
 
 
+class CreditOrDebitError(ValueError):
+    """A credit/debit row cannot be interpreted under the configured convention."""
+
+
 class CreditOrDebit(Column):
     """Specialized Column for positive and negative amounts on separate columns.
 
     Parse and return the amount present in the credit or debit
-    fields. The amount in the debit field is negated before being
-    returned. Only one of the two fields may be populated. The parsing
+    fields. Only one of the two fields may be populated. The parsing
     is done as per the Amount column type.
+
+    The sign convention used by the source bank is selected through the
+    sign_policy argument:
+
+    SIGN_COLUMN (default): the columns carry unsigned magnitudes. The
+      amount found in the debit column is negated before being returned
+      and the amount found in the credit column is returned as-is. A
+      negative value in the debit column represents the reversal of an
+      entry originally posted as a debit (for example a refund of a
+      payment) and is thus accepted. Negative values in the credit
+      column have no meaning in this convention and are rejected.
+
+    SIGN_SIGNED: the columns carry globally signed values and no sign
+      transformation is applied. A negative debit is an expense and a
+      positive debit is its refund. Negative values in the credit
+      column conflict with this convention and are rejected.
 
     Args:
       credit: Column name or index for amount.
@@ -202,25 +221,41 @@ class CreditOrDebit(Column):
       subs: Dictionary mapping regular expression patterns to
         replacement strings. Substitutions are performed with
         re.sub() in the order they are specified.
+      sign_policy: Sign convention used by the source bank, either
+        SIGN_COLUMN or SIGN_SIGNED.
       default: Value to return if both fields are empty, if specified.
 
     """
 
-    def __init__(self, credit, debit, subs=None, default=NA):
+    SIGN_COLUMN = "column"
+    SIGN_SIGNED = "signed"
+
+    def __init__(
+        self, credit, debit, subs=None, sign_policy=SIGN_COLUMN, default=NA
+    ):
         super().__init__(credit, debit, default=default)
         self.subs = subs if subs is not None else {}
+        self.sign_policy = sign_policy
 
     def parse(self, credit, debit):
         if credit and debit:
-            raise ValueError(
+            raise CreditOrDebitError(
                 "The credit and debit fields cannot be populated at the same time"
             )
         if not credit and not debit:
-            raise ValueError("Neither credit or debit fields are populated")
+            raise CreditOrDebitError("Neither credit or debit fields are populated")
         value = credit if credit else debit
         for pattern, replacement in self.subs.items():
             value = re.sub(pattern, replacement, value)
         parsed = decimal.Decimal(value)
+        if credit and parsed < 0:
+            raise CreditOrDebitError(
+                "Negative credit values conflict with the configured source "
+                f"sign convention ({self.sign_policy})"
+            )
+        if self.sign_policy is self.SIGN_SIGNED:
+            # The sign is carried by the value itself: do not negate.
+            return parsed
         return parsed if credit else -parsed
 
 
@@ -235,6 +270,11 @@ class CSVMeta(abc.ABCMeta):
     def __new__(mcs, name, bases, dct):
         columns = {}
         others = {}
+        # Inherit column specifications defined on base classes so that
+        # a subclass can override a single column without redefining all
+        # of them.
+        for base in bases:
+            columns.update(getattr(base, "columns", {}))
         for key, value in dct.items():
             if isinstance(value, Column):
                 columns[key] = value
@@ -338,11 +378,55 @@ class Importer(beangulp.Importer, CSVReader):
 
     """
 
+    reconcile = False
+    """Whether to verify each row against the running book balance.
+
+    When enabled, rows that cannot be interpreted under the configured
+    amount sign convention (for example a row with both the credit and
+    debit columns populated, or a value with a sign conflicting with the
+    source bank convention) are not turned into transactions. They are
+    reported in a Note directive carrying the raw source values and the
+    reason for the rejection, and the running balance reconciliation is
+    marked as unconfirmed until the end of the file. Subsequent parsed
+    entries are flagged and statement balances are reported as Notes
+    rather than Balance assertions.
+    """
+
+    opening_balances = None
+    """Opening balances keyed by currency, used as starting point for
+    reconciliation. If not set, running balances start from zero."""
+
+    precision = None
+    """Number of decimal digits used by each currency, either a dict
+    mapping currency codes to integers or a plain integer. Used to
+    compare statement and computed balances at the currency precision."""
+
     def __init__(self, account, currency, flag="*"):
         super().__init__()
         self.importer_account = account
         self.currency = currency
         self.flag = flag
+
+    def _quantize(self, value, currency):
+        """Quantize a value at the configured precision for a currency.
+
+        If no precision is configured for the given currency, the value
+        is returned unchanged.
+        """
+        if self.precision is None:
+            return value
+        if isinstance(self.precision, dict):
+            digits = self.precision.get(currency)
+        else:
+            digits = self.precision
+        if digits is None:
+            return value
+        return value.quantize(decimal.Decimal(1).scaleb(-digits))
+
+    def _note(self, filepath, lineno, date, account, comment):
+        """Build a Note directive recording a reconciliation event."""
+        meta = data.new_metadata(filepath, lineno)
+        return data.Note(meta, date, account, comment, EMPTY, EMPTY)
 
     def date(self, filepath):
         """Implement beangulp.Importer::date()
@@ -372,8 +456,16 @@ class Importer(beangulp.Importer, CSVReader):
         """
 
         entries = []
+        extras = []
         balances = defaultdict(list)
         default_account = self.account(filepath)
+
+        # Reconciliation state, used only when self.reconcile is set.
+        opening = self.opening_balances or {}
+        running = dict(opening)
+        unconfirmed = set()
+        confirmed = defaultdict(list)
+        pending = defaultdict(list)
 
         # Compute the line number of the first data line.
         offset = int(self.header) + bool(self.names) + 1
@@ -397,7 +489,9 @@ class Importer(beangulp.Importer, CSVReader):
                 payee = getattr(row, "payee", None)
                 account = getattr(row, "account", default_account)
                 currency = getattr(row, "currency", self.currency)
-                units = data.Amount(row.amount, currency)
+                amount = row.amount
+                units = data.Amount(amount, currency)
+                stated_balance = getattr(row, "balance", None)
 
                 # Create a transaction.
                 txn = data.Transaction(
@@ -417,48 +511,152 @@ class Importer(beangulp.Importer, CSVReader):
                 txn = self.finalize(txn, row)
 
             except Exception as ex:
-                # Report input file location of processing errors. This could
-                # use Exception.add_note() instead, but this is available only
-                # with Python 3.11 and later.
-                raise RuntimeError(
-                    f"Error processing {filepath} line {lineno + 1} with values {row!r}"
-                ) from ex
+                if not self.reconcile:
+                    # Report input file location of processing errors. This could
+                    # use Exception.add_note() instead, but this is available only
+                    # with Python 3.11 and later.
+                    raise RuntimeError(
+                        f"Error processing {filepath} line {lineno + 1} "
+                        f"with values {row!r}"
+                    ) from ex
+                # The row cannot be interpreted under the configured
+                # conventions: preserve the raw source values instead of
+                # fabricating an entry, and interrupt the balance chain.
+                currency = locals().get("currency", self.currency)
+                account = locals().get("account", default_account)
+                try:
+                    note_date = row.date
+                except Exception:
+                    note_date = datetime.date.today()
+                comment = (
+                    f"rejected source row at line {lineno + 1}: {ex}; "
+                    f"raw values: {tuple(row)}"
+                )
+                extras.append(
+                    (lineno, self._note(filepath, lineno, note_date, account, comment))
+                )
+                unconfirmed.add(currency)
+                continue
 
             # Allow finalize() to reject the row extracted from the current row.
             if txn is None:
                 continue
 
-            # Add the transaction to the output list.
-            entries.append(txn)
+            if not self.reconcile:
+                # Add the transaction to the output list.
+                entries.append(txn)
 
-            # Add balance to balances list.
-            balance = getattr(row, "balance", None)
-            if balance is not None:
-                date = row.date + datetime.timedelta(days=1)
-                units = data.Amount(balance, currency)
-                meta = data.new_metadata(filepath, lineno)
-                balances[currency].append(
-                    data.Balance(meta, date, account, units, None, None)
+                # Add balance to balances list.
+                if stated_balance is not None:
+                    date = row.date + datetime.timedelta(days=1)
+                    units = data.Amount(stated_balance, currency)
+                    meta = data.new_metadata(filepath, lineno)
+                    balances[currency].append(
+                        data.Balance(meta, date, account, units, None, None)
+                    )
+                continue
+
+            # Reconciliation path: update the running balance using only
+            # the amounts of the rows that parsed successfully. Rejected
+            # rows never contribute to it.
+            running[currency] = running.get(currency, decimal.Decimal()) + amount
+            computed = self._quantize(running[currency], currency)
+
+            if stated_balance is not None:
+                stated = self._quantize(stated_balance, currency)
+                # Preserve the per-row book balance for comparison.
+                txn.meta["balance"] = data.Amount(stated_balance, currency)
+                txn.meta["computed_balance"] = data.Amount(computed, currency)
+                if currency not in unconfirmed and stated != computed:
+                    # The statement chain does not add up: keep the entry
+                    # but do not assert any balance until the discrepancy
+                    # is resolved.
+                    unconfirmed.add(currency)
+                    comment = (
+                        f"statement balance {stated} {currency} at line {lineno + 1} "
+                        f"does not match computed balance {computed} {currency}"
+                    )
+                    extras.append(
+                        (lineno, self._note(filepath, lineno, row.date, account, comment))
+                    )
+
+            if currency in unconfirmed:
+                # Mark entries parsed after the chain was interrupted as
+                # pending confirmation rather than silently accepting them.
+                txn = txn._replace(flag="!")
+                txn.meta["reconcile"] = (
+                    "unconfirmed: running balance chain interrupted by a rejected row"
                 )
 
-        if not entries:
+            entries.append(txn)
+
+            if stated_balance is not None:
+                date = row.date + datetime.timedelta(days=1)
+                record = (lineno, date, account, stated_balance, currency)
+                if currency in unconfirmed:
+                    pending[currency].append(record)
+                else:
+                    confirmed[currency].append(record)
+
+        if not entries and not (self.reconcile and extras):
             return []
 
-        if self.order is None:
-            order = (
-                Order.ASCENDING if entries[0].date <= entries[-1].date else Order.DESCENDING
-            )
+        if entries:
+            if self.order is None:
+                order = (
+                    Order.ASCENDING
+                    if entries[0].date <= entries[-1].date
+                    else Order.DESCENDING
+                )
+            else:
+                order = self.order
+
+            # Reverse the list if the file is in descending order.
+            if order is Order.DESCENDING:
+                entries.reverse()
         else:
-            order = self.order
+            order = Order.ASCENDING
 
-        # Reverse the list if the file is in descending order.
-        if order is Order.DESCENDING:
-            entries.reverse()
+        if not self.reconcile:
+            # Append balances.
+            for currency, statements in balances.items():
+                entries.append(statements[-1 if order is Order.ASCENDING else 0])
+            return entries
 
-        # Append balances.
-        for currency, balances in balances.items():
-            entries.append(balances[-1 if order is Order.ASCENDING else 0])
+        # Append confirmed balance assertions. Only the latest statement
+        # for each currency with an uninterrupted chain becomes a Balance
+        # directive. Everything that remains unconfirmed is reported in
+        # Notes and never asserted, even if the numbers happen to match.
+        for currency, statements in confirmed.items():
+            lineno, date, account, value, code = statements[
+                -1 if order is Order.ASCENDING else 0
+            ]
+            meta = data.new_metadata(filepath, lineno)
+            extras.append(
+                (
+                    lineno,
+                    data.Balance(
+                        meta,
+                        date,
+                        account,
+                        data.Amount(value, code),
+                        None,
+                        None,
+                    ),
+                )
+            )
+        for currency, statements in pending.items():
+            for lineno, date, account, value, code in statements:
+                comment = (
+                    f"unconfirmed statement balance {value} {code}: "
+                    "balance chain interrupted by a rejected row"
+                )
+                extras.append(
+                    (lineno, self._note(filepath, lineno, date, account, comment))
+                )
 
+        extras.sort(key=lambda item: item[0])
+        entries.extend(directive for _, directive in extras)
         return entries
 
     def metadata(self, filepath, lineno, row):

@@ -4,6 +4,7 @@ import re
 import unittest
 
 from beancount.core import data
+from beancount.core.number import D
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
 from beangulp.importers.csvbase import (
@@ -17,6 +18,7 @@ from beangulp.importers.csvbase import (
     Order,
     Importer,
     CreditOrDebit,
+    CreditOrDebitError,
 )
 
 
@@ -257,6 +259,50 @@ class TestCreditOrDebitColumn(unittest.TestCase):
             ValueError, "Neither credit or debit fields are populated"
         ):
             func(("", ""))
+
+    def test_column_policy_negative_debit_is_reversal(self):
+        column = CreditOrDebit(0, 1)
+        func = column.getter(None)
+        # A negative debit reverses the original (negated) direction,
+        # thus it becomes a positive amount.
+        value = func(("", "-1.250"))
+        self.assertEqual(value, decimal.Decimal("1.250"))
+
+    def test_column_policy_negative_credit_rejected(self):
+        column = CreditOrDebit(0, 1)
+        func = column.getter(None)
+        with self.assertRaisesRegex(CreditOrDebitError, "sign convention"):
+            func(("-1.250", ""))
+
+    def test_signed_policy_negative_debit_is_expense(self):
+        column = CreditOrDebit(0, 1, sign_policy=CreditOrDebit.SIGN_SIGNED)
+        func = column.getter(None)
+        value = func(("", "-1.250"))
+        self.assertEqual(value, decimal.Decimal("-1.250"))
+
+    def test_signed_policy_positive_debit_is_refund(self):
+        column = CreditOrDebit(0, 1, sign_policy=CreditOrDebit.SIGN_SIGNED)
+        func = column.getter(None)
+        value = func(("", "1.250"))
+        self.assertEqual(value, decimal.Decimal("1.250"))
+
+    def test_signed_policy_credit_unchanged(self):
+        column = CreditOrDebit(0, 1, sign_policy=CreditOrDebit.SIGN_SIGNED)
+        func = column.getter(None)
+        value = func(("1.250", ""))
+        self.assertEqual(value, decimal.Decimal("1.250"))
+
+    def test_signed_policy_negative_credit_rejected(self):
+        column = CreditOrDebit(0, 1, sign_policy=CreditOrDebit.SIGN_SIGNED)
+        func = column.getter(None)
+        with self.assertRaisesRegex(CreditOrDebitError, "sign convention"):
+            func(("-1.250", ""))
+
+    def test_both_columns_error_type(self):
+        column = CreditOrDebit(0, 1)
+        func = column.getter(None)
+        with self.assertRaises(CreditOrDebitError):
+            func(("1.0", "2.0"))
 
 
 class TestCSVMeta(unittest.TestCase):
@@ -794,6 +840,164 @@ class TestImporter(cmptest.TestCase):
         with self.assertRaisesRegex(RuntimeError, msg) as ctx:
             importer.extract(filename, [])
         self.assertIsInstance(ctx.exception.__cause__, decimal.InvalidOperation)
+
+
+class ReconcileImporter(Importer):
+    def identify(self, filepath):
+        return True
+
+    date = Date("Date")
+    narration = Column("Description")
+    amount = CreditOrDebit("Credit", "Debit")
+    balance = Amount("Balance")
+
+
+class SignedReconcileImporter(ReconcileImporter):
+    amount = CreditOrDebit(
+        "Credit", "Debit", sign_policy=CreditOrDebit.SIGN_SIGNED
+    )
+
+
+class TestReconciliation(cmptest.TestCase):
+    def _importer(self, cls, currency, opening, precision):
+        importer = cls(f"Assets:Bank:{currency}", currency)
+        importer.reconcile = True
+        importer.opening_balances = {currency: decimal.Decimal(opening)}
+        importer.precision = precision
+        return importer
+
+    @docfile
+    def test_column_policy_expense_refund_and_rejections(self, filename):
+        """\
+        Date,Description,Credit,Debit,Balance
+        2025-02-01,Coffee,,1.250,3.750
+        2025-02-02,Coffee refund,,-1.250,5.000
+        2025-02-03,Both columns populated,0.250,0.250,5.000
+        2025-02-04,Negative credit not allowed,-0.300,,5.000
+        2025-02-05,Later valid credit,0.500,,5.500
+        """
+        importer = self._importer(
+            ReconcileImporter, "BHD", "5.000", {"BHD": 3}
+        )
+        entries = importer.extract(filename, [])
+
+        txns = [e for e in entries if isinstance(e, data.Transaction)]
+        notes = [e for e in entries if isinstance(e, data.Note)]
+        balances = [e for e in entries if isinstance(e, data.Balance)]
+
+        # The two valid rows produce an expense followed by its refund,
+        # converted verbatim into signed, fixed-point amounts.
+        self.assertEqual(len(txns), 3)
+        self.assertEqual(txns[0].postings[0].units, data.Amount(-D("1.250"), "BHD"))
+        self.assertEqual(txns[1].postings[0].units, data.Amount(D("1.250"), "BHD"))
+        # Per-row book balances are retained for comparison.
+        self.assertEqual(txns[0].meta["balance"], data.Amount(D("3.750"), "BHD"))
+        self.assertEqual(txns[0].meta["computed_balance"], data.Amount(D("3.750"), "BHD"))
+        self.assertEqual(txns[1].meta["balance"], data.Amount(D("5.000"), "BHD"))
+
+        # Rows parsed after the chain was interrupted are kept but
+        # flagged, and do not absorb the uncertain balances.
+        self.assertEqual(txns[0].flag, "*")
+        self.assertEqual(txns[1].flag, "*")
+        self.assertEqual(txns[2].flag, "!")
+        self.assertIn("reconcile", txns[2].meta)
+        self.assertEqual(txns[2].postings[0].units, data.Amount(D("0.500"), "BHD"))
+
+        # Both invalid rows are rejected with their raw columns intact.
+        # The both-columns row would naively net to zero and keep the
+        # ending balance at 5.000, but it must still be rejected.
+        self.assertEqual(len(notes), 3)
+        comments = " ".join(n.comment for n in notes)
+        self.assertIn("'0.250', '0.250'", comments)
+        self.assertIn("cannot be populated at the same time", comments)
+        self.assertIn("-0.300", comments)
+        self.assertIn("sign convention", comments)
+        # The last statement balance is only reported, never asserted.
+        self.assertIn("5.500", comments)
+
+        # Only the balance confirmed before the interruption is asserted.
+        self.assertEqual(len(balances), 1)
+        self.assertEqual(balances[0].amount, data.Amount(D("5.000"), "BHD"))
+
+    @docfile
+    def test_signed_policy_expense_refund_and_rejections(self, filename):
+        """\
+        Date,Description,Credit,Debit,Balance
+        2025-02-01,Coffee,,-1.250,3.750
+        2025-02-02,Coffee refund,,1.250,5.000
+        2025-02-03,Negative credit not allowed,-0.300,,5.000
+        2025-02-04,Both columns populated,0.250,0.250,5.000
+        """
+        importer = self._importer(
+            SignedReconcileImporter, "BHD", "5.000", {"BHD": 3}
+        )
+        entries = importer.extract(filename, [])
+
+        txns = [e for e in entries if isinstance(e, data.Transaction)]
+        notes = [e for e in entries if isinstance(e, data.Note)]
+        balances = [e for e in entries if isinstance(e, data.Balance)]
+
+        # Globally signed values are taken verbatim: negative debit is
+        # the expense and positive debit is the refund.
+        self.assertEqual(len(txns), 2)
+        self.assertEqual(txns[0].postings[0].units, data.Amount(-D("1.250"), "BHD"))
+        self.assertEqual(txns[1].postings[0].units, data.Amount(D("1.250"), "BHD"))
+        self.assertEqual(txns[0].meta["computed_balance"], data.Amount(D("3.750"), "BHD"))
+        self.assertEqual(txns[1].meta["computed_balance"], data.Amount(D("5.000"), "BHD"))
+
+        comments = " ".join(n.comment for n in notes)
+        self.assertIn("-0.300", comments)
+        self.assertIn("sign convention", comments)
+        self.assertIn("'0.250', '0.250'", comments)
+
+        self.assertEqual(len(balances), 1)
+        self.assertEqual(balances[0].amount, data.Amount(D("5.000"), "BHD"))
+
+    @docfile
+    def test_zero_decimal_currency_precision(self, filename):
+        """\
+        Date,Description,Credit,Debit,Balance
+        2025-03-01,Rent,,200,800.4
+        2025-03-02,Rent refund,200,,1000
+        """
+
+        class JPYImporter(ReconcileImporter):
+            pass
+
+        importer = self._importer(JPYImporter, "JPY", "1000", {"JPY": 0})
+        entries = importer.extract(filename, [])
+
+        txns = [e for e in entries if isinstance(e, data.Transaction)]
+        balances = [e for e in entries if isinstance(e, data.Balance)]
+        self.assertEqual(txns[0].postings[0].units, data.Amount(-D("200"), "JPY"))
+        self.assertEqual(txns[1].postings[0].units, data.Amount(D("200"), "JPY"))
+        # 800.4 and the computed 800 match at the zero-decimal JPY precision.
+        self.assertEqual(txns[0].meta["computed_balance"], data.Amount(D("800"), "JPY"))
+        self.assertEqual(len(balances), 1)
+        self.assertEqual(balances[0].amount, data.Amount(D("1000"), "JPY"))
+
+    def test_quantize_precision(self):
+        importer = ReconcileImporter("Assets:Bank:BHD", "BHD")
+        importer.precision = {"BHD": 3, "JPY": 0}
+        self.assertEqual(
+            importer._quantize(D("1.2509"), "BHD"), D("1.251")
+        )
+        self.assertEqual(importer._quantize(D("800.4"), "JPY"), D("800"))
+        # Unknown currencies and missing precision are left untouched.
+        self.assertEqual(importer._quantize(D("1.23456"), "USD"), D("1.23456"))
+        importer.precision = 2
+        self.assertEqual(importer._quantize(D("1.235"), "BHD"), D("1.24"))
+
+    @docfile
+    def test_disabled_reconciliation_keeps_strict_contract(self, filename):
+        """\
+        Date,Description,Credit,Debit,Balance
+        2025-02-03,Both columns populated,0.100,0.200,5.000
+        """
+        importer = ReconcileImporter("Assets:Bank:BHD", "BHD")
+        # reconcile defaults to False: invalid rows still abort extraction.
+        with self.assertRaises(RuntimeError):
+            importer.extract(filename, [])
 
 
 class TestChomp(unittest.TestCase):

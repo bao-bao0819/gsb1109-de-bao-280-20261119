@@ -23,6 +23,7 @@ from typing import List
 from dateutil.relativedelta import relativedelta
 
 from beanquery import cursor
+from beanquery.errors import ProgrammingError
 from beanquery.parser import ast
 from beanquery import query_execute
 from beanquery import types
@@ -643,36 +644,69 @@ class EvalPivot:
 
     query: EvalQuery
     pivots: list[int]
+    values: list | None = None
+    limit: int | None = None
+
+    def _columns(self, keys):
+        """Build the pivoted column descriptions for a list of keys."""
+        targets = self.query.columns
+        col1, col2 = self.pivots
+        othertargets = [target for index, target in enumerate(targets) if index not in self.pivots]
+        nother = len(othertargets)
+
+        if nother > 1:
+            it = itertools.product(keys, othertargets)
+            names = [f'{targets[col1].name}/{targets[col2].name}'] + [f'{key}/{target.name}' for key, target in it]
+        else:
+            names = [f'{targets[col1].name}/{targets[col2].name}'] + [f'{key}' for key in keys]
+        datatypes = [targets[col1].c_expr.dtype] + [target.c_expr.dtype for target in othertargets] * len(keys)
+        return tuple(cursor.Column(name, datatype) for name, datatype in zip(names, datatypes))
+
+    @property
+    def c_targets(self):
+        if self.values is None:
+            raise ProgrammingError('PIVOT BY without an explicit column list cannot be used as a subquery')
+        return [EvalTarget(EvalConstant(None, dtype=column.datatype), column.name, False)
+                for column in self._columns(self.values)]
+
+    @property
+    def columns(self):
+        return list(self.c_targets)
 
     def __call__(self):
         columns, rows = self.query()
 
         col1, col2 = self.pivots
-        othercols = [i for i in range(len(columns)) if i not in self.pivots]
+        othercols = [index for index in range(len(columns)) if index not in self.pivots]
         nother = len(othercols)
-        other = lambda x: tuple(x[i] for i in othercols)
-        keys = sorted({row[col2] for row in rows})
+        other = lambda row: tuple(row[index] for index in othercols)
 
-        # Compute the new column names and dtypes.
-        if nother > 1:
-            it = itertools.product(keys, other(columns))
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}/{col.name}' for key, col in it]
+        if self.values is not None:
+            keys = list(self.values)
         else:
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}' for key in keys]
-        datatypes = [columns[col1].datatype] + [col.datatype for col in other(columns)] * len(keys)
-        columns = tuple(cursor.Column(name, datatype) for name, datatype in zip(names, datatypes))
+            keys = sorted({row[col2] for row in rows})
+        outcolumns = self._columns(keys)
+        key_indexes = {key: index for index, key in enumerate(keys)}
 
         # Populate the pivoted table.
         pivoted = []
         rows.sort(key=operator.itemgetter(col1))
         for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
-            outrow = [field1] + [None] * (len(columns) - 1)
+            outrow = [field1] + [None] * (len(outcolumns) - 1)
             for row in group:
-                index = keys.index(row[col2]) * nother + 1
-                outrow[index:index+nother] = other(row)
+                key_index = key_indexes.get(row[col2])
+                if key_index is None:
+                    continue
+                index = key_index * nother + 1
+                outrow[index:index + nother] = other(row)
             pivoted.append(tuple(outrow))
 
-        return columns, pivoted
+        # LIMIT applies to the expanded report rows, never to the
+        # pre-pivot group rows, so a reported row keeps all its cells.
+        if self.limit is not None:
+            pivoted = pivoted[:self.limit]
+
+        return outcolumns, pivoted
 
 
 @dataclasses.dataclass

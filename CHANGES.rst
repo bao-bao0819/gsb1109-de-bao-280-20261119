@@ -1,6 +1,20 @@
 Version 0.1 (unreleased)
 ------------------------
 
+- The ``PIVOT BY`` clause accepts an optional fixed list of values, for
+  example ``PIVOT BY 1, 2 IN ('EUR', 'USD')`` or ``PIVOT BY 1, 2 IN
+  (EUR, USD)``.  The pivoted columns always appear in the given order,
+  including values for which there are no rows.  A missing value is
+  rendered as ``NULL`` and remains distinct from an aggregated value of
+  zero.
+
+- ``LIMIT`` on a ``PIVOT BY`` query now applies to the expanded report
+  rows rather than to the grouped rows before the pivot.
+
+- A ``PIVOT BY`` query with a fixed value list can be used as a
+  subquery, allowing the report rows to be ordered and limited by an
+  outer query.
+
 - The ``HAVING`` clause for aggregate queries is now supported.
 
 - The ``empty()`` BQL function to determine whether an Inventory

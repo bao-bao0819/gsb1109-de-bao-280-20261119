@@ -1506,6 +1506,192 @@ class TestExecutePivot(QueryBase):
                 ('Expenses:Bbb', I('5.00 USD'), datetime.date(2014, 2, 2), None, None),
             ]))
 
+    def test_pivot_fixed_values(self):
+        self.assertEqual(self.execute("""
+            SELECT
+              account,
+              year(date) AS year,
+              sum(cost(position)) AS balance
+            WHERE
+              account ~ 'Expenses'
+            GROUP BY 1, 2
+            PIVOT BY 1, 2 IN (2011, 2012, 2015)"""), (
+            [
+                ('account/year', str),
+                ('2011', inventory.Inventory),
+                ('2012', inventory.Inventory),
+                ('2015', inventory.Inventory),
+            ],
+            [
+                ('Expenses:Aaa', None, I('5.00 USD'), I('8.00 USD')),
+                ('Expenses:Bbb', None, I('1.00 USD'), None),
+            ]))
+
+    def test_pivot_fixed_values_keeps_zero_and_missing_distinct(self):
+        self.assertEqual(self.execute("""
+            SELECT
+              account,
+              currency,
+              sum(number) AS balance
+            WHERE
+              account ~ 'Expenses'
+            GROUP BY 1, 2
+            PIVOT BY 1, 2 IN ('JPY', 'USD')"""), (
+            [
+                ('account/currency', str),
+                ('JPY', Decimal),
+                ('USD', Decimal),
+            ],
+            [
+                ('Expenses:Aaa', None, Decimal('23.00')),
+                ('Expenses:Bbb', None, Decimal('13.00')),
+            ]))
+
+
+class TestExecutePivotReport(QueryBase):
+    """Pivot behavior for report exports with a fixed currency column set."""
+
+    def setUp(self):
+        super().setUp()
+        entries, errors, options = loader.load_string(self.data, dedent=True)
+        self.assertFalse(errors)
+        self.ctx = beanquery.connect('beancount:', entries=entries, errors=errors, options=options)
+
+    def execute(self, query):
+        curs = self.ctx.execute(query)
+        rows = curs.fetchall()
+        columns = [(c.name, c.datatype) for c in curs.description]
+        return columns, rows
+
+    data = """
+      2024-01-01 open Assets:A
+      2024-01-01 open Assets:B
+      2024-01-01 open Assets:Other
+
+      2024-01-02 * "A USD in"
+        Assets:A       10.00 USD
+        Assets:Other  -10.00 USD
+
+      2024-01-03 * "A USD out"
+        Assets:A      -10.00 USD
+        Assets:Other   10.00 USD
+
+      2024-01-04 * "A EUR"
+        Assets:A        7.00 EUR
+        Assets:Other   -7.00 EUR
+
+      2024-01-05 * "A EUR more"
+        Assets:A        3.00 EUR
+        Assets:Other   -3.00 EUR
+
+      2024-01-06 * "B EUR"
+        Assets:B        4.00 EUR
+        Assets:Other   -4.00 EUR
+    """
+
+    query = """
+        SELECT
+          account,
+          currency,
+          sum(number) AS total,
+          count(*) AS entries
+        WHERE
+          account ~ 'Assets'
+        GROUP BY 1, 2
+        PIVOT BY 1, 2 IN ('JPY', 'EUR', 'USD')
+    """
+
+    def test_fixed_columns_and_types(self):
+        columns, rows = self.execute(self.query)
+        self.assertEqual(columns, [
+            ('account/currency', str),
+            ('JPY/total', Decimal),
+            ('JPY/entries', int),
+            ('EUR/total', Decimal),
+            ('EUR/entries', int),
+            ('USD/total', Decimal),
+            ('USD/entries', int),
+        ])
+        self.assertEqual(rows, [
+            ('Assets:A', None, None, Decimal('10.00'), 2, Decimal('0.00'), 2),
+            ('Assets:B', None, None, Decimal('4.00'), 1, None, None),
+            ('Assets:Other', None, None, Decimal('-14.00'), 3, Decimal('0.00'), 2),
+        ])
+
+    def test_limit_applies_after_expansion(self):
+        query = """
+            SELECT * FROM (
+              SELECT
+                account,
+                currency,
+                sum(number) AS total,
+                count(*) AS entries
+              WHERE
+                account ~ 'Assets'
+              GROUP BY 1, 2
+              PIVOT BY 1, 2 IN ('JPY', 'EUR', 'USD')
+            )
+            ORDER BY 1
+            LIMIT 1
+        """
+        columns, rows = self.execute(query)
+        self.assertEqual(columns[1:], [
+            ('JPY/total', Decimal),
+            ('JPY/entries', int),
+            ('EUR/total', Decimal),
+            ('EUR/entries', int),
+            ('USD/total', Decimal),
+            ('USD/entries', int),
+        ])
+        self.assertEqual(rows, [
+            ('Assets:A', None, None, Decimal('10.00'), 2, Decimal('0.00'), 2),
+        ])
+
+    def test_first_page_matches_full_row(self):
+        full_columns, full_rows = self.execute(self.query)
+        first_columns, first_rows = self.execute(self.query + ' LIMIT 1')
+        self.assertEqual(first_columns, full_columns)
+        self.assertEqual(first_rows, full_rows[:1])
+
+    def test_fixed_columns_without_matching_ledger(self):
+        entries, errors, options = loader.load_string("""
+            2024-01-01 open Assets:B
+            2024-01-01 open Assets:Other
+
+            2024-01-06 * "B EUR"
+              Assets:B        4.00 EUR
+              Assets:Other   -4.00 EUR
+        """)
+        ctx = beanquery.connect('beancount:', entries=entries, errors=errors, options=options)
+        curs = ctx.execute(self.query)
+        self.assertEqual([(c.name, c.datatype) for c in curs.description], [
+            ('account/currency', str),
+            ('JPY/total', Decimal),
+            ('JPY/entries', int),
+            ('EUR/total', Decimal),
+            ('EUR/entries', int),
+            ('USD/total', Decimal),
+            ('USD/entries', int),
+        ])
+        self.assertEqual(curs.fetchall(), [
+            ('Assets:B', None, None, Decimal('4.00'), 1, None, None),
+            ('Assets:Other', None, None, Decimal('-4.00'), 1, None, None),
+        ])
+
+    def test_unfixed_pivot_discovers_currencies(self):
+        columns, rows = self.execute("""
+            SELECT account, currency, sum(number) AS total
+            WHERE account ~ 'Assets'
+            GROUP BY 1, 2
+            PIVOT BY 1, 2
+        """)
+        self.assertEqual(columns, [
+            ('account/currency', str),
+            ('EUR', Decimal),
+            ('USD', Decimal),
+        ])
+        self.assertEqual(rows[0], ('Assets:A', Decimal('10.00'), Decimal('0.00')))
+
 
 class TestExecuteSubquery(QueryBase):
 

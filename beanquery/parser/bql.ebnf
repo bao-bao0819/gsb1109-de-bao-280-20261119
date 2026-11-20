@@ -69,6 +69,23 @@ ordering
 
 pivotby::PivotBy
     = columns+:(integer | column) ',' columns+:(integer | column)
+      [
+      | ('IN' | 'VALUES' | 'COLUMNS' | 'AT' | 'ON') values:pivotvalues
+      | values:pivotvalues
+      ]
+    ;
+
+pivotvalues
+    = '(' @:','.{ pivotvalue }+ ')'
+    | @:','.{ pivotvalue }+
+    ;
+
+pivotvalue
+    = string
+    | integer
+    | decimal
+    | date
+    | column
     ;
 
 target::Target

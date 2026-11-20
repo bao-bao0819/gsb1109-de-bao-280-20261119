@@ -153,10 +153,16 @@ class Compiler:
 
         pivots = self._compile_pivot_by(node.pivot_by, c_targets, group_indexes)
         if pivots:
-            return EvalPivot(query, pivots)
+            values = self._compile_pivot_values(node.pivot_by.values)
+            # LIMIT applies after the pivot expands group rows into report
+            # rows, so it must not cut off the pre-pivot grouped input.
+            query.limit = None
+            compiled = EvalPivot(query, pivots, values, node.limit)
+        else:
+            compiled = query
 
         self.stack.pop()
-        return query
+        return compiled
 
     def _compile_from(self, node):
         if node is None:
@@ -310,6 +316,26 @@ class Compiler:
             order_spec.append((index, descending))
 
         return new_targets[len(c_targets):], order_spec
+
+    def _compile_pivot_values(self, values):
+        """Resolve the optional fixed values for a PIVOT BY clause.
+
+        Bare identifiers are treated as literal currency names, using the
+        case as written in the query rather than the normalized column name.
+        """
+        if values is None:
+            return None
+        compiled = []
+        for value in values:
+            if isinstance(value, ast.Column):
+                text = value.text
+                if text is None or text.startswith('"'):
+                    compiled.append(value.name)
+                else:
+                    compiled.append(text)
+            else:
+                compiled.append(value)
+        return compiled
 
     def _compile_pivot_by(self, pivot_by, targets, group_indexes):
         """Compiles a PIVOT BY clause.

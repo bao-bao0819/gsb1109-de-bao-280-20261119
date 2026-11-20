@@ -25,34 +25,34 @@ from tatsu.util import re, generic_main
 
 
 KEYWORDS: set[str] = {
-    'USING',
-    'GROUP',
-    'INSERT',
-    'AND',
-    'WHERE',
-    'SELECT',
-    'FROM',
-    'DISTINCT',
+    'PIVOT',
     'BALANCES',
-    'ORDER',
+    'FALSE',
+    'CREATE',
+    'NOT',
+    'WHERE',
+    'USING',
+    'FROM',
+    'AND',
+    'INTO',
+    'HAVING',
+    'BY',
+    'TRUE',
+    'LIMIT',
+    'INSERT',
+    'OR',
     'PRINT',
     'DESC',
-    'INTO',
+    'DISTINCT',
     'IN',
-    'CREATE',
-    'OR',
-    'BY',
-    'LIMIT',
-    'FALSE',
-    'AS',
-    'HAVING',
-    'ASC',
     'IS',
     'TABLE',
-    'NOT',
-    'TRUE',
-    'PIVOT',
+    'ASC',
+    'ORDER',
+    'SELECT',
     'JOURNAL',
+    'GROUP',
+    'AS',
 }
 
 
@@ -416,10 +416,91 @@ class BQLParser(Parser):
                     '<column> <integer>'
                 )
         self.add_last_node_to_name('columns')
+        with self._optional():
+            with self._choice():
+                with self._option():
+                    with self._group():
+                        with self._choice():
+                            with self._option():
+                                self._token('IN')
+                            with self._option():
+                                self._token('VALUES')
+                            with self._option():
+                                self._token('COLUMNS')
+                            with self._option():
+                                self._token('AT')
+                            with self._option():
+                                self._token('ON')
+                            self._error(
+                                'expecting one of: '
+                                "'AT' 'COLUMNS' 'IN' 'ON' 'VALUES'"
+                            )
+                    self._pivotvalues_()
+                    self.name_last_node('values')
+                    self._define(['values'], [])
+                with self._option():
+                    self._pivotvalues_()
+                    self.name_last_node('values')
+                self._error(
+                    'expecting one of: '
+                    "'AT' 'COLUMNS' 'IN' 'ON' 'VALUES'"
+                    '<pivotvalues>'
+                )
         self._define(
-            [],
+            ['values'],
             ['columns'],
         )
+
+    @tatsumasu()
+    def _pivotvalues_(self):
+        with self._choice():
+            with self._option():
+                self._token('(')
+
+                def sep0():
+                    self._token(',')
+
+                def block1():
+                    self._pivotvalue_()
+                self._positive_gather(block1, sep0)
+                self.name_last_node('@')
+                self._token(')')
+            with self._option():
+
+                def sep2():
+                    self._token(',')
+
+                def block3():
+                    self._pivotvalue_()
+                self._positive_gather(block3, sep2)
+                self.name_last_node('@')
+            self._error(
+                'expecting one of: '
+                "'(' <column> <date> <decimal> <integer>"
+                '<pivotvalue> <string>'
+            )
+
+    @tatsumasu()
+    def _pivotvalue_(self):
+        with self._choice():
+            with self._option():
+                self._string_()
+            with self._option():
+                self._integer_()
+            with self._option():
+                self._decimal_()
+            with self._option():
+                self._date_()
+            with self._option():
+                self._column_()
+            self._error(
+                'expecting one of: '
+                '<column> <date> <decimal> <identifier>'
+                '<integer> <string> [0-9]+'
+                '[0-9]+\\.[0-9]*|[0-9]*\\.[0-9]+'
+                '[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                '\\"[^\\"]*\\"|\\\'(?:[^\\\']|\\\'\\\')*\\\''
+            )
 
     @tatsumasu('Target')
     def _target_(self):

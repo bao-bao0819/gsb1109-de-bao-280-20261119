@@ -16,6 +16,7 @@ from .transforms import (
     export_loop, convert,
     to_native, to_primitive,
 )
+from .conversion_cache import ConversionCache
 from .validate import validate, prepare_validator
 from .types import BaseType
 from .types.serializable import Serializable
@@ -224,6 +225,8 @@ class Model(object):
         kwargs.setdefault('init_values', init)
         kwargs.setdefault('apply_defaults', init)
 
+        self._conversion_cache = ConversionCache()
+
         if lazy:
             self._data = ModelDict(unsafe=raw_data, valid=trusted_data)
             return
@@ -275,7 +278,9 @@ class Model(object):
         data = self._convert(raw_data, trusted_data=_dict(self), recursive=recursive, **kwargs)
         self._data.converted.update(data)
         if kwargs.get('validate'):
-            self.validate(convert=False)
+            self.validate(convert=False,
+                config_id=kwargs.get('config_id'),
+                reuse_conversions=kwargs.get('reuse_conversions', True))
         return self
 
     def _convert(self, raw_data=None, context=None, **kwargs):
@@ -285,7 +290,18 @@ class Model(object):
 
         :param raw_data:
             New data to be imported and converted
+        :param config_id:
+            Explicit revision identifier of the source configuration. Must be
+            changed whenever a mutable source configuration is modified in
+            place, so cached conversions produced under the old configuration
+            are not reused.
+        :param reuse_conversions:
+            Enables per-instance caching of conversions of fields that declare
+            ``reuse_conversion=True``. Set to False to force every field to be
+            converted again. Default: True.
         """
+        config_id = kwargs.pop('config_id', None)
+        reuse_conversions = kwargs.pop('reuse_conversions', True)
         raw_data = _dict(raw_data) if raw_data else self._data.converted
         kwargs['trusted_data'] = kwargs.get('trusted_data') or {}
         kwargs['convert'] = getattr(context, 'convert', kwargs.get('convert', True))
@@ -294,9 +310,28 @@ class Model(object):
             raw_data = self._data.unsafe
             self._data.unsafe = {}
             kwargs['convert'] = True
+        context = self._make_conversion_context(
+            context, config_id, reuse_conversions)
         should_validate = getattr(context, 'validate', kwargs.get('validate', False))
         func = validate if should_validate else convert
         return func(self._schema, self, raw_data=raw_data, oo=True, context=context, **kwargs)
+
+    def _make_conversion_context(self, context, config_id, reuse_conversions):
+        if context is not None and getattr(context, 'initialized', False):
+            if config_id is not None \
+                    and getattr(context, 'config_id', None) != config_id:
+                context = context._branch(config_id=config_id)
+            return context
+        context = Context._make(context)
+        if not hasattr(self, '_conversion_cache'):
+            self._conversion_cache = ConversionCache()
+        context._setdefaults({
+            'conversion_cache': self._conversion_cache if reuse_conversions else None,
+            'config_id': config_id,
+            'conversion_owner': self,
+            'conversion_path': (),
+        })
+        return context
 
     def export(self, field_converter=None, role=None, app_data=None, **kwargs):
         return export_loop(self._schema, self, field_converter=field_converter,

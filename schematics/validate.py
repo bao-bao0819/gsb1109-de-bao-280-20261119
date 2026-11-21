@@ -16,7 +16,8 @@ __all__ = []
 
 
 def validate(schema, mutable, raw_data=None, trusted_data=None,
-             partial=False, strict=False, convert=True, context=None, **kwargs):
+             partial=False, strict=False, convert=True, context=None,
+             conversion_cache=None, config_id=None, **kwargs):
     """
     Validate some untrusted data using a model. Trusted data can be passed in
     the `trusted_data` parameter.
@@ -41,6 +42,13 @@ def validate(schema, mutable, raw_data=None, trusted_data=None,
         Can be turned off to skip an unnecessary conversion step if all values
         are known to have the right datatypes (e.g., when validating immediately
         after the initial import). Default: True
+    :param conversion_cache:
+        An optional :class:`~schematics.conversion_cache.ConversionCache`
+        shared with a preceding conversion run, allowing fields that declare
+        ``reuse_conversion=True`` to skip parsing a value already converted.
+    :param config_id:
+        Explicit revision of the source configuration. Must change whenever
+        the configuration is modified in place.
 
     :returns: data
         ``dict`` containing the valid raw_data plus ``trusted_data``.
@@ -50,8 +58,15 @@ def validate(schema, mutable, raw_data=None, trusted_data=None,
     if raw_data is None:
         raw_data = mutable
 
-    context = context or get_validation_context(partial=partial, strict=strict,
-        convert=convert)
+    validation_context = get_validation_context(
+        partial=partial, strict=strict, convert=convert,
+        conversion_cache=conversion_cache, config_id=config_id,
+        conversion_owner=mutable, conversion_path=())
+    if context is None:
+        context = validation_context
+    else:
+        context = Context._make(context)
+        context._setdefaults(validation_context)
 
     errors = {}
     try:
@@ -112,6 +127,10 @@ def get_validation_context(**options):
         'convert': True,
         'validate': True,
         'new': False,
+        'conversion_owner': None,
+        'conversion_path': (),
+        'conversion_cache': None,
+        'config_id': None,
     }
     validation_options.update(options)
     return Context(**validation_options)

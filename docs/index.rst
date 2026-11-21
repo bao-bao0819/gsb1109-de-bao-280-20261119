@@ -141,6 +141,7 @@ the code itself provide the most accurate reference.
    schematics.models <api/models>
    schematics.validation <api/validation>
    schematics.transforms <api/transforms>
+   schematics.conversion_cache <api/conversion_cache>
    schematics.types <api/types>
    schematics.contrib <api/contrib>
 

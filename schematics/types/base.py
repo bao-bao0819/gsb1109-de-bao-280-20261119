@@ -15,6 +15,7 @@ import uuid
 from collections import OrderedDict
 
 from ..common import *
+from ..conversion_cache import cached_conversion
 from ..exceptions import *
 from ..translator import _
 from ..undefined import Undefined
@@ -166,10 +167,17 @@ class BaseType(object):
         - *description* : Explanation of the purpose of the field. Used for
           help, tooltips, documentation, etc.
         - *example* : A concrete example of the field usage.
+    :param reuse_conversion:
+        Marks the field's ``convert`` as expensive and deterministic for a
+        given raw value and source configuration. When set, a conversion run
+        may reuse the result of a previous conversion of the same raw value
+        instead of parsing it again. Default: False.
     """
 
     primitive_type = None
     native_type = None
+
+    reuse_conversion = False
 
     MESSAGES = {
         'required': _("This field is required."),
@@ -184,7 +192,7 @@ class BaseType(object):
     def __init__(self, required=False, default=Undefined, serialized_name=None,
                  choices=None, validators=None, deserialize_from=None,
                  export_level=None, serialize_when_none=None,
-                 messages=None, metadata=None):
+                 messages=None, metadata=None, reuse_conversion=None):
         super(BaseType, self).__init__()
 
         self.required = required
@@ -210,6 +218,8 @@ class BaseType(object):
         self.parent_field = None
         self.typeclass = self.__class__
         self.is_compound = False
+        if reuse_conversion is not None:
+            self.reuse_conversion = reuse_conversion
 
         self.export_mapping = dict(
             (format, getattr(self, fname)) for format, fname in self.EXPORT_METHODS.items())
@@ -315,7 +325,9 @@ class BaseType(object):
         context = context or get_validation_context()
 
         if context.convert:
-            value = self.convert(value, context)
+            value = cached_conversion(
+                self, value, context,
+                getattr(context, 'conversion_owner', None))
         elif self.is_compound:
             self.convert(value, context)
 

@@ -7,6 +7,7 @@ import types
 from collections import OrderedDict
 
 from .common import *
+from .conversion_cache import cached_conversion
 from .datastructures import Context
 from .exceptions import *
 from .undefined import Undefined
@@ -25,7 +26,8 @@ __all__ = []
 def import_loop(schema, mutable, raw_data=None, field_converter=None, trusted_data=None,
                 mapping=None, partial=False, strict=False, init_values=False,
                 apply_defaults=False, convert=True, validate=False, new=False,
-                oo=False, recursive=False, app_data=None, context=None):
+                oo=False, recursive=False, app_data=None, context=None, owner=None,
+                conversion_cache=None, config_id=None):
     """
     The import loop is designed to take untrusted data and convert it into the
     native types, as described in ``schema``.  It does this by calling
@@ -84,7 +86,11 @@ def import_loop(schema, mutable, raw_data=None, field_converter=None, trusted_da
             'new': new,
             'oo': oo,
             'recursive': recursive,
-            'app_data': app_data if app_data is not None else {}
+            'app_data': app_data if app_data is not None else {},
+            'conversion_owner': owner if owner is not None else mutable,
+            'conversion_path': (),
+            'conversion_cache': conversion_cache,
+            'config_id': config_id,
         })
 
     raw_data = context.field_converter.pre(schema, raw_data, context)
@@ -380,7 +386,8 @@ def import_converter(field, value, context):
     field.check_required(value, context)
     if value is None or value is Undefined:
         return value
-    return field.convert(value, context)
+    owner = getattr(context, 'conversion_owner', None)
+    return cached_conversion(field, value, context, owner)
 
 
 @BasicConverter
@@ -404,7 +411,11 @@ def get_import_context(field_converter=import_converter, **options):
         'convert': True,
         'validate': False,
         'new': False,
-        'oo': False
+        'oo': False,
+        'conversion_owner': None,
+        'conversion_path': (),
+        'conversion_cache': None,
+        'config_id': None,
     }
     import_options.update(options)
     return Context(**import_options)
@@ -413,7 +424,11 @@ def get_import_context(field_converter=import_converter, **options):
 def get_export_context(field_converter=to_native_converter, **options):
     export_options = {
         'field_converter': field_converter,
-        'export_level': None
+        'export_level': None,
+        'conversion_owner': None,
+        'conversion_path': (),
+        'conversion_cache': None,
+        'config_id': None,
     }
     export_options.update(options)
     return Context(**export_options)

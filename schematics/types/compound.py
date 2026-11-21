@@ -5,6 +5,7 @@ from __future__ import unicode_literals, absolute_import
 import itertools
 
 from ..common import *
+from ..datastructures import Context
 from ..exceptions import *
 from ..transforms import (
     export_loop,
@@ -28,6 +29,14 @@ except ImportError:
 
 __all__ = ['CompoundType', 'MultiType', 'ModelType', 'ListType', 'DictType',
     'PolyModelType']
+
+
+def _branch_path(context, path):
+    """Return a context variant with the given conversion path, tolerating
+    contexts that do not implement the Context protocol."""
+    if isinstance(context, Context):
+        return context._branch(conversion_path=path)
+    return context
 
 
 class CompoundType(BaseType):
@@ -81,6 +90,17 @@ class CompoundType(BaseType):
             else:
                 field = field(**options)
         return field
+
+    def _extended_path(self, context):
+        path = tuple(getattr(context, 'conversion_path', ()) or ())
+        if self.name is not None:
+            path = path + (self.name,)
+        return path
+
+    def _branch_path(self, context):
+        """Return a context whose conversion path includes this field."""
+        return _branch_path(context, self._extended_path(context))
+
 
 MultiType = CompoundType
 
@@ -157,9 +177,9 @@ class ModelType(CompoundType):
             raise ConversionError(
                 _("Input must be a mapping or '%s' instance") % field_model_class.__name__)
         if context.convert and context.oo:
-            return model_class(value, context=context)
+            return model_class(value, context=self._branch_path(context))
         else:
-            return model_class.convert(value, context=context)
+            return model_class.convert(value, context=self._branch_path(context))
 
     def _export(self, value, format, context):
         if isinstance(value, Model):
@@ -222,9 +242,11 @@ class ListType(CompoundType):
         value = self._coerce(value)
         data = []
         errors = {}
+        base_path = self._extended_path(context)
         for index, item in enumerate(value):
+            item_context = _branch_path(context, base_path + (index,))
             try:
-                data.append(context.field_converter(self.field, item, context))
+                data.append(context.field_converter(self.field, item, item_context))
             except BaseError as exc:
                 errors[index] = exc
         if errors:
@@ -303,9 +325,11 @@ class DictType(CompoundType):
 
         data = {}
         errors = {}
+        base_path = self._extended_path(context)
         for k, v in iteritems(value):
+            item_context = _branch_path(context, base_path + (k,))
             try:
-                data[self.coerce_key(k)] = context.field_converter(self.field, v, context)
+                data[self.coerce_key(k)] = context.field_converter(self.field, v, item_context)
             except BaseError as exc:
                 errors[k] = exc
         if errors:
@@ -397,7 +421,7 @@ class PolyModelType(CompoundType):
                                         'an instance of {}').format(instanceof_msg))
 
         model_class = self.find_model(value)
-        return model_class(value, context=context)
+        return model_class(value, context=self._branch_path(context))
 
     def find_model(self, data):
         """Finds the intended type by consulting potential classes or `claim_function`."""

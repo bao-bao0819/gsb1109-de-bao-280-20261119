@@ -21,6 +21,7 @@ from .types import BaseType
 from .types.serializable import Serializable
 from .undefined import Undefined
 from .util import get_ident
+from .diff import import_changes as _import_changes
 from . import schema
 
 __all__ = []
@@ -277,6 +278,28 @@ class Model(object):
         if kwargs.get('validate'):
             self.validate(convert=False)
         return self
+
+    def import_changes(self, raw_data, role=None, deserialize_mapping=None,
+                       partial=True, strict=False, app_data=None):
+        """
+        Builds an executable change list from ``raw_data`` without modifying
+        the instance or applying field defaults.
+
+        The returned mapping uses recursive serialized keys and contains only
+        leaves that differ from the current values.  An explicit ``None``
+        requests deletion.  Aliased input keys are collapsed into one entry;
+        unequal values targeting the same leaf raise
+        :class:`~schematics.diff.ChangeConflictError`.
+
+        :param role:
+            Optional role name.  Fields hidden by the role are omitted from
+            the change list, but conflicts or conversion errors on them still
+            reject the whole submission without exposing hidden values.
+        """
+        return _import_changes(
+            self._schema, self, raw_data, role=role,
+            mapping=deserialize_mapping, partial=partial, strict=strict,
+            app_data=app_data)
 
     def _convert(self, raw_data=None, context=None, **kwargs):
         """

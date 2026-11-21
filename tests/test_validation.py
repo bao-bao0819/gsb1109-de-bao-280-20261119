@@ -610,3 +610,17 @@ def test_validate_required_on_init():
     foo = Foo({'baz': 0}, partial=True, validate=True)
     foo.bar = 1
     assert foo.serialize() == {'bar': True, 'baz': False}
+
+
+def test_validator_context_parameter_is_not_mistaken_for_short_form():
+    seen = []
+
+    class Track(Model):
+        value = StringType()
+
+        def validate_value(self, value, context):
+            seen.append(context.app_data.get('tag'))
+
+    track = Track({'value': 'x'})
+    track.validate(app_data={'tag': 'ok'})
+    assert seen == ['ok']

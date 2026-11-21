@@ -278,6 +278,36 @@ class Model(object):
             self.validate(convert=False)
         return self
 
+    def migrate(self, target_class, **kwargs):
+        """Trial-convert this instance into a new ``target_class`` model.
+
+        This is a side-effect-free "dry run": the source model's validated,
+        pending and unvalidated layers are only read.  A new target model is
+        returned only after both conversion and the target's normal validation
+        have succeeded; on failure a :class:`~schematics.migration.MigrationError`
+        is raised and no target is published.
+
+        Object identity is preserved inside the target graph.  If two fields of
+        this instance refer to the same nested model, the corresponding fields
+        of the result refer to the same new nested model.  Distinct nested
+        models remain distinct even when their content is equal.
+
+        :param target_class:
+            The Model subclass to produce.
+        """
+        from .migration import migrate
+        return migrate(self, target_class, **kwargs)
+
+    def try_migrate(self, target_class, **kwargs):
+        """Trial-convert and return ``(target, error)`` instead of raising."""
+        from .migration import try_migrate
+        return try_migrate(self, target_class, **kwargs)
+
+    migrate_to = migrate
+    trial_migrate = migrate
+    trial_convert = migrate
+    convert_trial = migrate
+
     def _convert(self, raw_data=None, context=None, **kwargs):
         """
         Converts the instance raw data into richer Python constructs according

@@ -125,10 +125,43 @@ def prepare_validator(func, argcount):
     except AttributeError:
         func_args = inspect.getargspec(func).args  # PY2
     if len(func_args) < argcount:
+        # The pipeline calls validators as ``func(mutable, data, value,
+        # context)``.  A validator may declare fewer parameters:
+        #   field:  (self, value)                  or (self, value, context)
+        #   model:  (self, data, value)            or (..., context)
+        # Trim the synthetic arguments to the declared arity and forward the
+        # context when the signature accepts it.
+        declare_context = 'context' in func_args
+
         @functools.wraps(func)
         def newfunc(*args, **kwargs):
-            if not kwargs or kwargs.pop('context', 0) == 0:
-                args = args[:-1]
+            context = kwargs.pop('context', None)
+
+            if argcount < 4:
+                # Field validator: (self, value, context).
+                args = list(args)
+                if len(args) > len(func_args):
+                    if context is None:
+                        context = args[-1]
+                    args = list(args[:len(func_args)])
+                if declare_context and context is not None and 'context' not in kwargs:
+                    kwargs['context'] = context
+                return func(*args, **kwargs)
+
+            # Model validator: (self, data, value, context).
+            args = list(args)
+            if len(args) > len(func_args):
+                if context is None:
+                    context = args[-1]
+                if len(func_args) == 2 and len(args) >= 4:
+                    args = [args[0], args[2]]
+                else:
+                    args = list(args[:len(func_args)])
+            if declare_context and context is not None and 'context' not in kwargs:
+                context_index = func_args.index('context')
+                while len(args) < context_index:
+                    args.append(None)
+                args[context_index] = context
             return func(*args, **kwargs)
         return newfunc
     return func

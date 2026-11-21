@@ -136,6 +136,53 @@ randomly-generated URL - then ``get_mock_object`` will raise a
   ...
   schematics.exceptions.MockCreationError: url: This field is too short to hold the mock data
 
+
+.. _model_migration:
+
+Trial Migration
+===============
+
+``Model.migrate`` converts an existing instance into another model class
+without importing into or validating the source.  It is useful when an
+already-loaded object must be tried against a newer schema: the source keeps
+its validated values, its pending edits and its unvalidated data untouched.
+
+::
+
+  class NewAddress(Model):
+      street = StringType()
+      city = StringType()
+
+  class NewOrder(Model):
+      billing = ModelType(NewAddress)
+      shipping = ModelType(NewAddress)
+      placed_at = DateTimeType()
+
+  >>> converted = order.migrate(NewOrder)
+  >>> converted.placed_at
+  datetime.datetime(2020, 2, 2, 10, 0)
+
+No result is returned until every conversion step and the new model's normal
+validation have passed.  On failure a ``MigrationStageError`` (conversion) or
+``MigrationValidationError`` (new-model validation) is raised.  Both expose
+``stage`` and ``field_path``::
+
+  >>> try:
+  ...     order.migrate(NewOrder)
+  ... except MigrationError as error:
+  ...     print(error.stage, error.field_path)
+
+Object identity is preserved inside the converted graph.  If two source fields
+point at the same nested model, the two corresponding target fields point at
+the same new nested model.  Equal-but-distinct source values stay distinct.
+The converted graph is independent of the source: editing it never changes the
+old instance.
+
+``migrate`` accepts an optional ``normalize`` callable, applied to converted
+values before validation, and the usual ``partial`` and ``app_data`` options.
+``Model.try_migrate`` returns ``(target, error)`` instead of raising.
+
+
 More Information
 ================
 

@@ -1105,3 +1105,160 @@ test_allow_bigquery_nested_with_expression_variables_in_subquery:
   configs:
     core:
       dialect: bigquery
+
+test_three_way_correlated_subquery_outer_reference:
+  # Three-table FULL OUTER reconciliation (see ST07.yml for the join shape).
+  # The correlated subquery reuses the outer table name ``b``; its source
+  # exposes the B key under a different alias (``kk``), so the bare ``k`` in
+  # the predicate can only resolve to the outer merged key. The unqualified
+  # ``status`` and outer ``k`` are genuine external references and RF02
+  # reports them at their own positions inside the subquery. The bare merged
+  # ``k`` in the outer select is allowed because it is a USING column. No fix
+  # is offered for either reference.
+  fail_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = k
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+  violations:
+    - code: RF02
+      description: Unqualified reference 'status' found in select with more than one
+        referenced table/view.
+      name: references.qualification
+      warning: false
+      fixes: []
+      start_line_no: 10
+      start_line_pos: 16
+      start_file_pos: 152
+      end_line_no: 10
+      end_line_pos: 22
+      end_file_pos: 158
+    - code: RF02
+      description: Unqualified reference 'k' found in select with more than one
+        referenced table/view.
+      name: references.qualification
+      warning: false
+      fixes: []
+      start_line_no: 12
+      start_line_pos: 22
+      start_file_pos: 230
+      end_line_no: 12
+      end_line_pos: 23
+      end_file_pos: 231
+
+test_three_way_correlated_subquery_outer_reference_ignored_by_config:
+  # With ``subqueries_ignore_external_references`` switched on, the external
+  # references above are deliberately ignored and the same statement passes.
+  pass_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = k
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_three_way_correlated_subquery_inner_shadowing:
+  # The counterpart query qualifies every inner reference (``b.status`` and a
+  # self-contained ``b.kk = b.kk`` predicate). The inner ``b`` now shadows the
+  # outer table of the same name, so there are no external references and the
+  # statement passes both with and without the ignore-external option.
+  pass_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT b.status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = b.kk
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+
+test_three_way_correlated_subquery_inner_shadowing_ignore_config:
+  pass_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT b.status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = b.kk
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+  configs:
+    rules:
+      references.qualification:
+        subqueries_ignore_external_references: true
+
+test_three_way_correlated_subquery_outer_reference_postgres:
+  # The external-reference diagnostics must land in the same place under
+  # postgres as under ANSI.
+  fail_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = k
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+  configs:
+    core:
+      dialect: postgres

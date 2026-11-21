@@ -263,3 +263,141 @@ test_fail_qualified_wildcard_still_fixed:
   fix_str: |
     select a.*, b.* from a
     inner join b ON a.id = b.id
+
+test_three_way_full_outer_both_using_unfixable:
+  # Three-table reconciliation with two consecutive FULL OUTER JOIN ... USING
+  # on the same key. The first join cannot be rewritten to ON because a later
+  # USING reuses the merged key (issue #8950), and the second join is never
+  # fixable on its own. A single-row CTE joined by a comma precedes the join
+  # chain, and a bare read of the merged key plus a correlated subquery sit in
+  # the select list. The inner source aliases B's key to ``kk`` so the bare
+  # ``k`` can only resolve to the outer merged key. Both USING clauses stay
+  # flagged but neither is fixed. The executable counterpart
+  # (std_RF02_ST07_three_way_test.py) checks the result column order, the
+  # sourced-status row multiset and the NULL orphans.
+  fail_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = k
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+  violations:
+    - description: Found USING statement. Expected only ON statements.
+      name: structure.using
+      warning: false
+      fixes: []
+      start_line_no: 16
+      start_line_pos: 23
+      start_file_pos: 293
+      end_line_no: 16
+      end_line_pos: 28
+      end_file_pos: 298
+    - description: Found USING statement. Expected only ON statements.
+      name: structure.using
+      warning: false
+      fixes: []
+      start_line_no: 17
+      start_line_pos: 23
+      start_file_pos: 325
+      end_line_no: 17
+      end_line_pos: 28
+      end_file_pos: 330
+
+test_three_way_full_outer_both_using_unfixable_postgres:
+  # Same statement under postgres: the two USING diagnostics and the refusal
+  # to fix must be identical to ANSI.
+  fail_str: |
+    WITH seed AS (
+        SELECT 1 AS guard
+    )
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status,
+        (
+            SELECT status
+            FROM (SELECT k AS kk, status FROM b) AS b
+            WHERE b.kk = k
+        ) AS inner_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b USING (k)
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k
+  configs:
+    core:
+      dialect: postgres
+
+test_three_way_first_using_fixable_when_isolated:
+  # Removing the second join and only reading qualified columns isolates the
+  # first USING. The comma CTE means the join connects ``a`` and ``b`` (the
+  # from_expression base and the joined element), not ``seed`` and ``a``.
+  fail_str: |
+    SELECT a.k AS a_k, b.k AS b_k, a.status, b.status
+    FROM (SELECT 1 AS guard) AS seed, a FULL OUTER JOIN b USING (k)
+  fix_str: |
+    SELECT a.k AS a_k, b.k AS b_k, a.status, b.status
+    FROM (SELECT 1 AS guard) AS seed, a FULL OUTER JOIN b ON a.k = b.k
+
+test_three_way_second_using_fixable_in_derived_table:
+  # Completing the first join inside a derived table that keeps the merged key
+  # isolates the second USING. It is then fixed against the derived alias
+  # ``ab`` and ``c``; the inner USING remains flagged but unfixable.
+  fail_str: |
+    SELECT ab.k, ab.a_status, ab.b_status, c.status AS c_status
+    FROM (
+        SELECT k, a.status AS a_status, b.status AS b_status
+        FROM a FULL OUTER JOIN b USING (k)
+    ) AS ab
+    FULL OUTER JOIN c USING (k)
+  fix_str: |
+    SELECT ab.k, ab.a_status, ab.b_status, c.status AS c_status
+    FROM (
+        SELECT k, a.status AS a_status, b.status AS b_status
+        FROM a FULL OUTER JOIN b USING (k)
+    ) AS ab
+    FULL OUTER JOIN c ON ab.k = c.k
+  violations_after_fix:
+    - description: Found USING statement. Expected only ON statements.
+      name: structure.using
+      warning: false
+      fixes: []
+      start_line_no: 4
+      start_line_pos: 30
+      start_file_pos: 153
+      end_line_no: 4
+      end_line_pos: 35
+      end_file_pos: 158
+
+test_three_way_first_using_only_rewrite_is_rejected:
+  # Rewriting only the first USING to ON while the second USING stays is not
+  # offered as a fix: the bare merged key would become ambiguous and a later
+  # USING would re-merge a de-duplicated column. The remaining USING is
+  # flagged but unfixable, and the executable test confirms the statement
+  # fails with an ambiguous-key error instead of returning the reconciliation.
+  fail_str: |
+    WITH seed AS (SELECT 1 AS guard)
+    SELECT
+        k,
+        a.status AS a_status,
+        b.status AS b_status,
+        c.status AS c_status
+    FROM seed,
+        a
+        FULL OUTER JOIN b ON a.k = b.k
+        FULL OUTER JOIN c USING (k)
+    ORDER BY k IS NULL, k

@@ -274,6 +274,7 @@ class DesignInfo(object):
     """
 
     def __init__(self, column_names, factor_infos=None, term_codings=None):
+        column_names = list(column_names)
         self.column_name_indexes = OrderedDict(
             zip(column_names, range(len(column_names)))
         )
@@ -285,6 +286,14 @@ class DesignInfo(object):
 
         self.factor_infos = factor_infos
         self.term_codings = term_codings
+
+        # Set when this DesignInfo describes a projection of another
+        # DesignInfo. _column_projection contains indexes into
+        # _source_design_info.column_names, in output order, and
+        # _source_design_info is the DesignInfo that owns the factors and term
+        # codings.
+        self._column_projection = None
+        self._source_design_info = None
 
         # factor_infos is a dict containing one entry for every factor
         #    mentioned in our terms
@@ -415,6 +424,69 @@ class DesignInfo(object):
     def column_names(self):
         "A list of the column names, in order."
         return list(self.column_name_indexes)
+
+    def project(self, columns):
+        """Create a new :class:`DesignInfo` for a column projection.
+
+        The returned :class:`DesignInfo` keeps the factors and term codings
+        of the original, so it can be used with :func:`build_design_matrices`
+        without re-fitting any stateful transforms. ``columns`` gives design
+        matrix columns in the order they should appear in the projection;
+        each entry may be a column name or a raw integer index. Columns must
+        not be repeated, because a :class:`DesignInfo` identifies columns by
+        name.
+
+        Building from a projected DesignInfo is a hint, not a contract: the
+        builder may still materialize the full design and slice it. Code that
+        wants to avoid that should inspect the returned matrix's shape.
+        """
+        source = self._source_design_info or self
+        current_names = self.column_names
+        if self._source_design_info is not None:
+            current_to_source = list(self._column_projection)
+        else:
+            current_to_source = list(range(len(current_names)))
+        if isinstance(columns, slice):
+            columns = range(*columns.indices(len(current_names)))
+        if isinstance(columns, np.ndarray) and columns.dtype == bool:
+            columns = np.flatnonzero(columns)
+        if isinstance(columns, (str, bytes)) or not hasattr(columns, "__iter__"):
+            columns = [columns]
+        indexes = []
+        for column in columns:
+            if isinstance(column, str):
+                try:
+                    current_index = current_names.index(column)
+                except ValueError:
+                    raise PatsyError("unknown column specified '%s'" % (column,))
+            elif np.issubdtype(type(column), np.integer):
+                current_index = int(column)
+                if current_index < 0:
+                    current_index += len(current_names)
+                if not 0 <= current_index < len(current_names):
+                    raise IndexError("column index out of range")
+            else:
+                raise TypeError("column specifiers must be names or integers")
+            indexes.append(current_to_source[current_index])
+        if len(set(indexes)) != len(indexes):
+            raise PatsyError("a projection cannot contain duplicate columns")
+        if self._source_design_info is None and self.term_codings is None:
+            return DesignInfo([current_names[i] for i in indexes])
+        if indexes == current_to_source:
+            return self
+        return _projected_design_info(source, indexes)
+
+    def projection(self, columns):
+        "Alias for :meth:`project`."
+        return self.project(columns)
+
+    def select_columns(self, columns):
+        "Alias for :meth:`project`."
+        return self.project(columns)
+
+    def subset_columns(self, columns):
+        "Alias for :meth:`project`."
+        return self.project(columns)
 
     @property
     def terms(self):
@@ -651,6 +723,17 @@ class DesignInfo(object):
                 raise PatsyError("right-hand-side-only formula required")
             which_terms = [term.name() for term in desc.rhs_termlist]
 
+        if self._source_design_info is not None:
+            source = self._source_design_info
+            new_source = source.subset(which_terms)
+            new_indexes = {name: i for (i, name) in enumerate(new_source.column_names)}
+            indexes = [
+                new_indexes[source.column_names[i]]
+                for i in self._column_projection
+                if source.column_names[i] in new_indexes
+            ]
+            return _projected_design_info(new_source, indexes)
+
         if self.term_codings is None:
             # This is a minimal DesignInfo
             # If the name is unknown we just let the KeyError escape
@@ -713,6 +796,17 @@ class DesignInfo(object):
         return DesignInfo(column_names)
 
     __getstate__ = no_pickling
+
+
+def _projected_design_info(design_info, indexes):
+    projected = DesignInfo([design_info.column_names[i] for i in indexes])
+    projected._column_projection = list(indexes)
+    projected._source_design_info = (
+        design_info
+        if design_info._source_design_info is None
+        else design_info._source_design_info
+    )
+    return projected
 
 
 def test_DesignInfo():

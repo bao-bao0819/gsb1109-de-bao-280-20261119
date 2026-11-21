@@ -18,7 +18,11 @@ from patsy import PatsyError
 from patsy.design_info import DesignMatrix, DesignInfo
 from patsy.eval import EvalEnvironment
 from patsy.desc import ModelDesc
-from patsy.build import design_matrix_builders, build_design_matrices
+from patsy.build import (
+    design_matrix_builders,
+    build_design_matrices,
+    _normalize_projection,
+)
 from patsy.util import have_pandas, asarray_or_pandas, atleast_2d_column_default
 
 if have_pandas:
@@ -147,7 +151,9 @@ def incr_dbuilders(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
 #   DesignInfo
 #   (DesignInfo, DesignInfo)
 #   any object with a special method __patsy_get_model_desc__
-def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
+def _do_highlevel_design(
+    formula_like, data, eval_env, NA_action, return_type, projection=None
+):
     if return_type == "dataframe" and not have_pandas:
         raise PatsyError("pandas.DataFrame was requested, but pandas is not installed")
     if return_type not in ("matrix", "dataframe"):
@@ -163,8 +169,17 @@ def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
         formula_like, data_iter_maker, eval_env, NA_action
     )
     if design_infos is not None:
+        if projection is not None:
+            lhs_design_info, rhs_design_info = design_infos
+            design_infos = [
+                lhs_design_info,
+                _normalize_projection(rhs_design_info, projection),
+            ]
         return build_design_matrices(
-            design_infos, data, NA_action=NA_action, return_type=return_type
+            design_infos,
+            data,
+            NA_action=NA_action,
+            return_type=return_type,
         )
     else:
         # No builders, but maybe we can still get matrices
@@ -227,7 +242,15 @@ def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
         return (lhs, rhs)
 
 
-def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="matrix"):
+def dmatrix(
+    formula_like,
+    data={},
+    eval_env=0,
+    NA_action="drop",
+    return_type="matrix",
+    projection=None,
+    columns=None,
+):
     """Construct a single design matrix given a formula_like and data.
 
     :arg formula_like: An object that can be used to construct a design
@@ -247,6 +270,11 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
       :class:`NAAction` object. See :class:`NAAction` for details on what
       values count as 'missing' (and how to alter this).
     :arg return_type: Either ``"matrix"`` or ``"dataframe"``. See below.
+    :arg projection: Like the ``projection`` argument to
+      :func:`build_design_matrices`; restricts the returned columns. This
+      is only applied when `formula_like` is interpreted as a formula or
+      :class:`DesignInfo`; explicit matrices are returned as given.
+    :arg columns: Alias for ``projection``.
 
     The `formula_like` can take a variety of forms. You can use any of the
     following:
@@ -290,9 +318,13 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
     """
+    if projection is not None and columns is not None:
+        raise TypeError("specify at most one of projection= and columns=")
+    if columns is not None:
+        projection = columns
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
     (lhs, rhs) = _do_highlevel_design(
-        formula_like, data, eval_env, NA_action, return_type
+        formula_like, data, eval_env, NA_action, return_type, projection
     )
     if lhs.shape[1] != 0:
         raise PatsyError(
@@ -302,7 +334,13 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
 
 
 def dmatrices(
-    formula_like, data={}, eval_env=0, NA_action="drop", return_type="matrix"
+    formula_like,
+    data={},
+    eval_env=0,
+    NA_action="drop",
+    return_type="matrix",
+    projection=None,
+    columns=None,
 ):
     """Construct two design matrices given a formula_like and data.
 
@@ -313,9 +351,13 @@ def dmatrices(
 
     See :func:`dmatrix` for details.
     """
+    if projection is not None and columns is not None:
+        raise TypeError("specify at most one of projection= and columns=")
+    if columns is not None:
+        projection = columns
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
     (lhs, rhs) = _do_highlevel_design(
-        formula_like, data, eval_env, NA_action, return_type
+        formula_like, data, eval_env, NA_action, return_type, projection
     )
     if lhs.shape[1] == 0:
         raise PatsyError("model is missing required outcome variables")

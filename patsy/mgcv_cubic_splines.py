@@ -7,6 +7,8 @@
 # These are made available in the patsy.* namespace
 __all__ = ["cr", "cc", "te"]
 
+import itertools
+
 import numpy as np
 
 from patsy.util import (
@@ -299,6 +301,11 @@ def _absorb_constraints(design_matrix, constraints):
       which is cleaner than numpy's version requiring a call like
       ``qr(..., mode='complete')`` to get a full QR decomposition.
     """
+    q, m = _constraint_null_space(constraints)
+    return np.dot(design_matrix, q[:, m:])
+
+
+def _constraint_null_space(constraints):
     try:
         from scipy import linalg
     except ImportError:  # pragma: no cover
@@ -307,7 +314,7 @@ def _absorb_constraints(design_matrix, constraints):
     m = constraints.shape[0]
     q, r = linalg.qr(np.transpose(constraints))
 
-    return np.dot(design_matrix, q[:, m:])
+    return q, m
 
 
 def _get_free_crs_dmatrix(x, knots, cyclic=False):
@@ -389,6 +396,53 @@ def _get_te_dmatrix(design_matrices, constraints=None):
         dm = _absorb_constraints(dm, constraints)
 
     return dm
+
+
+def _row_tensor_product_columns(design_matrices, columns):
+    columns = list(columns)
+    tp_nrows = design_matrices[0].shape[0]
+    out = np.empty((tp_nrows, len(columns)))
+    if not columns:
+        return out
+    for out_col, flat_col in enumerate(columns):
+        multiplier = 1.0
+        remainder = flat_col
+        for dm in reversed(design_matrices):
+            width = dm.shape[1]
+            multiplier = multiplier * dm[:, remainder % width]
+            remainder //= width
+        out[:, out_col] = multiplier
+    return out
+
+
+def _get_te_dmatrix_columns(design_matrices, constraints, columns):
+    """Build ``columns`` of the tensor product design matrix without forming
+    the full row-by-row tensor product.
+
+    This is used by prediction code that only needs a few columns. When
+    constraints are present, each output column is a linear combination of all
+    tensor-product basis columns, so the accumulation still visits every basis
+    element, but it never stores the full dense tensor-product block.
+    """
+    columns = list(columns)
+    tp_nrows = design_matrices[0].shape[0]
+    if not columns:
+        return np.empty((tp_nrows, 0))
+
+    if constraints is None:
+        return _row_tensor_product_columns(design_matrices, columns)
+
+    q, m = _constraint_null_space(constraints)
+    selected = q[:, m:][:, columns]
+    out = np.zeros((tp_nrows, len(columns)))
+    for flat_col, combo in enumerate(
+        itertools.product(*[range(dm.shape[1]) for dm in design_matrices])
+    ):
+        multiplier = 1.0
+        for dm, column_idx in zip(design_matrices, combo):
+            multiplier = multiplier * dm[:, column_idx]
+        out += np.outer(multiplier, selected[flat_col, :])
+    return out
 
 
 # Stateful Transforms
@@ -996,8 +1050,16 @@ class TE(object):
                 )
             args_2d.append(arg)
 
-        return _get_te_dmatrix(args_2d, self._constraints)
+        projected = getattr(self, "_patsy_projection_columns", None)
+        if projected is None:
+            return _get_te_dmatrix(args_2d, self._constraints)
+        # Missing data in any marginal basis column would remove the row when
+        # the full tensor product is built, so report NA from all marginals,
+        # not just the selected output columns.
+        self._patsy_projection_NA_args = args_2d
+        return _get_te_dmatrix_columns(args_2d, self._constraints, projected)
 
+    __patsy_supports_column_projection__ = True
     __getstate__ = no_pickling
 
 

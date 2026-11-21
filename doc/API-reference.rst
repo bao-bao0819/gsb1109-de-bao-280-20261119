@@ -144,6 +144,8 @@ Design metadata
 
    .. automethod:: slice
 
+   .. automethod:: project
+
    .. automethod:: subset
 
    .. automethod:: from_array

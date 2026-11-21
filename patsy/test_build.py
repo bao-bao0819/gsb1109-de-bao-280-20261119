@@ -796,3 +796,138 @@ def test_DesignInfo_subset():
     min_di_subset = min_di.subset(["c", "a"])
     assert min_di_subset.column_names == ["c", "a"]
     assert min_di_subset.terms is None
+
+
+def test_DesignInfo_project():
+    data = {"x": [1, 2], "y": [[3.1, 3.2], [4.1, 4.2]], "z": [5, 6]}
+
+    def iter_maker():
+        yield data
+
+    design_info = design_matrix_builders([make_termlist("x", "y", "z")], iter_maker, 0)[
+        0
+    ]
+    full_matrix = build_design_matrices([design_info], data)[0]
+    names = design_info.column_names
+
+    projected = design_info.project([names.index("z"), 1, 2])
+    assert projected.column_names == ["z", "y[0]", "y[1]"]
+    matrix = build_design_matrices([projected], data)[0]
+    assert matrix.design_info is projected
+    assert np.array_equal(matrix, full_matrix[:, [3, 1, 2]])
+
+    # projector is useful for keywords on build_design_matrices too
+    matrix = build_design_matrices([design_info], data, projection=[names.index("z")])[
+        0
+    ]
+    assert matrix.design_info.column_names == ["z"]
+    assert np.array_equal(matrix, full_matrix[:, [3]])
+
+    # a projection of a projection composes correctly
+    projected2 = projected.project([2, 0])
+    assert projected2.column_names == ["y[1]", "z"]
+    matrix2 = build_design_matrices([projected2], data)[0]
+    assert np.array_equal(matrix2, full_matrix[:, [2, 3]])
+
+    # build with a full projection just returns the same DesignInfo
+    assert design_info.project(list(range(len(names)))) is design_info
+
+    pytest.raises(PatsyError, design_info.project, ["unknown"])
+    pytest.raises(IndexError, design_info.project, [len(names)])
+    pytest.raises(TypeError, design_info.project, [object()])
+    pytest.raises(PatsyError, design_info.project, [0, 0])
+
+
+def test_project_tensor_with_constraint_and_missing_unselected():
+    from patsy.highlevel import incr_dbuilder
+
+    pytest.importorskip("scipy")
+    rng = np.random.RandomState(1234)
+    n = 30
+    train = {
+        "x1": rng.normal(size=n),
+        "x2": rng.normal(size=n),
+        "x3": rng.normal(size=n),
+        "a": rng.choice(["p", "q", "r"], size=n),
+    }
+    te_term = (
+        "te(cr(x1, df=4, constraints='center'), cc(x2, df=4), constraints='center')"
+    )
+    formula = te_term + " + te(cr(x3, df=4, constraints='center')) + C(a):x1"
+    design_info = incr_dbuilder(formula, lambda: iter([train]))
+    full = build_design_matrices([design_info], train)[0]
+    names = design_info.column_names
+
+    te_0 = names.index(te_term + "[0]")
+    te_11 = names.index(te_term + "[11]")
+    interaction = names.index("C(a)[p]:x1")
+    selected = [interaction, te_0, te_11]
+
+    projected = design_info.project(selected)
+    assert projected.column_names == [names[i] for i in selected]
+    matrix = build_design_matrices([projected], train)[0]
+    assert matrix.shape == (n, 3)
+    assert np.allclose(matrix, full[:, selected])
+
+    # A completely unselected tensor term with missing data still removes the
+    # affected rows, while the unselected tensor is not materialized.
+    import patsy.mgcv_cubic_splines as mgcv
+
+    projected_widths = []
+    real_get_te_columns = mgcv._get_te_dmatrix_columns
+
+    def spy_get_te_columns(design_matrices, constraints, columns):
+        projected_widths.append(len(columns))
+        return real_get_te_columns(design_matrices, constraints, columns)
+
+    new_data = {
+        "x1": np.array([0.1, 0.2, 0.3]),
+        "x2": np.array([-0.1, 0.2, 0.5]),
+        "x3": np.array([1.0, np.nan, 2.0]),
+        "a": np.array(["p", "q", "r"]),
+    }
+    full_new = build_design_matrices([design_info], new_data)[0]
+    projected_new = design_info.project(selected)
+    mgcv._get_te_dmatrix_columns = spy_get_te_columns
+    try:
+        matrix_new = build_design_matrices([projected_new], new_data)[0]
+    finally:
+        mgcv._get_te_dmatrix_columns = real_get_te_columns
+    assert matrix_new.shape == (2, 3)
+    assert np.allclose(matrix_new, full_new[:, selected])
+    # The selected tensor asks for 2 columns; the unselected one for 0.
+    assert sorted(projected_widths) == [0, 2]
+
+
+def test_project_does_not_materialize_full_tensor_block(monkeypatch):
+    import patsy.mgcv_cubic_splines as mgcv
+    from patsy.desc import ModelDesc
+
+    pytest.importorskip("scipy")
+    rng = np.random.RandomState(4321)
+    n = 20
+    train = {"x1": rng.normal(size=n), "x2": rng.normal(size=n)}
+    design_info = design_matrix_builders(
+        [
+            ModelDesc.from_formula(
+                "te(cr(x1, df=4, constraints='center'), "
+                "cc(x2, df=4), constraints='center')"
+            ).rhs_termlist
+        ],
+        lambda: iter([train]),
+        0,
+    )[0]
+    full = build_design_matrices([design_info], train)[0]
+    projected = design_info.project([3, 9])
+
+    calls = []
+    real_row_tensor = mgcv._row_tensor_product
+
+    def checked_row_tensor(dms):
+        calls.append(dms)
+        return real_row_tensor(dms)
+
+    monkeypatch.setattr(mgcv, "_row_tensor_product", checked_row_tensor)
+    matrix = build_design_matrices([projected], train)[0]
+    assert calls == []
+    assert np.allclose(matrix, full[:, [3, 9]])

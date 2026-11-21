@@ -20,7 +20,7 @@ from patsy.util import (
 )
 from patsy.design_info import DesignMatrix, DesignInfo, FactorInfo, SubtermInfo
 from patsy.redundancy import pick_contrasts_for_term
-from patsy.eval import EvalEnvironment
+from patsy.eval import EvalEnvironment, capture_obj_method_calls
 from patsy.contrasts import code_contrast_matrix, Treatment
 from patsy.compat import OrderedDict
 from patsy.missing import NAAction
@@ -63,18 +63,57 @@ def test__max_allowed_dim():
     pytest.raises(PatsyError, _max_allowed_dim, 2, np.array([[[1]]]), f)
 
 
-def _eval_factor(factor_info, data, NA_action):
+def _factor_projection_transform(factor_info):
+    """Return the top-level stateful transform for this factor, if it can
+    build only a requested subset of its columns."""
+    state = factor_info.state
+    if not isinstance(state, dict):
+        return None
+    eval_code = state.get("eval_code")
+    transforms = state.get("transforms")
+    if not isinstance(eval_code, str) or not isinstance(transforms, dict):
+        return None
+    candidates = []
+    for obj_name, transform in transforms.items():
+        if not getattr(transform, "__patsy_supports_column_projection__", False):
+            continue
+        calls = capture_obj_method_calls(obj_name, eval_code)
+        if len(calls) == 1 and calls[0][1].strip() == eval_code.strip():
+            candidates.append((obj_name, transform))
+    if len(candidates) != 1:
+        return None
+    return candidates[0][1]
+
+
+def _eval_factor(factor_info, data, NA_action, projection_columns=None):
     factor = factor_info.factor
-    result = factor.eval(factor_info.state, data)
+    transform = None
+    if projection_columns is not None:
+        transform = _factor_projection_transform(factor_info)
+    if transform is not None:
+        transform._patsy_projection_columns = list(projection_columns)
+        transform._patsy_projection_NA_args = None
+    try:
+        result = factor.eval(factor_info.state, data)
+        projection_NA_args = None
+        if transform is not None:
+            projection_NA_args = getattr(transform, "_patsy_projection_NA_args", None)
+    finally:
+        if transform is not None:
+            transform._patsy_projection_columns = None
+            transform._patsy_projection_NA_args = None
     # Returns either a 2d ndarray, or a DataFrame, plus is_NA mask
     if factor_info.type == "numerical":
         result = atleast_2d_column_default(result, preserve_pandas=True)
         _max_allowed_dim(2, result, factor)
-        if result.shape[1] != factor_info.num_columns:
+        expected_columns = (
+            factor_info.num_columns if transform is None else len(projection_columns)
+        )
+        if result.shape[1] != expected_columns:
             raise PatsyError(
                 "when evaluating factor %s, I got %s columns "
                 "instead of the %s I was expecting"
-                % (factor.name(), factor_info.num_columns, result.shape[1]),
+                % (factor.name(), result.shape[1], expected_columns),
                 factor,
             )
         if not safe_issubdtype(np.asarray(result).dtype, np.number):
@@ -83,7 +122,11 @@ def _eval_factor(factor_info, data, NA_action):
                 "I got non-numeric data of type '%s'" % (factor.name(), result.dtype),
                 factor,
             )
-        return result, NA_action.is_numerical_NA(result)
+        if projection_NA_args is not None:
+            is_NA = NA_action.is_numerical_NA(np.hstack(projection_NA_args))
+        else:
+            is_NA = NA_action.is_numerical_NA(result)
+        return result, is_NA
     # returns either a 1d ndarray or a pandas.Series, plus is_NA mask
     else:
         assert factor_info.type == "categorical"
@@ -274,13 +317,18 @@ def _subterm_column_names_iter(factor_infos, subterm):
     assert total == subterm.num_columns
 
 
-def _build_subterm(subterm, factor_infos, factor_values, out):
-    assert subterm.num_columns == out.shape[1]
+def _build_subterm(
+    subterm, factor_infos, factor_values, out, columns=None, factor_column_indexes=None
+):
+    if columns is None:
+        columns = list(range(subterm.num_columns))
+    else:
+        columns = list(columns)
+    assert len(columns) == out.shape[1]
     out[...] = 1
-    for i, column_idxs in enumerate(
-        _subterm_column_combinations(factor_infos, subterm)
-    ):
-        for factor, column_idx in zip(subterm.factors, column_idxs):
+    combinations = list(_subterm_column_combinations(factor_infos, subterm))
+    for out_i, column_i in enumerate(columns):
+        for factor, column_idx in zip(subterm.factors, combinations[column_i]):
             if factor_infos[factor].type == "categorical":
                 contrast = subterm.contrast_matrices[factor]
                 if np.any(factor_values[factor] < 0):
@@ -288,13 +336,17 @@ def _build_subterm(subterm, factor_infos, factor_values, out):
                         "can't build a design matrix containing missing values",
                         factor,
                     )
-                out[:, i] *= contrast.matrix[factor_values[factor], column_idx]
+                out[:, out_i] *= contrast.matrix[factor_values[factor], column_idx]
             else:
                 assert factor_infos[factor].type == "numerical"
-                assert (
-                    factor_values[factor].shape[1] == factor_infos[factor].num_columns
-                )
-                out[:, i] *= factor_values[factor][:, column_idx]
+                factor_info = factor_infos[factor]
+                value = factor_values[factor]
+                if factor_column_indexes and factor_info in factor_column_indexes:
+                    value_column = factor_column_indexes[factor_info][column_idx]
+                else:
+                    value_column = column_idx
+                assert value.shape[1] > value_column
+                out[:, out_i] *= value[:, value_column]
 
 
 def test__subterm_column_names_iter_and__build_subterm():
@@ -831,6 +883,118 @@ def _build_design_matrix(design_info, factor_info_to_values, dtype):
     return need_reshape, m
 
 
+def _projected_column_locations(design_info):
+    projection = design_info._column_projection
+    source = design_info._source_design_info
+    locations = []
+    start_column = 0
+    subterms = [
+        subterm for subterms in source.term_codings.values() for subterm in subterms
+    ]
+    ranges = []
+    for subterm in subterms:
+        end_column = start_column + subterm.num_columns
+        ranges.append((start_column, end_column, subterm))
+        start_column = end_column
+    for column in projection:
+        for start, end, subterm in ranges:
+            if start <= column < end:
+                locations.append((subterm, column - start))
+                break
+        else:  # pragma: no cover
+            raise AssertionError("projected column does not belong to a subterm")
+    return locations
+
+
+def _build_projected_design_matrix(
+    design_info, factor_info_to_values, dtype, factor_column_indexes=None
+):
+    projection = design_info._column_projection
+    source = design_info._source_design_info
+    factor_to_values = {}
+    num_rows = None
+    for factor_info, value in factor_info_to_values.items():
+        if source.factor_infos.get(factor_info.factor) is not factor_info:
+            continue
+        factor_to_values[factor_info.factor] = value
+        if num_rows is not None:
+            assert num_rows == value.shape[0]
+        else:
+            num_rows = value.shape[0]
+    if num_rows is None:
+        num_rows = 1
+        need_reshape = True
+    else:
+        need_reshape = False
+    m = DesignMatrix(np.empty((num_rows, len(projection)), dtype=dtype), design_info)
+    locations = _projected_column_locations(design_info)
+    position = 0
+    while position < len(locations):
+        subterm = locations[position][0]
+        end = position + 1
+        while end < len(locations) and locations[end][0] is subterm:
+            end += 1
+        columns = [column for (_, column) in locations[position:end]]
+        m_slice = m[:, position:end]
+        _build_subterm(
+            subterm,
+            source.factor_infos,
+            factor_to_values,
+            m_slice,
+            columns=columns,
+            factor_column_indexes=factor_column_indexes,
+        )
+        position = end
+    assert position == len(projection)
+    return need_reshape, m
+
+
+def _projected_factor_columns(design_info):
+    """Return the factor-local output columns needed to build a projected
+    DesignInfo.
+
+    The result maps numerical FactorInfo objects to sorted column indexes
+    into that factor's own output. Categorical factors are not included.
+    """
+    projection = design_info._column_projection
+    source = design_info._source_design_info
+    factor_to_columns = {}
+    start_column = 0
+    for term, subterms in source.term_codings.items():
+        for subterm in subterms:
+            end_column = start_column + subterm.num_columns
+            wanted = [
+                i - start_column for i in projection if start_column <= i < end_column
+            ]
+            if wanted:
+                combinations = list(
+                    _subterm_column_combinations(source.factor_infos, subterm)
+                )
+                for flat_column in wanted:
+                    for factor, factor_column in zip(
+                        subterm.factors, combinations[flat_column]
+                    ):
+                        factor_info = source.factor_infos[factor]
+                        if factor_info.type == "numerical":
+                            factor_to_columns.setdefault(factor_info, set()).add(
+                                factor_column
+                            )
+            start_column = end_column
+    return {
+        factor_info: sorted(columns)
+        for (factor_info, columns) in factor_to_columns.items()
+        if _factor_projection_transform(factor_info) is not None
+    }
+
+
+def _factor_value_indexes(factor_info_to_columns):
+    return {
+        factor_info: {column: i for (i, column) in enumerate(columns)}
+        for (factor_info, columns) in factor_info_to_columns.items()
+        if columns is not None
+    }
+
+
 class _CheckMatch(object):
     def __init__(self, name, eq_fn):
         self._name = name
@@ -858,8 +1022,45 @@ class _CheckMatch(object):
                 raise PatsyError(msg, origin)
 
 
+def _normalize_projection(design_info, projection):
+    if projection is None:
+        return design_info
+    if isinstance(projection, slice):
+        projection = range(*projection.indices(len(design_info.column_names)))
+    if isinstance(projection, np.ndarray) and projection.dtype == bool:
+        projection = np.flatnonzero(projection)
+    if isinstance(projection, (str, bytes)) or not hasattr(projection, "__iter__"):
+        projection = [projection]
+    return design_info.project(list(projection))
+
+
+def _normalize_projections(design_infos, projection):
+    if projection is None:
+        return design_infos
+    per_design = (
+        isinstance(projection, (list, tuple))
+        and len(design_infos) > 1
+        and len(projection) == len(design_infos)
+        and all(item is None or isinstance(item, (list, tuple)) for item in projection)
+    )
+    if per_design:
+        return [
+            _normalize_projection(design_info, item)
+            for (design_info, item) in zip(design_infos, projection)
+        ]
+    return [
+        _normalize_projection(design_info, projection) for design_info in design_infos
+    ]
+
+
 def build_design_matrices(
-    design_infos, data, NA_action="drop", return_type="matrix", dtype=np.dtype(float)
+    design_infos,
+    data,
+    NA_action="drop",
+    return_type="matrix",
+    dtype=np.dtype(float),
+    projection=None,
+    columns=None,
 ):
     """Construct several design matrices from :class:`DesignMatrixBuilder`
     objects.
@@ -878,6 +1079,18 @@ def build_design_matrices(
     :arg return_type: Either ``"matrix"`` or ``"dataframe"``. See below.
     :arg dtype: The dtype of the returned matrix. Useful if you want to use
       single-precision or extended-precision.
+    :arg projection: An optional specifier for building only some of the
+      columns of each design matrix. Pass a sequence of column names and/or
+      integer indexes; if it is a single string, it is treated as one column
+      name. When given, the returned matrices contain exactly those columns,
+      in that order. Building a projection may avoid materializing
+      unselected columns; factors for unselected columns are still evaluated
+      for missing values, so rows with missing data in those columns are
+      still dropped. To make a projection persistent, use
+      :meth:`DesignInfo.project` and pass the resulting DesignInfo normally.
+      When building multiple matrices and each needs its own projection, pass
+      a list with one entry per matrix.
+    :arg columns: Alias for ``projection``. Only one of the two may be given.
 
     This function returns either a list of :class:`DesignMatrix` objects (for
     ``return_type="matrix"``) or a list of :class:`pandas.DataFrame` objects
@@ -926,6 +1139,10 @@ def build_design_matrices(
        The ``NA_action`` argument.
 
     """
+    if projection is not None and columns is not None:
+        raise TypeError("specify at most one of projection= and columns=")
+    if columns is not None:
+        projection = columns
     if isinstance(NA_action, str):
         NA_action = NAAction(NA_action)
     if return_type == "dataframe" and not have_pandas:
@@ -935,6 +1152,8 @@ def build_design_matrices(
             "unrecognized output type %r, should be "
             "'matrix' or 'dataframe'" % (return_type,)
         )
+    if projection is not None:
+        design_infos = _normalize_projections(design_infos, projection)
     # Evaluate factors
     factor_info_to_values = {}
     factor_info_to_isNAs = {}
@@ -943,13 +1162,59 @@ def build_design_matrices(
     if have_pandas and isinstance(data, pandas.DataFrame):
         index_checker.check(data.index, "data.index", None)
         rows_checker.check(data.shape[0], "data argument", None)
+    # Projections are a hint that lets us skip building unselected columns.
+    # They only apply when every requested design is a projection of the same
+    # source design; otherwise we build everything normally.
+    projection_columns = None
+    projected_sources = []
     for design_info in design_infos:
+        if design_info._column_projection is None:
+            projected_sources = None
+            break
+        source = design_info._source_design_info
+        if projected_sources and projected_sources[0] is not source:
+            projected_sources = None
+            break
+        projected_sources.append(source)
+    if projected_sources:
+        projection_columns = _projected_factor_columns(design_infos[0])
+        projected_factor_infos = set(projection_columns)
+        for design_info in design_infos[1:]:
+            for factor_info, columns in _projected_factor_columns(design_info).items():
+                projected_factor_infos.add(factor_info)
+                if factor_info in projection_columns:
+                    projection_columns[factor_info] = sorted(
+                        set(projection_columns[factor_info]) | set(columns)
+                    )
+                else:
+                    projection_columns[factor_info] = columns
+        for design_info in design_infos:
+            source = design_info._source_design_info
+            for factor_info in source.factor_infos.values():
+                if factor_info in projected_factor_infos:
+                    continue
+                if _factor_projection_transform(factor_info) is not None:
+                    projection_columns[factor_info] = []
+                else:
+                    projection_columns[factor_info] = None
+    for design_info in design_infos:
+        if design_info._source_design_info is not None:
+            factor_infos = design_info._source_design_info.factor_infos.values()
+        else:
+            factor_infos = design_info.factor_infos.values()
         # We look at evaluators rather than factors here, because it might
         # happen that we have the same factor twice, but with different
         # memorized state.
-        for factor_info in design_info.factor_infos.values():
+        for factor_info in factor_infos:
             if factor_info not in factor_info_to_values:
-                value, is_NA = _eval_factor(factor_info, data, NA_action)
+                requested_columns = None
+                if projection_columns is not None:
+                    requested_columns = projection_columns.get(factor_info)
+                    if requested_columns is not None:
+                        requested_columns = list(requested_columns)
+                value, is_NA = _eval_factor(
+                    factor_info, data, NA_action, requested_columns
+                )
                 factor_info_to_isNAs[factor_info] = is_NA
                 # value may now be a Series, DataFrame, or ndarray
                 name = factor_info.factor.name()
@@ -988,9 +1253,24 @@ def build_design_matrices(
         pandas_index = new_values.pop()
     factor_info_to_values = dict(zip(factor_info_to_values, new_values))
     # Build factor values into matrices
+    factor_column_indexes = None
+    if projection_columns is not None:
+        factor_column_indexes = _factor_value_indexes(projection_columns)
     results = []
     for design_info in design_infos:
-        results.append(_build_design_matrix(design_info, factor_info_to_values, dtype))
+        if design_info._column_projection is not None:
+            results.append(
+                _build_projected_design_matrix(
+                    design_info,
+                    factor_info_to_values,
+                    dtype,
+                    factor_column_indexes=factor_column_indexes,
+                )
+            )
+        else:
+            results.append(
+                _build_design_matrix(design_info, factor_info_to_values, dtype)
+            )
     matrices = []
     for need_reshape, matrix in results:
         if need_reshape:

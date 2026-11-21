@@ -19,6 +19,7 @@ from sqlfluff.cli.helpers import (
 from sqlfluff.cli.outputstream import OutputKind, OutputPolicy, OutputStream
 from sqlfluff.core import FluffConfig, Linter, SQLBaseError, TimingSummary
 from sqlfluff.core.linter import FormatterInterface, LintedFile, ParsedString
+from sqlfluff.core.linter.patch import FixPatchConflict
 from sqlfluff.core.types import Color
 
 
@@ -180,6 +181,33 @@ class OutputStreamFormatter(FormatterInterface):
             self.dispatch_message(
                 self.format_filename(filename=filename, success=result),
                 OutputKind.ACTION,
+            )
+
+    def format_source_fix_conflict(
+        self, filename: str, conflict: FixPatchConflict
+    ) -> str:
+        """Format a single source range which needs manual fixing."""
+        start, stop = conflict.source_range
+        fix_texts = ", ".join(repr(text) for text in conflict.fix_texts)
+        return (
+            f"   {filename}:{conflict.line_no}:{conflict.line_pos}: "
+            f"MANUAL FIX REQUIRED ({conflict.reason}) source "
+            f"[{start}:{stop}] {conflict.source_str!r} "
+            f"- competing fixes: {fix_texts}"
+        )
+
+    def dispatch_source_fix_conflicts(
+        self,
+        filename: str,
+        conflicts: list[FixPatchConflict],
+    ) -> None:
+        """Dispatch source ranges which could not be auto-fixed safely."""
+        if not conflicts:
+            return
+        for conflict in conflicts:
+            self.dispatch_message(
+                self.format_source_fix_conflict(filename, conflict),
+                OutputKind.DIAGNOSTIC,
             )
 
     def _format_path(self, path: str) -> str:

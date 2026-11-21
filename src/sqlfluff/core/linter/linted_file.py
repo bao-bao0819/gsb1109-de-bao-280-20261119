@@ -23,7 +23,12 @@ from sqlfluff.core.errors import (
     SQLTemplaterError,
 )
 from sqlfluff.core.formatter import FormatterInterface
-from sqlfluff.core.linter.patch import FixPatch, generate_source_patches
+from sqlfluff.core.linter.patch import (
+    FixPatch,
+    FixPatchConflict,
+    generate_source_patches,
+    resolve_source_patches,
+)
 
 # Classes needed only for type checking
 from sqlfluff.core.parser.segments import BaseSegment
@@ -74,6 +79,11 @@ class LintedFile(NamedTuple):
     templated_file: Optional[TemplatedFile]
     encoding: str
     source_patches: Optional[list[FixPatch]] = None
+    # Source ranges which could not be auto-fixed because their expansions
+    # disagreed, only some expansions proposed the edit, or patches overlapped.
+    # These are intentionally left untouched in the source and must be reviewed
+    # manually.
+    source_patch_conflicts: Optional[list[FixPatchConflict]] = None
     # The (all, raw) segment counts of the tree, set by parallel workers when
     # they leave out a tree which the main process won't otherwise need.
     segment_counts: Optional[tuple[int, int]] = None
@@ -195,6 +205,41 @@ class LintedFile(NamedTuple):
         """Return True if there are no ignorable violations."""
         return not any(self.get_violations(filter_ignore=True))
 
+    def source_fix_conflicts(self) -> list[FixPatchConflict]:
+        """Return the source ranges which require manual fixing.
+
+        A conflict is recorded when the rendered expansions of a template
+        disagree about how a source range should be fixed (for example the two
+        iterations of a Jinja loop), when only some expansions proposed an
+        edit, or when two proposed edits overlap partially. Those ranges are
+        deliberately excluded from :meth:`fix_string` so that an automatic fix
+        never silently changes an expansion which renders differently.
+        """
+        return list(self.source_patch_conflicts or [])
+
+    def fix_report(self) -> dict[str, object]:
+        """Return a serialisable report of safe fixes and manual conflicts.
+
+        The report distinguishes the source ranges which were (or will be)
+        safely written from those which need a human decision, and includes the
+        templated positions of each expansion as evidence.
+        """
+        return {
+            "path": self.path,
+            "can_be_fixed": bool(self.num_violations(fixable=True))
+            or bool(self.source_patches)
+            or bool(self.source_patch_conflicts),
+            "safe_patch_count": len(self.source_patches or []),
+            "conflict_count": len(self.source_fix_conflicts()),
+            "conflicts": [
+                conflict.to_dict() for conflict in self.source_fix_conflicts()
+            ],
+        }
+
+    def manual_fix_ranges(self) -> list[slice]:
+        """Return the source ranges which must be fixed manually."""
+        return [conflict.source_slice for conflict in self.source_fix_conflicts()]
+
     def fix_string(self) -> tuple[str, bool]:
         """Obtain the changes to a path as a string.
 
@@ -242,9 +287,27 @@ class LintedFile(NamedTuple):
             # NOTE: In normal usage, this clause is not hit, but has been kept
             # for python API users who may rely on it. Consider deprecating
             # this clause in the future if it isn't being used.
-            filtered_source_patches = generate_source_patches(
-                self.tree, self.templated_file
+            # Resolve rather than merely generate, so that repeated expansions
+            # of a source range (e.g. a loop) are still checked for agreement
+            # and conflicting ranges are withheld.
+            resolution = resolve_source_patches(
+                [
+                    generate_source_patches(
+                        self.tree, self.templated_file, variant_idx=0
+                    )
+                ],
+                source_str=original_source,
+                templated_files=[self.templated_file],
             )
+            filtered_source_patches = resolution.patches
+            if resolution.conflicts:
+                linter_logger.warning(
+                    "%s source range(s) in %s could not be auto-fixed and "
+                    "require manual handling: %s",
+                    len(resolution.conflicts),
+                    self.path,
+                    [conflict.source_range for conflict in resolution.conflicts],
+                )
         linter_logger.debug("Filtered source patches:")
         for idx, patch in enumerate(filtered_source_patches):
             linter_logger.debug("    %s: %s", idx, patch)
@@ -415,6 +478,14 @@ class LintedFile(NamedTuple):
 
         if formatter:
             formatter.dispatch_persist_filename(filename=self.path, result=result_label)
+            # Surface any ranges which could not be fixed automatically so that
+            # the user knows exactly where manual handling is required. This is
+            # reported regardless of whether anything was written, because an
+            # unfixed conflict is a property of the source, not of this run.
+            formatter.dispatch_source_fix_conflicts(
+                filename=self.path,
+                conflicts=self.source_fix_conflicts(),
+            )
 
         return success
 

@@ -18,6 +18,7 @@ from sqlfluff.core.types import Color
 if TYPE_CHECKING:  # pragma: no cover
     from sqlfluff.core.config import FluffConfig
     from sqlfluff.core.linter import LintedFile
+    from sqlfluff.core.linter.patch import FixPatchConflict
 
 
 class FormatterInterface(ABC):
@@ -27,6 +28,20 @@ class FormatterInterface(ABC):
     def dispatch_persist_filename(self, filename: str, result: str) -> None:
         """Called after a formatted file as been persisted to disk."""
         ...
+
+    def dispatch_source_fix_conflicts(
+        self,
+        filename: str,
+        conflicts: "list[FixPatchConflict]",
+    ) -> None:
+        """Dispatch source ranges which could not be auto-fixed.
+
+        These are ranges where the rendered expansions of a template disagreed
+        about a fix, so the source was deliberately left untouched. Users need
+        to resolve them manually. The default implementation is a no-op so that
+        formatters which don't care about this remain valid.
+        """
+        return None
 
     @abstractmethod
     def dispatch_lint_header(self, fname: str, rules: list[str]) -> None:

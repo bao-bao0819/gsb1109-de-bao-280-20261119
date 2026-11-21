@@ -11,6 +11,7 @@ from sqlfluff.core.linter.patch import (
     FixPatch,
     generate_source_patches,
     merge_source_patches,
+    resolve_source_patches,
 )
 from sqlfluff.core.parser.markers import PositionMarker
 from sqlfluff.core.parser.segments import (
@@ -439,9 +440,22 @@ def test__fix__merge_source_patches_dedupes_and_skips_conflicts():
     patch_b = FixPatch(slice(3, 4), "B", "literal", slice(3, 4), "d", "d")
     conflicting_patch = FixPatch(slice(3, 4), "C", "literal", slice(3, 4), "d", "d")
 
+    # The identical edits on (1, 2) collapse to one patch. The two *different*
+    # edits on (3, 4) cannot both be written, so that range is withheld rather
+    # than letting whichever variant was processed first win.
     assert merge_source_patches(
         [[patch_a, patch_b], [patch_a_dup, conflicting_patch]]
-    ) == [patch_a, patch_b]
+    ) == [patch_a]
+
+    resolution = resolve_source_patches(
+        [[patch_a, patch_b], [patch_a_dup, conflicting_patch]]
+    )
+    assert resolution.patches == [patch_a]
+    assert resolution.conflict_count == 1
+    conflict = resolution.conflicts[0]
+    assert conflict.source_range == (3, 4)
+    assert conflict.is_incompatible
+    assert conflict.fix_texts == ["B", "C"]
 
 
 def test__fix__merge_source_patches_skips_conflicting_insertions_at_same_point():
@@ -464,9 +478,169 @@ def test__fix__merge_source_patches_skips_conflicting_insertions_at_same_point()
         "",
     )
 
-    assert merge_source_patches([[first_insertion], [conflicting_insertion]]) == [
-        first_insertion
+    # Neither insertion can be written: they point at the same source offset
+    # but disagree about the inserted text.
+    assert merge_source_patches([[first_insertion], [conflicting_insertion]]) == []
+    resolution = resolve_source_patches([[first_insertion], [conflicting_insertion]])
+    assert resolution.patches == []
+    assert resolution.conflict_count == 1
+    assert resolution.conflicts[0].source_range == (2, 2)
+    assert resolution.conflicts[0].is_incompatible
+
+
+def test__fix__merge_source_patches_is_order_independent():
+    """Swapping the variant order must not change the winner of a conflict."""
+    patch_a = FixPatch(slice(1, 2), "A", "literal", slice(1, 2), "b", "b")
+    first_winner = FixPatch(slice(3, 4), "B", "literal", slice(3, 4), "d", "d")
+    second_winner = FixPatch(slice(3, 4), "C", "literal", slice(3, 4), "d", "d")
+
+    forward = resolve_source_patches([[patch_a, first_winner], [second_winner]])
+    backward = resolve_source_patches([[second_winner], [first_winner, patch_a]])
+
+    assert forward.patches == backward.patches == [patch_a]
+    assert forward.to_dict() == backward.to_dict()
+
+
+def test__fix__merge_source_patches_keeps_only_confirmed_expansions():
+    """A fix proposed by only some expansions is withheld as unconfirmed."""
+    # The range is rendered twice (occurrence_count=2) but only one expansion
+    # proposed the edit, so writing it would change the other expansion.
+    first_expansion = FixPatch(
+        slice(4, 5),
+        "A",
+        "literal",
+        slice(4, 5),
+        "b",
+        "b",
+        variant_idx=0,
+        occurrence_count=2,
+    )
+    other_expansion_safe = FixPatch(
+        slice(8, 9),
+        "B",
+        "literal",
+        slice(8, 9),
+        "d",
+        "d",
+        variant_idx=0,
+        occurrence_count=1,
+    )
+
+    resolution = resolve_source_patches([[first_expansion, other_expansion_safe]])
+    assert resolution.patches == [other_expansion_safe]
+    assert resolution.conflict_count == 1
+    conflict = resolution.conflicts[0]
+    assert conflict.source_range == (4, 5)
+    assert conflict.is_unconfirmed
+    assert conflict.expected_occurrences == 2
+    assert conflict.proposed_occurrences == 1
+
+
+def test__fix__merge_source_patches_keeps_agreed_expansions():
+    """When every expansion agrees, the fix is written exactly once."""
+    occurrences = [
+        FixPatch(
+            slice(4 + offset, 5 + offset),
+            "A",
+            "literal",
+            slice(4, 5),
+            "b",
+            "b",
+            variant_idx=0,
+            occurrence_count=2,
+        )
+        for offset in (0, 10)
     ]
+
+    resolution = resolve_source_patches([occurrences])
+    assert len(resolution.patches) == 1
+    assert resolution.patches[0].fixed_raw == "A"
+    assert not resolution.conflicts
+
+
+def test__fix__merge_source_patches_withholds_partial_overlaps():
+    """Two different, partially overlapping ranges cannot both be applied."""
+    small = FixPatch(slice(2, 4), "AB", "literal", slice(2, 4), "cd", "cd")
+    large = FixPatch(slice(3, 6), "DEF", "literal", slice(3, 6), "def", "def")
+
+    resolution = resolve_source_patches([[small, large]])
+    # Neither is written, and both ranges are reported as overlapping.
+    assert resolution.patches == []
+    assert resolution.conflict_count == 2
+    assert all(conflict.is_overlapping for conflict in resolution.conflicts)
+    assert {conflict.source_range for conflict in resolution.conflicts} == {
+        (2, 4),
+        (3, 6),
+    }
+
+
+def test__fix__merge_source_patches_allows_adjacent_point_insertions():
+    """An insertion on a range boundary does not clash with that range."""
+    insertion = FixPatch(slice(2, 2), "+", "mid_point", slice(2, 2), "", "")
+    replacement = FixPatch(slice(2, 4), "AB", "literal", slice(2, 4), "cd", "cd")
+
+    resolution = resolve_source_patches([[insertion, replacement]])
+    assert resolution.patches == [insertion, replacement]
+    assert not resolution.conflicts
+
+
+def test__fix__merge_source_patches_multiple_disjoint_overlaps_report_once():
+    """Each withheld overlapping range is reported exactly once."""
+    # Two ranges overlap one shared range. Both are withheld, and the shared
+    # overlap evidence should not produce duplicate reports.
+    left = FixPatch(slice(1, 4), "L", "literal", slice(1, 4), "abc", "abc")
+    right = FixPatch(slice(3, 6), "R", "literal", slice(3, 6), "cde", "cde")
+
+    resolution = resolve_source_patches([[left, right]])
+    assert resolution.patches == []
+    assert [conflict.source_range for conflict in resolution.conflicts] == [
+        (1, 4),
+        (3, 6),
+    ]
+
+
+def test__fix__merge_source_patches_reports_overlapping_insertions():
+    """Two insertions strictly inside the same range conflict with it."""
+    replacement = FixPatch(
+        slice(0, 6), "ABCDEF", "literal", slice(0, 6), "abcdef", "abcdef"
+    )
+    inner_insertion = FixPatch(slice(3, 3), "X", "mid_point", slice(3, 3), "", "")
+
+    resolution = resolve_source_patches([[replacement, inner_insertion]])
+    assert resolution.patches == []
+    assert resolution.conflict_count == 2
+    assert all(conflict.is_overlapping for conflict in resolution.conflicts)
+
+
+def test__fix__source_patch_resolution_public_api():
+    """The resolution and conflict expose a stable public reporting API."""
+    patch = FixPatch(slice(1, 2), "A", "literal", slice(1, 2), "b", "b")
+    conflicting = FixPatch(slice(1, 2), "C", "literal", slice(1, 2), "b", "b")
+
+    resolution = resolve_source_patches([[patch, conflicting]], source_str="abc")
+    assert resolution.has_conflicts
+    assert resolution.safe_patches == []
+    assert resolution.to_dict()["conflict_count"] == 1
+
+    conflict = resolution.conflicts[0]
+    assert conflict.is_incompatible
+    assert not conflict.is_unconfirmed
+    assert not conflict.is_overlapping
+    assert conflict.to_dict()["source_range"] == [1, 2]
+    assert "incompatible" in str(conflict)
+
+    # The aliases point at the same reporting types.
+    from sqlfluff.core.linter.patch import (
+        FixPatchConflict,
+        FixReport,
+        PatchConflict,
+        SourceFixConflict,
+        SourcePatchResolution,
+    )
+
+    assert PatchConflict is FixPatchConflict
+    assert SourceFixConflict is FixPatchConflict
+    assert FixReport is SourcePatchResolution
 
 
 @pytest.mark.parametrize(

@@ -38,7 +38,11 @@ from sqlfluff.core.linter.linted_file import (
     LintedFile,
 )
 from sqlfluff.core.linter.linting_result import LintingResult
-from sqlfluff.core.linter.patch import generate_source_patches, merge_source_patches
+from sqlfluff.core.linter.patch import (
+    SourcePatchResolution,
+    generate_source_patches,
+    resolve_source_patches,
+)
 from sqlfluff.core.parser import Lexer, Parser
 from sqlfluff.core.parser.segments.base import BaseSegment, SourceFix
 from sqlfluff.core.rules import BaseRule, RulePack, get_ruleset
@@ -745,7 +749,7 @@ class Linter:
         time_dict = parsed.time_dict
         tree: Optional[BaseSegment] = None
         templated_file: Optional[TemplatedFile] = None
-        merged_source_patches = None
+        source_resolution: Optional[SourcePatchResolution] = None
         t0 = time.monotonic()
 
         root_variant = parsed.root_variant()
@@ -773,6 +777,9 @@ class Linter:
             linter_logger.info("lint_parsed - linting root variant (%s)", parsed.fname)
             assert root_variant.tree  # We just checked this.
             variant_source_patches = []
+            # Templated files aligned with `variant_source_patches`, used to
+            # count how often a source range is expanded in each render.
+            variant_templated_files = []
             (
                 fixed_tree,
                 initial_linting_errors,
@@ -793,8 +800,13 @@ class Linter:
             tree = fixed_tree
             if fix:
                 variant_source_patches.append(
-                    generate_source_patches(fixed_tree, root_variant.templated_file)
+                    generate_source_patches(
+                        fixed_tree,
+                        root_variant.templated_file,
+                        variant_idx=0,
+                    )
                 )
+                variant_templated_files.append(root_variant.templated_file)
 
             # We're only going to return the *initial* errors, rather
             # than any generated during the fixing cycle.
@@ -826,11 +838,28 @@ class Linter:
                         generate_source_patches(
                             alt_fixed_tree,
                             alternate_variant.templated_file,
+                            # Index by position in the aligned patch buffers,
+                            # i.e. the root render is 0 and alternates follow.
+                            variant_idx=len(variant_source_patches),
                         )
                     )
+                    variant_templated_files.append(alternate_variant.templated_file)
 
             if fix:
-                merged_source_patches = merge_source_patches(variant_source_patches)
+                source_resolution = resolve_source_patches(
+                    variant_source_patches,
+                    source_str=root_variant.templated_file.source_str,
+                    templated_files=variant_templated_files,
+                )
+                for conflict in source_resolution.conflicts:
+                    linter_logger.warning(
+                        "Not auto-fixing source range %s (line %s, position %s): "
+                        "%s. Manual review required.",
+                        conflict.source_range,
+                        conflict.line_no,
+                        conflict.line_pos,
+                        conflict.reason,
+                    )
 
         # If no root variant, we should still apply ignores to any parsing
         # or templating fails.
@@ -876,7 +905,10 @@ class Linter:
             ignore_mask=ignore_mask,
             templated_file=templated_file,
             encoding=encoding,
-            source_patches=merged_source_patches,
+            source_patches=(source_resolution.patches if source_resolution else None),
+            source_patch_conflicts=(
+                source_resolution.conflicts if source_resolution else None
+            ),
         )
 
         # This is the main command line output from linting.

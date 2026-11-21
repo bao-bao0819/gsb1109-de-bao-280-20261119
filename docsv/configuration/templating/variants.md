@@ -67,6 +67,48 @@ that changes the SQL structure, for example:
 If your templates are mostly simple substitutions, macros, or library calls,
 variant rendering is less likely to change lint coverage.
 
+## Fixing Across Variants
+
+Auto-fixing is more delicate when the same source range is rendered more than
+once. This happens whenever a template repeats a fragment, most commonly the
+body of a `{% for %}` loop, but also when the same literal is rendered from two
+different `{% if %}` branches.
+
+SQLFluff resolves the fixes proposed by each expansion in source space. A
+source range is only written back when the evidence is unambiguous:
+
+* **Every expansion agrees.** The same edit is proposed by every expansion of
+  that source range, so it is written once, regardless of how many times the
+  fragment is rendered. This also deduplicates identical fixes from different
+  variants.
+* **Expansions disagree.** If two expansions of the same source range propose
+  different text, SQLFluff does **not** pick a winner. Writing either edit
+  would change an expansion which renders differently, so the range is left
+  untouched and reported for manual handling.
+* **Only some expansions propose an edit.** If a source range is rendered
+  several times inside one render but only some expansions propose a fix, the
+  remaining expansions were already correct. Applying the fix would break them,
+  so it is withheld and reported.
+* **Patches overlap partially.** Two edits which cover different but
+  overlapping source ranges cannot both be applied. Both are withheld and
+  reported.
+
+Fixes which are genuinely independent (for example an edit outside the loop)
+are still applied. A conflict on one range never blocks safe fixes elsewhere in
+the same file.
+
+Reporting is emitted by `sqlfluff fix` as a `MANUAL FIX REQUIRED` line per
+conflicting range, identifying the file, line and position, the real source
+range, and the competing fixes. The same information is available from the
+Python API via `LintedFile.source_fix_conflicts()` and `LintedFile.fix_report()`,
+which also include the templated position of each expansion as evidence.
+
+Resolution never depends on the order in which expansions or variants were
+processed: swapping the loop body (or the order of renders) changes which fix
+text belongs to which expansion, but not whether the range is safe to fix.
+Re-running `fix` on the resulting file does not change ranges which were
+already fixed safely.
+
 ## Limitations
 
 There are still some important limits:

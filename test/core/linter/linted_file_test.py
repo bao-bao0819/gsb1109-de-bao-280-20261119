@@ -321,3 +321,61 @@ def test__linted_file__fix_string_generates_patches_when_not_precomputed():
 
     assert changed
     assert fixed_sql == "SELECT\n    1\n"
+
+
+def test__linted_file__fallback_fix_string_withholds_loop_conflicts(caplog):
+    """The legacy fallback path must also resolve repeat-expansion conflicts.
+
+    Even without precomputed patches, fixes from different expansions of the
+    same source range must be checked for agreement before being written.
+    """
+    from sqlfluff.core.rules import BaseRule, LintResult
+    from sqlfluff.core.rules.crawlers import RootOnlyCrawler
+    from sqlfluff.core.rules.fix import LintFix
+
+    class Rule_T950(BaseRule):
+        """Rewrite each loop expansion of `x` differently."""
+
+        groups = ("all",)
+        crawl_behaviour = RootOnlyCrawler()
+        is_fix_compatible = True
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._seen = 0
+
+        def _eval(self, context):
+            results = []
+            for seg in context.segment.raw_segments:
+                if seg.raw == "x" and seg.is_code:
+                    self._seen += 1
+                    value = "X1" if self._seen == 1 else "X2"
+                    results.append(
+                        LintResult(
+                            anchor=seg,
+                            fixes=[LintFix.replace(seg, [seg.edit(value)])],
+                        )
+                    )
+            return results
+
+    sql = "{% for x in [1, 2] %}\nSELECT foo = x;\n{% endfor %}\n"
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "templater": "jinja",
+            "rules": "T950",
+            "render_variant_limit": 5,
+        }
+    )
+    linter = Linter(config=config, user_rules=[Rule_T950])
+    linted = linter.lint_string(sql, fix=True, fname="test.sql")
+    # Drop the precomputed resolution so the compatibility path is exercised.
+    legacy_linted = linted._replace(source_patches=None, source_patch_conflicts=None)
+
+    with caplog.at_level(logging.WARNING, logger="sqlfluff.linter"):
+        fixed_sql, changed = legacy_linted.fix_string()
+
+    # The conflicting range is untouched, not arbitrarily resolved.
+    assert not changed
+    assert "foo = x" in fixed_sql
+    assert "required manual handling" in caplog.text or "Manual review" in caplog.text

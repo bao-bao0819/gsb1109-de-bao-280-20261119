@@ -27,7 +27,7 @@ except ImportError:
     from collections import Iterable, Sequence, Mapping  # PY2
 
 __all__ = ['CompoundType', 'MultiType', 'ModelType', 'ListType', 'DictType',
-    'PolyModelType']
+    'KeyRule', 'PolyModelType']
 
 
 class CompoundType(BaseType):
@@ -269,6 +269,31 @@ class ListType(CompoundType):
         return data
 
 
+class KeyRule(object):
+    """A rule that maps external dictionary keys to the field used to
+    convert, validate and export their values.
+
+    A rule created with ``exact=True`` matches a single key and takes
+    precedence over prefix rules.  Prefix rules all share the same rank:
+    if more than one of them matches a key, a ``ConversionError`` is raised
+    rather than letting the rule order pick a winner.
+    """
+
+    def __init__(self, pattern, field, exact=False):
+        self.pattern = pattern
+        self.field = field
+        self.exact = exact
+
+    def matches(self, key):
+        if self.exact:
+            return key == self.pattern
+        return key.startswith(self.pattern)
+
+    def __repr__(self):
+        return '<%s %r%s>' % (
+            self.__class__.__name__, self.pattern, self.exact and ' (exact)' or '')
+
+
 class DictType(CompoundType):
     """A field for storing a mapping of items, the values of which must conform to the type
     specified by the ``field`` parameter.
@@ -278,24 +303,92 @@ class DictType(CompoundType):
         ...
         categories = DictType(StringType)
 
+    Alternatively, a list of ``KeyRule`` objects selects the field per key and
+    ``key_normalize`` unifies external key spellings before the rules are
+    applied.  The normalizer is expected to be idempotent: applying it to an
+    already normalized key must return the key unchanged::
+
+        ...
+        metrics = DictType(
+            key_rules=[
+                KeyRule('temp_state', StringType(), exact=True),
+                KeyRule('temp', DecimalType()),
+                KeyRule('count', IntType()),
+            ],
+            key_normalize=lambda key: key.strip().lower().replace(' ', '_'))
+
     """
 
     primitive_type = dict
     native_type = dict
 
-    def __init__(self, field, coerce_key=None, **kwargs):
+    def __init__(self, field=None, coerce_key=None, key_rules=None, key_normalize=None, **kwargs):
         # type: (...) -> typing.Dict[str, T]
 
-        self.field = self._init_field(field, kwargs)
+        self.key_rules = [self._init_key_rule(rule) for rule in key_rules or []]
+        self.key_normalize = key_normalize
+        if field is not None:
+            self.field = self._init_field(field, kwargs)
+        elif not self.key_rules:
+            raise TypeError("DictType requires a field or at least one key rule.")
         self.coerce_key = coerce_key or str
         super(DictType, self).__init__(**kwargs)
+        for rule in self.key_rules:
+            try:
+                rule.field.parent_field = self
+            except AttributeError:
+                pass
+
+    def _init_key_rule(self, rule):
+        if not isinstance(rule, KeyRule):
+            raise TypeError("DictType: Expected a KeyRule, got an argument "
+                            "of the type '{}'.".format(type(rule).__name__))
+        if not isinstance(rule.field, BaseType):
+            rule = KeyRule(rule.pattern, rule.field(), rule.exact)
+        return rule
 
     @property
     def model_class(self):
         return self.field.model_class
 
     def _repr_info(self):
-        return self.field.__class__.__name__
+        field = getattr(self, 'field', None)
+        if field is not None:
+            return field.__class__.__name__
+        return ', '.join(rule.pattern for rule in self.key_rules)
+
+    def _setup(self, field_name, owner_model):
+        for rule in self.key_rules:
+            rule.field._setup(None, owner_model)
+        super(DictType, self)._setup(field_name, owner_model)
+
+    def _normalize_key(self, key):
+        key = self.coerce_key(key)
+        if self.key_normalize is not None:
+            key = self.key_normalize(key)
+        return key
+
+    def _field_for_key(self, key):
+        if not self.key_rules:
+            return self.field
+        exact_rules = [rule for rule in self.key_rules if rule.exact and rule.matches(key)]
+        if len(exact_rules) > 1:
+            raise ConversionError(
+                _("Key '%s' matches multiple key rules: %s")
+                % (key, ', '.join(repr(rule.pattern) for rule in exact_rules)))
+        if exact_rules:
+            return exact_rules[0].field
+        prefix_rules = [rule for rule in self.key_rules if not rule.exact and rule.matches(key)]
+        if len(prefix_rules) > 1:
+            raise ConversionError(
+                _("Key '%s' matches multiple key rules: %s")
+                % (key, ', '.join(repr(rule.pattern) for rule in prefix_rules)))
+        if prefix_rules:
+            return prefix_rules[0].field
+        field = getattr(self, 'field', None)
+        if field is not None:
+            return field
+        raise ConversionError(_("No key rule matches key '%s'.") % key)
 
     def _convert(self, value, context, safe=False):
         if not isinstance(value, Mapping):
@@ -303,9 +396,22 @@ class DictType(CompoundType):
 
         data = {}
         errors = {}
+        key_sources = {}
         for k, v in iteritems(value):
             try:
-                data[self.coerce_key(k)] = context.field_converter(self.field, v, context)
+                key = self._normalize_key(k)
+                field = self._field_for_key(key)
+                item = context.field_converter(field, v, context)
+                if key in data:
+                    if data[key] != item:
+                        exc = ConversionError(
+                            _("Keys '%s' and '%s' normalize to '%s' but their values differ.")
+                            % (key_sources[key], k, key))
+                        errors[key_sources[key]] = exc
+                        raise exc
+                else:
+                    data[key] = item
+                    key_sources[key] = k
             except BaseError as exc:
                 errors[k] = exc
         if errors:
@@ -318,15 +424,24 @@ class DictType(CompoundType):
         as `transforms.export_loop`.
         """
         data = {}
-        _export_level = self.field.get_export_level(context)
-        if _export_level == DROP:
-            return data
+        if not self.key_rules:
+            _export_level = self.field.get_export_level(context)
+            if _export_level == DROP:
+                return data
         for key, value in iteritems(dict_instance):
-            shaped = self.field.export(value, format, context)
+            if self.key_rules:
+                key = self._normalize_key(key)
+                field = self._field_for_key(key)
+                _export_level = field.get_export_level(context)
+                if _export_level == DROP:
+                    continue
+            else:
+                field = self.field
+            shaped = field.export(value, format, context)
             if shaped is None:
                 if _export_level <= NOT_NONE:
                     continue
-            elif self.field.is_compound and len(shaped) == 0:
+            elif field.is_compound and len(shaped) == 0:
                 if _export_level <= NONEMPTY:
                     continue
             data[key] = shaped

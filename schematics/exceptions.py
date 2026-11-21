@@ -219,7 +219,10 @@ class CompoundError(BaseError):
             raise TypeError("Compound errors must be reported as a dictionary.")
         for key, value in errors.items():
             if isinstance(value, CompoundError):
-                errors[key] = value.errors
+                # An IngestError keeps its structured result so an outer list
+                # can re-address nested rejections in original coordinates.
+                if getattr(value, 'result', None) is None:
+                    errors[key] = value.errors
             else:
                 errors[key] = value
         super(CompoundError, self).__init__(errors)

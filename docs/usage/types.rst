@@ -54,7 +54,7 @@ Validation
 ==========
 
 Validation can be as simple as successfully calling ``to_native``, but
-sometimes more is needed.  
+sometimes more is needed.
 data or behavior during a typical use, like serialization.
 
 Let's look at the ``StringType``.  We'll set a ``max_length`` of 10.
@@ -75,6 +75,85 @@ It converts to a string just fine.  Now, let's attempt to validate it.
     File "schematics/types/base.py", line 164, in validate
       raise ValidationError(errors)
   schematics.exceptions.ValidationError: [u'String value is too long.']
+
+
+Tracked lists
+=============
+
+``ListType`` keeps its ordinary strict behavior by default.  An opt-in ingest
+entry point is available when a list arrives as a one-shot iterator and the
+caller needs to keep valid records while addressing rejected ones at their
+original positions::
+
+    >>> from schematics.models import Model
+    >>> from schematics.types import IntType, StringType
+    >>> from schematics.types.compound import ListType, ModelType
+    >>> class Detail(Model):
+    ...     code = StringType(required=True)
+    ...     amount = IntType(required=True)
+    >>> class Order(Model):
+    ...     lines = ListType(ModelType(Detail))
+
+    >>> result = Order.lines.ingest((item for item in [
+    ...     None,
+    ...     {'code': 'A-1', 'amount': 5},
+    ...     {'code': 'A-1', 'amount': 'bad'},
+    ...     {'code': 'A-1', 'amount': 0},
+    ... ]))
+    >>> [detail.amount for detail in result.items]
+    [5, 0]
+    >>> result.positions
+    [1, 3]
+    >>> result.skipped
+    [0]
+    >>> [(rejection.detail, rejection.parent) for rejection in result.errors]
+    [(2, None)]
+
+``None`` is treated as a placeholder and skipped; a numeric ``0`` is a valid
+amount.  The input iterator is read exactly once.  ``min_size`` and
+``max_size`` are checked against the retained items, not the raw positions.
+The ordinary ``Order({...})`` and ``validate()`` paths are unchanged.
+
+Setting ``ingest=True`` on the field enables the same reporting behavior on
+the ordinary import path: it raises ``IngestError`` carrying the same report,
+so a parent is never delivered with only some of its details.  Either way,
+:meth:`ListType.ingest` can be called directly; an ordinary import only skips
+placeholders when the field opts in with ``ingest=True`` or
+``skip_none=True``.
+
+When the parent items themselves contain a tracked list, ``ingest()`` returns
+a ``BatchIngestResult`` and keeps parent and detail positions separate::
+
+    >>> class Batch(Model):
+    ...     batch_no = StringType(required=True)
+    ...     orders = ListType(ModelType(Order))
+    >>> batch = Batch.orders.ingest([{'order_no': 'O-1', 'lines': [
+    ...     {'code': 'MIXED', 'amount': 100},
+    ...     {'code': 'DISC', 'amount': -10}]}])
+    >>> detail = batch.result_for(0).tracked[0]
+    >>> detail.positions
+    (0, 0)
+
+Split, merged and reordered values keep their provenance on the tracked
+object rather than on the amount or business number::
+
+    >>> from schematics.provenance import split, merge, describe_positions
+    >>> result = Order.lines.ingest([
+    ...     {'code': 'MIXED', 'amount': 100},
+    ...     {'code': 'DISC', 'amount': -10},
+    ... ])
+    >>> goods, freight = split(result.tracked[0],
+    ...                        [('goods', 100), ('freight', 0)])
+    >>> net = merge([goods, result.tracked[1]], 90, kind='net_goods')
+    >>> report = describe_positions([freight, net], [0, 1])[1]
+    >>> [(source['detail'], source['kind']) for source in report['sources']]
+    [(0, 'goods'), (1, 'lines')]
+
+An order-level rule reports positions in the reorganized list.
+``describe_positions`` maps each position back to its original detail and to
+every participating derived item.  Two values that compare equal still map to
+different sources because resolution uses list position and object identity,
+never value equality.
 
 
 Custom types

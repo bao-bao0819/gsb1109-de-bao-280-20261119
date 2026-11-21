@@ -5,11 +5,17 @@ from __future__ import unicode_literals, absolute_import
 import itertools
 
 from ..common import *
+from ..datastructures import Context
 from ..exceptions import *
+from ..provenance import (
+    BatchIngestResult, IngestError, ListIngestResult, Provenance,
+    ProvenanceTracker, Rejection, SourceCoordinate, TrackedItem,
+    _attach_provenance)
+from ..undefined import Undefined
 from ..transforms import (
     export_loop,
     get_import_context, get_export_context,
-    to_native_converter, to_primitive_converter)
+    import_converter, to_native_converter, to_primitive_converter)
 from ..translator import _
 from ..util import get_all_subclasses, import_string
 from .base import BaseType, get_value_in
@@ -156,10 +162,23 @@ class ModelType(CompoundType):
         else:
             raise ConversionError(
                 _("Input must be a mapping or '%s' instance") % field_model_class.__name__)
+
+        ingest = context._get('ingest', False) if hasattr(context, '_get') else False
+        tracker = context._get('ingest_tracker', None) if ingest else None
+        start = len(tracker.results) if tracker is not None else 0
+
         if context.convert and context.oo:
-            return model_class(value, context=context)
+            result = model_class(value, context=context)
         else:
-            return model_class.convert(value, context=context)
+            result = model_class.convert(value, context=context)
+
+        if tracker is not None and isinstance(result, Model):
+            nested = tracker.results[start:]
+            if nested:
+                result._ingest_results = dict(
+                    (entry.field_name or str(index), entry)
+                    for index, entry in enumerate(nested))
+        return result
 
     def _export(self, value, format, context):
         if isinstance(value, Model):
@@ -170,13 +189,24 @@ class ModelType(CompoundType):
 
 
 class ListType(CompoundType):
-    """A field for storing a list of items, all of which must conform to the type
-    specified by the ``field`` parameter.
+    """A field for storing a list of items, all of which must conform to the
+    type specified by the ``field`` parameter.
 
     Use it like this::
 
         ...
         categories = ListType(StringType)
+
+    An optional ingest mode can be enabled for lists whose input may be a
+    one-shot iterator, may contain ``None`` placeholders, or whose rejected
+    items must be reported at their original positions::
+
+        ...
+        details = ListType(ModelType(Detail), ingest=True)
+
+    In ingest mode :meth:`ingest` returns a :class:`ListIngestResult`.  The
+    ordinary conversion path, including ``strict`` validation, is unchanged
+    when the option is not used.
     """
 
     primitive_type = list
@@ -186,6 +216,45 @@ class ListType(CompoundType):
                  field,  # type: T
                  min_size=None, max_size=None, **kwargs):
         # type: (...) -> typing.List[T]
+
+        # Ingest is opt-in.  Accept a few equivalent spellings so a caller can
+        # choose the wording that matches its own vocabulary.
+        self._ingest_enabled = any((
+            kwargs.pop('ingest', False),
+            kwargs.pop('collect_errors', False),
+            kwargs.pop('report', False),
+            kwargs.pop('track', False),
+            kwargs.pop('track_provenance', False),
+            kwargs.pop('provenance', False),
+            kwargs.pop('partial', False),
+            kwargs.pop('allow_partial', False),
+            kwargs.pop('on_error', None) in ('collect', 'ignore', 'skip'),
+        ))
+        placeholders = kwargs.pop('placeholders', None)
+        if placeholders is None:
+            placeholders = kwargs.pop('placeholder', Undefined)
+            if placeholders is Undefined:
+                placeholders = None
+            else:
+                placeholders = (placeholders,)
+        skip_none = any((
+            kwargs.pop('skip_none', False),
+            kwargs.pop('skip_placeholder', False),
+            kwargs.pop('skip_placeholders', False),
+            kwargs.pop('ignore_none', False),
+            kwargs.pop('allow_none', False),
+        ))
+        if placeholders is not None:
+            if isinstance(placeholders, (str, bytes)):
+                placeholders = (placeholders,)
+            elif not isinstance(placeholders, (list, tuple, set)):
+                placeholders = (placeholders,)
+            self._placeholders = tuple(placeholders)
+        elif skip_none or self._ingest_enabled:
+            self._placeholders = (None,)
+        else:
+            self._placeholders = ()
+        self._skip_placeholders = bool(self._placeholders)
 
         self.field = self._init_field(field, kwargs)
         self.min_size = min_size
@@ -198,6 +267,38 @@ class ListType(CompoundType):
     @property
     def model_class(self):
         return self.field.model_class
+
+    @property
+    def ingest_enabled(self):
+        return self._ingest_enabled
+
+    @property
+    def placeholders(self):
+        return self._placeholders
+
+    @property
+    def skips_placeholders(self):
+        return self._skip_placeholders
+
+    def _field_name(self):
+        return self.name or getattr(self.parent_field, 'name', None) or 'items'
+
+    def _is_placeholder(self, value):
+        if value is None:
+            # ``None`` is an ignorable placeholder on the ingest entry point
+            # regardless of field options; the configured placeholders add
+            # further values.
+            return True
+        for placeholder in self._placeholders:
+            if placeholder is None:
+                continue
+            # Identity first: 0 and False are valid values and must never be
+            # treated as placeholders merely because they are falsy.
+            if value is placeholder:
+                return True
+            if type(value) is type(placeholder) and value == placeholder:
+                return True
+        return False
 
     def _repr_info(self):
         return self.field.__class__.__name__
@@ -219,6 +320,17 @@ class ListType(CompoundType):
         raise ConversionError(_('Could not interpret the value as a list'))
 
     def _convert(self, value, context):
+        # The explicit ingest entry point always reports.  A field with
+        # ``ingest=True`` also reports on the ordinary import path; fields
+        # without the option keep the original strict behavior.
+        if self._ingest_enabled or (context is not None and
+                                    context._get('ingest', False)):
+            context = self._ensure_ingest_context(context)
+            values, result = self._ingest_values(value, context)
+            if result.errors or result.length_error:
+                raise IngestError(result)
+            return values
+
         value = self._coerce(value)
         data = []
         errors = {}
@@ -230,6 +342,307 @@ class ListType(CompoundType):
         if errors:
             raise CompoundError(errors)
         return data
+
+    def ingest(self, value, context=None):
+        """Read ``value`` once and return an ingest report.
+
+        ``value`` may be any iterable, including a generator that can only be
+        consumed once.  ``None`` entries are placeholders and are skipped;
+        their original positions are retained for every item after them.  A
+        rejected item does not prevent other items from being delivered.  If
+        ``min_size`` or ``max_size`` is configured, the check applies to the
+        retained (non-placeholder, successfully converted) items.
+
+        When this field holds parent models that themselves contain an
+        ingest-enabled ``ListType``, the call returns a
+        :class:`BatchIngestResult` with one isolated result per parent.  A
+        parent with any rejected detail is not delivered at all.
+        """
+        context = self._ingest_context(context)
+
+        if self._has_nested_ingest():
+            return self.ingest_batch(value, context=context)
+
+        values, result = self._ingest_values(value, context)
+        return result
+
+    def ingest_batch(self, values, context=None):
+        """Ingest a batch of parent items, isolating failures per parent.
+
+        Each parent is converted independently.  A parent whose own type is
+        wrong, or whose nested required details fail, contributes no details
+        at all.  Original parent positions are preserved in the result.
+        """
+        context = self._ingest_context(context)
+
+        batch = BatchIngestResult(field_name=self._field_name())
+        for index, item in enumerate(values):
+            if self._is_placeholder(item):
+                result = ListIngestResult(field_name=self._field_name(),
+                                          parent_index=index)
+                result.outcomes.append({'index': index, 'status': 'skipped'})
+                batch.add(result)
+                continue
+
+            parent_context = context._branch(
+                ingest=True,
+                ingest_tracker=ProvenanceTracker(),
+                oo=True)
+            tracker = parent_context._get('ingest_tracker')
+            start = len(tracker.results)
+            try:
+                converted = parent_context.field_converter(
+                    self.field, item, parent_context)
+            except (FieldError, CompoundError) as exc:
+                rejections = self._expand_error(index, exc)
+                result = ListIngestResult(field_name=self._field_name(),
+                                          errors=rejections,
+                                          parent_index=index)
+                result.outcomes.append({
+                    'index': index, 'status': 'rejected',
+                    'error': exc, 'rejections': rejections})
+                batch.add(result)
+                continue
+
+            nested = [entry for entry in tracker.results[start:]
+                      if isinstance(entry, ListIngestResult)]
+            nested_errors = [rejection
+                             for entry in nested for rejection in entry.errors]
+            nested_length_errors = [entry for entry in nested
+                                    if entry.length_error is not None]
+
+            if nested_errors or nested_length_errors:
+                prefix = (SourceCoordinate(self._field_name(), index),)
+                rejections = [rejection.with_prefix(prefix)
+                              for rejection in nested_errors]
+                for entry in nested_length_errors:
+                    rejections.append(Rejection(
+                        index=index, path=prefix,
+                        error=entry.length_error, scope='parent'))
+                result = ListIngestResult(field_name=self._field_name(),
+                                          errors=rejections,
+                                          parent_index=index)
+                result.outcomes.append({
+                    'index': index, 'status': 'rejected',
+                    'rejections': rejections})
+                batch.add(result)
+                continue
+
+            if nested:
+                prefix = (SourceCoordinate(self._field_name(), index),)
+                tracked = []
+                for entry in nested:
+                    for child in entry.tracked:
+                        provenance = child.provenance.map_path(prefix)
+                        _attach_provenance(child.value, provenance)
+                        tracked.append(TrackedItem(child.value, provenance))
+                result = ListIngestResult(
+                    tracked=tracked,
+                    skipped=[child_index
+                             for entry in nested for child_index in entry.skipped],
+                    tracker=tracker,
+                    field_name=self._field_name(),
+                    parent_index=index,
+                    min_size=self.min_size,
+                    max_size=self.max_size)
+                result.outcomes.append({'index': index, 'status': 'accepted'})
+            else:
+                provenance = Provenance(
+                    path=(SourceCoordinate(self._field_name(), index),),
+                    kind=self._field_name())
+                _attach_provenance(converted, provenance)
+                result = ListIngestResult(
+                    tracked=[TrackedItem(converted, provenance)],
+                    field_name=self._field_name(),
+                    parent_index=index)
+                result.outcomes.append({'index': index, 'status': 'accepted'})
+
+            batch.add(result)
+
+        length_error = self._check_ingest_length(len(batch.deliverable))
+        batch.length_error = length_error
+        batch.tracked_count = len(batch.deliverable)
+        return batch
+
+    def _ingest_context(self, context=None):
+        if context is None:
+            context = get_import_context(oo=True)
+        elif isinstance(context, Mapping):
+            options = dict(context)
+            options.setdefault('oo', True)
+            if 'field_converter' not in options:
+                options['field_converter'] = import_converter
+            context = get_import_context(**options)
+        else:
+            context = Context._make(context)
+            if context._get('field_converter') is None:
+                context.field_converter = import_converter
+            if context._get('oo') is None:
+                context.oo = True
+
+        context._setdefaults({
+            'ingest': True,
+            'ingest_tracker': ProvenanceTracker(),
+        })
+        context['ingest'] = True
+        if 'oo' not in context:
+            context['oo'] = True
+        return context
+
+    def _ensure_ingest_context(self, context):
+        """Return a context carrying ingest state, without mutating the input."""
+        if context is None:
+            return self._ingest_context(None)
+        if context._get('ingest_tracker') is not None:
+            return context
+        branched = Context(context)
+        if 'ingest_tracker' not in branched:
+            branched.ingest_tracker = ProvenanceTracker()
+        if 'ingest' not in branched:
+            branched.ingest = True
+        return branched
+
+    def _has_nested_ingest(self):
+        field = self.field
+        if isinstance(field, ListType):
+            return True
+        model_class = getattr(field, 'model_class', None)
+        if model_class is None:
+            return False
+        for candidate in getattr(model_class, 'fields', {}).values():
+            if isinstance(candidate, ListType):
+                return True
+        return False
+
+    def _rejection_for(self, index, error):
+        """Build a rejection for a parent-level failure at ``index``."""
+        return Rejection(index=index, path=(
+            SourceCoordinate(self._field_name(), index),), error=error)
+
+    def _expand_error(self, index, error):
+        """Expand a rejected parent into original child coordinates.
+
+        A nested list reports its failures in ``IngestError.result``.  Those
+        rejections already know the child's original position; this method
+        only prepends the outer parent position.  Nothing is inferred from the
+        child's value, so duplicate business numbers are safe.  An error of
+        the parent itself (including its own fields) is reported as a
+        parent-level rejection without a detail position.
+        """
+        prefix = (SourceCoordinate(self._field_name(), index),)
+        rejections = self._collect_nested(prefix, error)
+        if rejections:
+            return rejections
+        return [Rejection(index=index, path=prefix, error=error,
+                          scope='parent')]
+
+    def _collect_nested(self, prefix, error):
+        nested = getattr(error, 'result', None)
+        if nested is not None:
+            rejections = [rejection.with_prefix(prefix)
+                          for rejection in nested.errors]
+            if not rejections and nested.length_error is not None:
+                rejections = [Rejection(index=prefix[-1].index, path=prefix,
+                                        error=nested.length_error)]
+            if rejections:
+                return rejections
+
+        if isinstance(error, CompoundError):
+            rejections = []
+            for value in error.errors.values():
+                rejections.extend(self._collect_nested(prefix, value))
+            return rejections
+
+        return []
+
+    def _expand_item_error(self, index, error):
+        """Expand a rejected detail item; its own position is the detail."""
+        prefix = (SourceCoordinate(self._field_name(), index),)
+        nested = getattr(error, 'result', None)
+        if nested is not None:
+            rejections = [rejection.with_prefix(prefix)
+                          for rejection in nested.errors]
+            if not rejections and nested.length_error is not None:
+                rejections = [Rejection(index=index, path=prefix,
+                                        error=nested.length_error)]
+            if rejections:
+                return rejections
+        return [Rejection(index=index, path=prefix, error=error,
+                          scope='item')]
+
+    def _ingest_values(self, value, context):
+        """Single-pass conversion used by :meth:`ingest` and ingest mode."""
+        value = self._coerce(value)
+        name = self._field_name()
+        tracker = context._get('ingest_tracker') or ProvenanceTracker()
+        tracked = []
+        errors = []
+        skipped = []
+        outcomes = []
+        consumed = 0
+
+        for index, item in enumerate(value):
+            consumed += 1
+            if self._is_placeholder(item):
+                skipped.append(index)
+                outcomes.append({'index': index, 'status': 'skipped'})
+                continue
+
+            start = len(tracker.records)
+            item_context = context._branch(ingest_tracker=tracker)
+            try:
+                converted = item_context.field_converter(
+                    self.field, item, item_context)
+            except (FieldError, CompoundError) as exc:
+                del tracker.records[start:]
+                rejections = self._expand_item_error(index, exc)
+                for rejection in rejections:
+                    rejection.value = item
+                errors.extend(rejections)
+                outcomes.append({
+                    'index': index, 'status': 'rejected',
+                    'error': exc, 'rejections': rejections})
+                continue
+
+            provenance = Provenance(
+                path=(SourceCoordinate(name, index),), kind=name)
+            entry = TrackedItem(converted, provenance)
+            _attach_provenance(converted, provenance)
+            tracked.append(entry)
+            tracker.record(provenance, converted)
+            outcomes.append({'index': index, 'status': 'accepted',
+                             'provenance': provenance})
+
+        result = ListIngestResult(
+            tracked=tracked, errors=errors, skipped=skipped,
+            outcomes=outcomes, tracker=tracker, field_name=name,
+            min_size=self.min_size, max_size=self.max_size)
+
+        length_error = self._check_ingest_length(len(tracked))
+        if length_error is not None:
+            result.length_error = length_error
+
+        result.consumed = consumed
+        result.original_count = consumed
+        tracker.record_result(result)
+        return result.items, result
+
+    def _check_ingest_length(self, length):
+        if self.min_size is not None and length < self.min_size:
+            message = ({
+                True: _('Please provide at least %d item.'),
+                False: _('Please provide at least %d items.'),
+            }[self.min_size == 1]) % self.min_size
+            return ValidationError(message)
+
+        if self.max_size is not None and length > self.max_size:
+            message = ({
+                True: _('Please provide no more than %d item.'),
+                False: _('Please provide no more than %d items.'),
+            }[self.max_size == 1]) % self.max_size
+            return ValidationError(message)
+
+        return None
 
     def check_length(self, value, context):
         list_length = len(value) if value else 0

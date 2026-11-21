@@ -313,6 +313,90 @@ results without having to specify ``role`` in the export function.
   }
 
 
+.. _exporting_export_paths:
+
+Export Paths
+------------
+
+A single object is sometimes reached through more than one edge of the
+object graph, and each edge may need its own role.  Pass an ``export_paths``
+mapping to :meth:`~schematics.models.Model.to_primitive`,
+:meth:`~schematics.models.Model.to_native` or
+:meth:`~schematics.models.Model.export` to attach an
+:class:`~schematics.export.ExportPath` to a field name.  A path selects the
+role applied to the model reached through that field, keyed by the model's
+actual class name; subclasses without their own entry inherit the entry of
+their nearest model base class.
+
+::
+
+  from schematics.export import ExportPath
+
+  class Address(Model):
+      internal_id = IntType()
+      public_no = StringType()
+      contact = StringType()
+
+      class Options:
+          roles = {
+              'review': blacklist('internal_id', 'contact'),
+              'pickup_default': whitelist('public_no'),
+              'delivery_default': whitelist('public_no'),
+          }
+
+  class Order(Model):
+      pickup = ModelType(Address)
+      delivery = ModelType(Address)
+
+  paths = {
+      'pickup': ExportPath('pickup', {'Address': 'pickup_default'}),
+      'delivery': ExportPath('delivery', {'Address': 'delivery_default'}),
+  }
+
+  order.to_primitive(role='review', export_paths=paths)
+
+The outlet level ``role`` still filters the top-level model and applies to
+any nested model without a matching path entry, so an outlet's field caps
+are always respected.  The same model instance reached through two paths is
+exported twice, once per path; ordinary object sharing is never treated as
+a cycle.
+
+Missing roles and fallback
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a path requests a role a model does not define, the default strict
+behavior raises :class:`~schematics.export.RoleError` (a ``ValueError``
+subclass) carrying the model name, role name and the path's field name.
+Passing ``raise_error_on_role=False`` instead consults the path's
+``fallback_roles`` mapping, so a subclass default role can take over while
+the outlet's field caps still apply.
+
+::
+
+  path = ExportPath(
+      'delivery',
+      {'SpecialDelivery': 'delivery_default'},
+      fallback_roles={'SpecialDelivery': 'delivery_fallback'})
+
+Re-running a failed strict export with fallback enabled produces exactly
+the same output as running the fallback export directly.
+
+Cyclic references
+~~~~~~~~~~~~~~~~~
+
+If a field points back to an instance already on the current export stack,
+the recursion is stopped on that edge and the optional ``cycle_handler`` is
+called as ``cycle_handler(instance, export_path, role_name, context)``.
+Its return value replaces the nested instance.  Use
+:func:`~schematics.export.visible_reference` to build a checkable
+reference: it reads a field only after
+:func:`~schematics.export.field_allowed` confirms the role permits it, so a
+role that hides the public address number (or any internal id) can never be
+circumvented to look the number up, and the number is omitted from the
+reference.  When no handler is supplied a ``{'cycle': True}`` marker is
+emitted instead of recursing forever.
+
+
 
 .. _exporting_serializable:
 

@@ -298,15 +298,24 @@ class Model(object):
         func = validate if should_validate else convert
         return func(self._schema, self, raw_data=raw_data, oo=True, context=context, **kwargs)
 
-    def export(self, field_converter=None, role=None, app_data=None, **kwargs):
+    def export(self, field_converter=None, role=None, app_data=None,
+               export_paths=None, cycle_handler=None, **kwargs):
         return export_loop(self._schema, self, field_converter=field_converter,
-                           role=role, app_data=app_data, **kwargs)
+                           role=role, app_data=app_data,
+                           export_paths=export_paths, cycle_handler=cycle_handler,
+                           **kwargs)
 
-    def to_native(self, role=None, app_data=None, **kwargs):
-        return to_native(self._schema, self, role=role, app_data=app_data, **kwargs)
+    def to_native(self, role=None, app_data=None, export_paths=None,
+                  cycle_handler=None, **kwargs):
+        return to_native(self._schema, self, role=role, app_data=app_data,
+                         export_paths=export_paths, cycle_handler=cycle_handler,
+                         **kwargs)
 
-    def to_primitive(self, role=None, app_data=None, **kwargs):
-        return to_primitive(self._schema, self, role=role, app_data=app_data, **kwargs)
+    def to_primitive(self, role=None, app_data=None, export_paths=None,
+                     cycle_handler=None, **kwargs):
+        return to_primitive(self._schema, self, role=role, app_data=app_data,
+                            export_paths=export_paths, cycle_handler=cycle_handler,
+                            **kwargs)
 
     def serialize(self, *args, **kwargs):
         raw_data = self._data.converted

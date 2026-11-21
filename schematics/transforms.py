@@ -13,6 +13,7 @@ from .undefined import Undefined
 from .util import listify
 from .iteration import atoms, atom_filter
 from .role import Role
+from .export import RoleError, default_cycle_handler, schema_name
 
 __all__ = []
 
@@ -200,8 +201,49 @@ def _mutate(schema, mutable, raw_data, context):
     return errors
 
 
+def _resolve_role(schema, role, raise_error_on_role, export_path=None):
+    """
+    Resolve the role name to apply to ``schema``.
+
+    The incoming ``export_path`` may override the outlet level role for this
+    schema, selecting the role by the schema's actual name so subclasses can
+    be handled independently.  When the selected role is missing the path's
+    fallback role is consulted in non-strict mode.  A missing role raises
+    :class:`RoleError` in strict mode; outlets without a path keep the
+    historical ``ValueError`` behavior.
+    """
+    selected_role = role
+    if export_path is not None:
+        path_role = export_path.role_for(schema)
+        if path_role is not None:
+            selected_role = path_role
+
+    if callable(selected_role) or schema._options.roles.get(selected_role) is not None:
+        return selected_role
+
+    if export_path is not None and not raise_error_on_role:
+        fallback_role = export_path.fallback_role_for(schema)
+        if fallback_role is not None and schema._options.roles.get(fallback_role) is not None:
+            return fallback_role
+
+    if selected_role and raise_error_on_role:
+        raise RoleError(schema_name(schema), selected_role,
+                        getattr(export_path, 'name', None))
+
+    return "default" if schema._options.roles.get("default") is not None else None
+
+
+def _filter_for(schema, role_name):
+    if role_name is None:
+        return None
+    if callable(role_name):
+        return role_name
+    return schema._options.roles.get(role_name)
+
+
 def export_loop(schema, instance_or_dict, field_converter=None, role=None, raise_error_on_role=True,
-                export_level=None, app_data=None, context=None):
+                export_level=None, app_data=None, context=None, export_paths=None,
+                cycle_handler=None):
     """
     The export_loop function is intended to be a general loop definition that
     can be used for any form of data shaping, such as application of roles or
@@ -228,6 +270,14 @@ def export_loop(schema, instance_or_dict, field_converter=None, role=None, raise
         A ``Context`` object that encapsulates configuration options and ``app_data``.
         The context object is created upon the initial invocation of ``import_loop``
         and is then propagated through the entire process.
+    :param export_paths:
+        Optional mapping of field names to :class:`~schematics.export.ExportPath`
+        objects.  A path selects the role applied to the model reached through
+        that field and provides a fallback role for non-strict outlets.
+    :param cycle_handler:
+        Callable invoked as ``cycle_handler(instance, export_path, role_name,
+        context)`` when a model instance is re-encountered on its own export
+        path.  Its return value replaces the recursively exported instance.
     """
     context = Context._make(context)
     try:
@@ -241,55 +291,73 @@ def export_loop(schema, instance_or_dict, field_converter=None, role=None, raise
             'role': role,
             'raise_error_on_role': raise_error_on_role,
             'export_level': export_level,
-            'app_data': app_data if app_data is not None else {}
+            'app_data': app_data if app_data is not None else {},
+            'export_paths': dict(export_paths or {}),
+            'cycle_handler': cycle_handler or default_cycle_handler,
+            'export_stack': [],
+            'export_edges': [],
         })
 
     instance_or_dict = context.field_converter.pre(schema, instance_or_dict, context)
+
+    incoming_path = context.export_edges[-1][1] if context.export_edges else None
+
+    stack = context.export_stack
+    stack_key = id(instance_or_dict)
+    if stack_key in stack:
+        cycle_role = _resolve_role(
+            schema, context.role, context.raise_error_on_role, incoming_path)
+        return context.cycle_handler(instance_or_dict, incoming_path, cycle_role, context)
+
+    role_name = _resolve_role(
+        schema, context.role, context.raise_error_on_role, incoming_path)
+    filter_func = _filter_for(schema, role_name)
 
     if schema._options.export_order:
         data = OrderedDict()
     else:
         data = {}
 
-    filter_func = (context.role if callable(context.role) else
-        schema._options.roles.get(context.role))
-    if filter_func is None:
-        if context.role and context.raise_error_on_role:
-            error_msg = '%s Model has no role "%s"'
-            raise ValueError(error_msg % (schema.__name__, context.role))
-        else:
-            filter_func = schema._options.roles.get("default")
+    stack.append(stack_key)
+    try:
+        for field_name, field, value in atoms(schema, instance_or_dict):
+            serialized_name = field.serialized_name or field_name
 
-    _field_converter = context.field_converter
-
-    for field_name, field, value in atoms(schema, instance_or_dict):
-        serialized_name = field.serialized_name or field_name
-
-        if filter_func is not None and filter_func(field_name, value):
-            continue
-
-        _export_level = field.get_export_level(context)
-
-        if _export_level == DROP:
-            continue
-
-        elif value is not None and value is not Undefined:
-            value = _field_converter(field, value, context)
-
-        if value is Undefined:
-            if _export_level <= DEFAULT:
-                continue
-        elif value is None:
-            if _export_level <= NOT_NONE:
-                continue
-        elif field.is_compound and len(value) == 0:
-            if _export_level <= NONEMPTY:
+            if filter_func is not None and filter_func(field_name, value):
                 continue
 
-        if value is Undefined:
-            value = None
+            _export_level = field.get_export_level(context)
 
-        data[serialized_name] = value
+            if _export_level == DROP:
+                continue
+
+            elif value is not None and value is not Undefined:
+                if field.is_compound:
+                    context.export_edges.append(
+                        (field_name, context.export_paths.get(field_name)))
+                    try:
+                        value = context.field_converter(field, value, context)
+                    finally:
+                        context.export_edges.pop()
+                else:
+                    value = context.field_converter(field, value, context)
+
+            if value is Undefined:
+                if _export_level <= DEFAULT:
+                    continue
+            elif value is None:
+                if _export_level <= NOT_NONE:
+                    continue
+            elif field.is_compound and len(value) == 0:
+                if _export_level <= NONEMPTY:
+                    continue
+
+            if value is Undefined:
+                value = None
+
+            data[serialized_name] = value
+    finally:
+        stack.pop()
 
     data = context.field_converter.post(schema, data, context)
 

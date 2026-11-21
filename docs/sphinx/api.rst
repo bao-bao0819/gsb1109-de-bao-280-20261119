@@ -71,6 +71,44 @@ API
    :undoc-members:
 
 
+Partitioning
+------------
+
+.. autodata:: s2sphere.DEFAULT_LEVEL
+
+.. autoclass:: s2sphere.FastSample
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.DeviceHeader
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.DeviceSample
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.PartitionResult
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.PartitionResolver
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.PartitionError
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.RouteSource
+   :members:
+   :undoc-members:
+
+.. autofunction:: s2sphere.partition_row
+.. autofunction:: s2sphere.partition_rows
+.. autofunction:: s2sphere.partition_all
+
+
 Utilities
 ---------
 

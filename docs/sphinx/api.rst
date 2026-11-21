@@ -30,6 +30,16 @@ API
    :members:
    :undoc-members:
 
+.. autoclass:: s2sphere.EdgeNeighbor
+
+.. autoclass:: s2sphere.EdgeSegment
+
+.. autoclass:: s2sphere.EdgeSample
+
+.. autoclass:: s2sphere.EdgeSampleSegment
+
+.. autoclass:: s2sphere.EdgeReadSample
+
 .. autoclass:: s2sphere.CellUnion
    :members:
    :undoc-members:

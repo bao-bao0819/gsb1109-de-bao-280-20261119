@@ -448,6 +448,177 @@ class TestCellId(unittest.TestCase):
 
         self.assertEqual(expected, all)
 
+    def testEdgeNeighborEdgeMapping(self):
+        # Same face, cross face and the three-face corner all map every edge
+        # to one real shared edge, and the reverse lookup returns the original
+        # cell and edge.
+        cells = [CellId.from_face_pos_level(0, 0, 5),
+                 CellId.from_face_pos_level(1, 0, 5),
+                 CellId.from_token('1ffffffffffffffc'),
+                 CellId.from_token('2000000000000004'),
+                 CellId.from_token('0000000000000001')]
+        for cell_id in cells:
+            cell = Cell(cell_id)
+            infos = cell_id.get_edge_neighbor_edges()
+            self.assertEqual(len(infos), 4)
+            for k, info in enumerate(infos):
+                start = cell.get_vertex(k)
+                end = cell.get_vertex((k + 1) & 3)
+                neighbor = Cell(info.cell_id)
+                a = neighbor.get_vertex(info.edge)
+                b = neighbor.get_vertex((info.edge + 1) & 3)
+                self.assertTrue((a == start and b == end) or
+                                (a == end and b == start))
+                self.assertEqual(info.reversed, a == end and b == start)
+                back = info.cell_id.get_edge_neighbor_edges()
+                self.assertTrue(any(other.cell_id == cell_id
+                                    for other in back))
+                for other in back:
+                    if other.cell_id == cell_id:
+                        self.assertEqual(other.edge, k)
+
+    def testEdgeNeighborDeepSeamCorrection(self):
+        # The legacy West neighbor of 2000000000000004 was one cell off.
+        cell_id = CellId.from_token('2000000000000004')
+        self.assertEqual(cell_id.get_edge_neighbors()[3],
+                         CellId.from_token('1ffffffffffffffc'))
+        source = CellId.from_token('1ffffffffffffffc')
+        self.assertEqual(source.get_edge_neighbors()[1], cell_id)
+        # a corner contact must not be offered as an edge neighbor
+        corner = CellId.from_token('1ffffffffffffffe')
+        for neighbor in source.get_edge_neighbors():
+            self.assertNotEqual(neighbor, corner)
+
+    def testEdgeNeighborAt28To30(self):
+        for level in (28, 29, 30):
+            for face in range(6):
+                cell_id = CellId.from_face_pos_level(face, 0, level)
+                cell = Cell(cell_id)
+                infos = cell_id.get_edge_neighbor_edges()
+                for k, info in enumerate(infos):
+                    start = cell.get_vertex(k)
+                    end = cell.get_vertex((k + 1) & 3)
+                    neighbor = Cell(info.cell_id)
+                    a = neighbor.get_vertex(info.edge)
+                    b = neighbor.get_vertex((info.edge + 1) & 3)
+                    self.assertEqual({a, b}, {start, end})
+
+    def testEdgeSamplesArcAndGrid(self):
+        cell_id = CellId.from_token('1ffffffffffffffc')
+        for mode in (CellId.EDGE_SAMPLE_ARC, CellId.EDGE_SAMPLE_GRID):
+            samples = cell_id.get_edge_samples(1, 4, mode)
+            self.assertEqual([s.step for s in samples], [0, 1, 2, 3, 4])
+            self.assertEqual(samples[0].point, samples[0].point)
+            reverse = cell_id.get_edge_samples(1, 4, mode, reverse=True)
+            self.assertEqual([s.point for s in samples],
+                             list(reversed([s.point for s in reverse])))
+            segments = cell_id.get_edge_sample_segments(1, 4, mode)
+            self.assertEqual(len(segments), 4)
+            for i in range(3):
+                self.assertEqual(segments[i].end_point,
+                                 segments[i + 1].start_point)
+
+    def testEdgeSampleMixedResolution(self):
+        coarse = CellId.from_face_pos_level(0, 0, 8)
+        neighbor = coarse.get_edge_neighbor(1)
+        child = next(neighbor.cell_id.children(
+            neighbor.cell_id.level() + 2))
+        parent_samples = coarse.get_edge_samples(
+            1, 4, CellId.EDGE_SAMPLE_ARC)
+        child_samples = child.get_edge_samples(
+            neighbor.edge, 2, CellId.EDGE_SAMPLE_ARC)
+        records = parent_samples + child_samples
+        point = parent_samples[2].point
+        chosen = CellId.resolve_edge_sample(point, records)
+        self.assertEqual(chosen.cell_id, coarse)
+        # a child record at the very same point wins over the parent record
+        exact = child_samples[-1]
+        chosen = CellId.resolve_edge_sample(exact.point, records)
+        self.assertEqual(chosen.cell_id, child)
+        # a grid-sampled cell that has no record at the point leaves a gap
+        grid = child.get_edge_samples(
+            neighbor.edge, 2, CellId.EDGE_SAMPLE_GRID)
+        off_point = parent_samples[1].point
+        self.assertIsNone(CellId.resolve_edge_sample(off_point, grid))
+
+    def testEdgeSegmentsMixedCoverage(self):
+        coarse = CellId.from_face_pos_level(0, 0, 10)
+        neighbor = coarse.get_edge_neighbor(1)
+        cells = list(neighbor.cell_id.children(
+            neighbor.cell_id.level() + 2))
+        segments = coarse.get_edge_segments(cells)
+        covered = [segment for segment in segments
+                   if segment.coarse_edge == 1]
+        self.assertTrue(covered)
+        # pieces from the fine cells tile the whole coarse edge without a gap
+        for previous, current in zip(covered, covered[1:]):
+            self.assertLessEqual(previous.end.angle(current.start), 1e-12)
+        # a cell that only meets this one at a vertex adds no segment
+        corner = CellId.from_face_pos_level(0, 0, 10)
+        corner_cell = Cell(corner)
+        diagonal = CellId.from_face_ij(
+            0, 0, 2 * corner_cell.id().get_size_ij(10))
+        corner_segments = corner.get_edge_segments([diagonal])
+        self.assertEqual(corner_segments, [])
+
+    def testEdgeReadSamplesBackfillAndGaps(self):
+        coarse = CellId.from_face_pos_level(0, 0, 8)
+        neighbor = coarse.get_edge_neighbor(1)
+        child = next(neighbor.cell_id.children(
+            neighbor.cell_id.level() + 2))
+        parent_samples = coarse.get_edge_samples(1, 4)
+        child_samples = child.get_edge_samples(neighbor.edge, 2)
+        table = {coarse: parent_samples, child: child_samples}
+        read = coarse.read_edge_samples(1, 4, table)
+        self.assertEqual(len(read), 5)
+        # the child keeps its own samples where it has them
+        at_child = [row for row in read
+                    if row.cell_id == child]
+        self.assertTrue(at_child)
+        # a child record at a point also sampled by the parent wins
+        shared = [row for row in read
+                  if row.cell_id == child and row.fraction in (0.0, 1.0)]
+        self.assertTrue(shared)
+        # parent fills the rest of the edge
+        self.assertTrue(all(row.cell_id is not None for row in read))
+        # a grid table whose points do not coincide leaves gaps
+        grid = {coarse: coarse.get_edge_samples(
+            1, 4, CellId.EDGE_SAMPLE_GRID),
+            child: child.get_edge_samples(
+                neighbor.edge, 2, CellId.EDGE_SAMPLE_GRID)}
+        mixed = coarse.read_edge_samples(
+            1, 4, grid, mode=CellId.EDGE_SAMPLE_ARC)
+        self.assertTrue(any(row.cell_id is None for row in mixed))
+
+    def testEdgeReadReverseMatchesSamePoints(self):
+        coarse = CellId.from_face_pos_level(0, 0, 8)
+        neighbor = coarse.get_edge_neighbor(1)
+        table = {coarse: coarse.get_edge_samples(1, 4)}
+        forward = coarse.read_edge_samples(1, 4, table)
+        backward = coarse.read_edge_samples(1, 4, table, reverse=True)
+        self.assertEqual([row.point for row in forward],
+                         list(reversed([row.point for row in backward])))
+        self.assertEqual([row.cell_id for row in forward],
+                         list(reversed([row.cell_id for row in backward])))
+
+    def testEdgeSegmentsLeaveGaps(self):
+        coarse = CellId.from_face_pos_level(0, 0, 10)
+        neighbor = coarse.get_edge_neighbor(1)
+        children = list(neighbor.cell_id.children(
+            neighbor.cell_id.level() + 2))
+        segments = coarse.get_edge_segments(children[1:3])
+        covered = [segment for segment in segments
+                   if segment.coarse_edge == 1]
+        span = sum(segment.start.angle(segment.end)
+                   for segment in covered)
+        whole = Cell(coarse).get_vertex(1).angle(
+            Cell(coarse).get_vertex(2))
+        self.assertLess(span, whole)
+        self.assertGreater(span, 0)
+        # coverage deeper than depth_limit is left as a gap, not expanded
+        self.assertEqual(
+            coarse.get_edge_segments(children, depth_limit=11), [])
+
 
 class LevelStats(object):
     def __init__(self):

@@ -9,6 +9,8 @@ import functools
 import heapq
 import math
 
+from collections import namedtuple
+
 
 @functools.total_ordering
 class Angle(object):
@@ -850,6 +852,28 @@ class LatLngRect(object):
         return pole_cap
 
 
+EdgeNeighbor = namedtuple('EdgeNeighbor', ['cell_id', 'edge', 'reversed'])
+
+EdgeSegment = namedtuple('EdgeSegment', [
+    'cell_id', 'edge', 'start', 'end', 'reversed', 'level',
+    'source_start', 'source_end', 'coarse_cell_id', 'coarse_edge',
+])
+
+EdgeSample = namedtuple('EdgeSample', [
+    'cell_id', 'edge', 'step', 'steps', 'fraction', 'point', 'mode',
+])
+
+EdgeSampleSegment = namedtuple('EdgeSampleSegment', [
+    'cell_id', 'edge', 'step', 'steps',
+    'start_fraction', 'end_fraction', 'start_point', 'end_point', 'mode',
+])
+
+EdgeReadSample = namedtuple('EdgeReadSample', [
+    'cell_id', 'edge', 'step', 'steps', 'fraction', 'source_fraction',
+    'point', 'mode', 'reversed', 'coarse_cell_id', 'coarse_edge',
+])
+
+
 # Constants for CellId
 LOOKUP_BITS = 4
 SWAP_MASK = 0x01
@@ -1322,20 +1346,492 @@ class CellId(object):
         return face, i, j, orientation
 
     def get_edge_neighbors(self):
-        level = self.level()
-        size = self.get_size_ij(level)
-        face, i, j, orientation = self.to_face_ij_orientation()
+        """Return the four cells that are adjacent across this cell's edges.
 
-        return (self.from_face_ij_same(face, i, j - size, j - size >= 0)
-                .parent(level),
-                self.from_face_ij_same(face, i + size, j,
-                                       i + size < self.__class__.MAX_SIZE
-                                       ).parent(level),
-                self.from_face_ij_same(face, i, j + size,
-                                       j + size < self.__class__.MAX_SIZE
-                                       ).parent(level),
-                self.from_face_ij_same(face, i - size, j, i - size >= 0)
-                .parent(level))
+        The neighbors are returned in the order of the edges defined by
+        :func:`Cell.get_edge`: edge ``k`` joins vertex ``k`` to vertex
+        ``k + 1`` (mod 4).  Every neighbor is at the same level as this cell
+        and shares the whole corresponding spherical edge.
+        """
+        return tuple(info.cell_id for info in self.get_edge_neighbor_edges())
+
+    def get_edge_neighbor_edges(self):
+        """Return the four edge-adjacent cells together with the matching edge.
+
+        Each entry is an :class:`EdgeNeighbor` with:
+
+        - ``cell_id``: the same-level cell across edge ``k``;
+        - ``edge``: the edge of ``cell_id`` that coincides with edge ``k`` of
+          this cell, numbered in ``cell_id``'s own vertex order;
+        - ``reversed``: ``True`` when the two edges run in opposite directions,
+          i.e. when ``cell_id``'s edge starts at this cell's edge end.
+
+        A cell that only shares a vertex with this cell never appears here.
+        """
+        level = self.level()
+        cell = Cell(self)
+        neighbors = []
+        for k in range(4):
+            start = cell.get_vertex(k)
+            end = cell.get_vertex((k + 1) & 3)
+            neighbor = self._edge_neighbor_cell(
+                k, start, end, level, cell)
+            edge, reversed_ = self._matching_edge(neighbor, start, end)
+            neighbors.append(EdgeNeighbor(neighbor, edge, reversed_))
+        return tuple(neighbors)
+
+    def get_edge_neighbor(self, k):
+        """Return the :class:`EdgeNeighbor` across edge ``k``."""
+        return self.get_edge_neighbor_edges()[k]
+
+    def _edge_neighbor_cell(self, k, start, end, level, cell=None):
+        if cell is None:
+            cell = Cell(self)
+        mid = ((start + end) * 0.5).normalize()
+        inward = cell.get_edge(k).normalize()
+        # Sample half a cell width outward from the shared edge.  MIN_WIDTH is
+        # a lower bound on the cell width, and the midpoint sits strictly
+        # inside the edge, so the sample lands well inside the neighbor.  The
+        # retry only guards against projection rounding at the coarsest
+        # levels; it never walks a face.
+        step = 0.5 * MIN_WIDTH.get_value(level)
+        for _ in range(4):
+            sample = (mid * math.cos(step) -
+                      inward * math.sin(step)).normalize()
+            neighbor = self.__class__.from_point(sample).parent(level)
+            if self._shares_edge(neighbor, start, end):
+                return neighbor
+            step *= 2
+        raise ValueError('no edge neighbor found for {:016x} edge {}'
+                         .format(self.id(), k))
+
+    @classmethod
+    def _shares_edge(cls, cell_id, start, end):
+        cell = Cell(cell_id)
+        for k in range(4):
+            a = cell.get_vertex(k)
+            b = cell.get_vertex((k + 1) & 3)
+            if (a == start and b == end) or (a == end and b == start):
+                return True
+        return False
+
+    @classmethod
+    def _matching_edge(cls, neighbor, start, end):
+        cell = Cell(neighbor)
+        for k in range(4):
+            a = cell.get_vertex(k)
+            b = cell.get_vertex((k + 1) & 3)
+            if a == start and b == end:
+                return k, False
+            if a == end and b == start:
+                return k, True
+        raise ValueError('cell {:016x} does not share the requested edge'
+                         .format(neighbor.id()))
+
+    def get_edge_segments(self, cells, depth_limit=None):
+        """Split this cell's edges into the actual mixed-level coverage.
+
+        ``cells`` is an iterable of level-mixed :class:`CellId` values.  Only
+        cells covering part of one of this cell's edges participate.  The query
+        walks this cell's four edges and reports, for each covered stretch, an
+        :class:`EdgeSegment`:
+
+        - ``cell_id`` / ``level``: the cell supplying the coverage;
+        - ``edge``: that cell's edge lying on the coarse edge, numbered in its
+          own vertex order;
+        - ``start`` / ``end``: the covered spherical arc, in this cell's vertex
+          order along edge ``coarse_edge``;
+        - ``reversed``: whether the covering cell's edge runs opposite to this
+          cell's edge;
+        - ``source_start`` / ``source_end``: the covering cell's edge endpoints
+          in its own read order.
+
+        Stretches without coverage are omitted, so gaps stay visible.  A cell
+        that only shares a corner produces a zero-length interval and is not
+        reported.  Cells at the same level are reported once even if several
+        inputs cover the stretch; deeper cells win over their ancestors.
+        ``depth_limit``, when given, treats deeper cells as unreadable: those
+        stretches are reported as gaps instead of being expanded.
+
+        Only the supplied candidate cells are examined.  The caller can hand in
+        an already pruned list (for example from a spatial index), so no face
+        or subtree enumeration is performed here.
+        """
+        if depth_limit is None:
+            depth_limit = self.__class__.MAX_LEVEL
+        candidates = self._edge_coverage_index(cells, depth_limit)
+        if not candidates:
+            return []
+        level = self.level()
+        cell = Cell(self)
+        segments = []
+        for edge in range(4):
+            start = cell.get_vertex(edge)
+            end = cell.get_vertex((edge + 1) & 3)
+            segments.extend(self._segment_edge(
+                edge, start, end, candidates))
+        return segments
+
+    def _segment_edge(self, edge, start, end, candidates):
+        """Return contiguous covered pieces along one of this cell's edges."""
+        intervals = []
+        for cell_id in candidates:
+            if not self._touches_edge_cell(cell_id, edge):
+                continue
+            cell = Cell(cell_id)
+            for own_edge in range(4):
+                a = cell.get_vertex(own_edge)
+                b = cell.get_vertex((own_edge + 1) & 3)
+                # A true shared edge has both ends on this edge (or contains
+                # the whole edge, for a parent record).
+                if not (self._on_arc(start, end, a) and
+                        self._on_arc(start, end, b)) and \
+                        not (self._on_arc(a, b, start) and
+                             self._on_arc(a, b, end)):
+                    continue
+                covered = self._collinear_interval(start, end, a, b)
+                if covered is None:
+                    continue
+                lo, hi, reversed_ = covered
+                if hi - lo <= 0:
+                    continue
+                intervals.append((lo, hi, cell_id, own_edge, reversed_))
+        if not intervals:
+            return []
+        # Walk along the coarse edge and let the finest supplied cell win on
+        # each stretch.  Splitting at every interval endpoint keeps partial
+        # overlaps exact and leaves real gaps out.
+        cuts = set([0.0, 1.0])
+        for interval in intervals:
+            cuts.add(interval[0])
+            cuts.add(interval[1])
+        cuts = sorted(cuts)
+        pieces = []
+        for lo, hi in zip(cuts, cuts[1:]):
+            if hi - lo <= 0:
+                continue
+            middle = 0.5 * (lo + hi)
+            covering = [item for item in intervals
+                        if item[0] <= middle <= item[1]]
+            if not covering:
+                continue
+            best = min(covering, key=lambda item: (-item[2].level(),
+                                                    item[0], item[1]))
+            if (pieces and pieces[-1][2] == best[2] and
+                    pieces[-1][3] == best[3] and
+                    abs(pieces[-1][1] - lo) <= 1e-9 * max(1.0, hi - lo)):
+                # Same covering edge continuing across a grid crack.
+                previous = pieces[-1]
+                pieces[-1] = (previous[0], hi, best[2], best[3], best[4])
+            else:
+                pieces.append((lo, hi, best[2], best[3], best[4]))
+        merged = pieces
+        result = []
+        for lo, hi, cell_id, own_edge, reversed_ in merged:
+            covering = Cell(cell_id)
+            result.append(EdgeSegment(
+                cell_id=cell_id,
+                edge=own_edge,
+                start=self._edge_point(start, end, lo),
+                end=self._edge_point(start, end, hi),
+                reversed=reversed_,
+                level=cell_id.level(),
+                source_start=covering.get_vertex(own_edge),
+                source_end=covering.get_vertex((own_edge + 1) & 3),
+                coarse_cell_id=self,
+                coarse_edge=edge,
+            ))
+        return result
+
+    def _touches_edge_cell(self, other, edge):
+        """Cheap integer test: can ``other`` touch this edge?"""
+        if other == self:
+            return True
+        size = self.get_size_ij(self.level())
+        face, i, j, _ = self.to_face_ij_orientation()
+        i &= -size
+        j &= -size
+        bounds = {
+            0: (i, i + size, j - 1, j),
+            1: (i + size, i + size + 1, j, j + size),
+            2: (i, i + size, j + size, j + size + 1),
+            3: (i - 1, i, j, j + size),
+        }[edge]
+        if other.face() != face:
+            # A cross-face candidate can still meet this edge; keep it and let
+            # the vertex test decide.
+            return True
+        _, oi, oj, _ = other.to_face_ij_orientation()
+        o_size = other.get_size_ij(other.level())
+        oi &= -o_size
+        oj &= -o_size
+        return not (oi >= bounds[1] or oi + o_size <= bounds[0] or
+                    oj >= bounds[3] or oj + o_size <= bounds[2])
+
+    @classmethod
+    def _edge_coverage_index(cls, cells, depth_limit):
+        result = []
+        for cell_id in cells:
+            cell_id = (cell_id if isinstance(cell_id, cls) else cls(cell_id))
+            if not cell_id.is_valid() or cell_id.level() > depth_limit:
+                continue
+            result.append(cell_id)
+        return result
+
+    @classmethod
+    def _collinear_interval(cls, start, end, a, b):
+        """Overlap of arc ``a-b`` with arc ``start-end`` as fractions.
+
+        Returns ``(lo, hi, reversed_)`` in ``start-end`` parameter space, or
+        ``None`` when the two arcs do not share a positive-length stretch.
+
+        Endpoint containment is decided with the triangle inequality
+        (``angle(start, p) + angle(p, end) <= angle(start, end)``).  That test
+        stays reliable at level 30, where the cell edge itself is only about
+        1e-9 radians and a plane-distance test would drown in rounding.
+        """
+        if cls._on_arc(start, end, a) and cls._on_arc(start, end, b):
+            ta = cls._arc_fraction(start, end, a)
+            tb = cls._arc_fraction(start, end, b)
+            lo, hi = min(ta, tb), max(ta, tb)
+            if hi - lo <= 0:
+                return None
+            return lo, hi, ta > tb
+        if cls._on_arc(a, b, start) and cls._on_arc(a, b, end):
+            # The covering edge contains this whole edge (a parent record).
+            ta = cls._arc_fraction(a, b, start)
+            tb = cls._arc_fraction(a, b, end)
+            return 0.0, 1.0, ta > tb
+        return None
+
+    @classmethod
+    def _on_arc(cls, start, end, point):
+        tolerance = 1e-12
+        if cls._same_vertex(point, start) or cls._same_vertex(point, end):
+            return True
+        total = start.angle(end)
+        return start.angle(point) + point.angle(end) <= total + tolerance
+
+    @staticmethod
+    def _same_vertex(a, b, tolerance=1e-12):
+        if a == b:
+            return True
+        return a.angle(b) <= tolerance
+
+    @staticmethod
+    def _edge_point(start, end, fraction):
+        angle = start.angle(end)
+        if angle == 0:
+            return start
+        a = math.sin((1.0 - fraction) * angle) / math.sin(angle)
+        b = math.sin(fraction * angle) / math.sin(angle)
+        return (start * a + end * b).normalize()
+
+    @staticmethod
+    def _arc_fraction(start, end, point):
+        angle = start.angle(end)
+        if angle == 0:
+            return 0.0
+        return start.angle(point) / angle
+
+    EDGE_SAMPLE_ARC = 'arc'
+    EDGE_SAMPLE_GRID = 'grid'
+
+    def get_edge_samples(self, edge, steps, mode=None, reverse=False):
+        """Sample one edge at ``steps`` intervals.
+
+        ``mode`` selects the scanner:
+
+        - :attr:`EDGE_SAMPLE_ARC` (the default) divides the actual spherical
+          arc into equal angles;
+        - :attr:`EDGE_SAMPLE_GRID` divides the owning face's (u, v) grid
+          coordinate equally, matching the legacy face-grid scanner.
+
+        The result contains ``steps + 1`` :class:`EdgeSample` values with
+        ``step`` running ``0..steps``; ``fraction`` is the sampling parameter
+        in the selected mode.  ``reverse=True`` reads the edge from the other
+        end, which is what a reversed cross-face read does.  The same physical
+        point has the same ``point`` value in both directions.
+        """
+        if steps < 1:
+            raise ValueError('steps must be positive')
+        if mode is None:
+            mode = self.__class__.EDGE_SAMPLE_ARC
+        cell = Cell(self)
+        if reverse:
+            start = cell.get_vertex((edge + 1) & 3)
+            end = cell.get_vertex(edge)
+        else:
+            start = cell.get_vertex(edge)
+            end = cell.get_vertex((edge + 1) & 3)
+        points = self._sample_edge(cell.face(), start, end, steps, mode)
+        return [EdgeSample(self, edge, i, steps, i / float(steps),
+                           point, mode)
+                for i, point in enumerate(points)]
+
+    def get_edge_sample_segments(self, edge, steps, mode=None,
+                                 reverse=False):
+        """Return ``steps`` adjacent sample segments along one edge.
+
+        Consecutive segments share an endpoint, so the endpoint samples repeat
+        between neighbouring records.  Every record identifies the cell, edge,
+        step, step count and sampling mode, plus the segment's spherical end
+        points.
+        """
+        samples = self.get_edge_samples(edge, steps, mode, reverse)
+        return [EdgeSampleSegment(
+            self, edge, i, steps,
+            samples[i].fraction, samples[i + 1].fraction,
+            samples[i].point, samples[i + 1].point, samples[i].mode)
+            for i in range(steps)]
+
+    @classmethod
+    def _sample_edge(cls, face, start, end, steps, mode):
+        if mode == cls.EDGE_SAMPLE_ARC:
+            return [cls._edge_point(start, end, i / float(steps))
+                    for i in range(steps + 1)]
+        if mode == cls.EDGE_SAMPLE_GRID:
+            _, u0, v0 = face_xyz_to_uv(face, start)
+            _, u1, v1 = face_xyz_to_uv(face, end)
+            points = []
+            for i in range(steps + 1):
+                t = i / float(steps)
+                u = u0 + (u1 - u0) * t
+                v = v0 + (v1 - v0) * t
+                points.append(face_uv_to_xyz(face, u, v).normalize())
+            return points
+        raise ValueError('unknown edge sampling mode: {}'.format(mode))
+
+    @classmethod
+    def resolve_edge_sample(cls, point, samples, max_error=1e-12):
+        """Return the source sample at the given spherical read point.
+
+        Samples are matched by physical position, never by their linear index
+        on a cell edge.  When several records share the point (for example a
+        coarse parent and a fine child), the finest record wins.  If the finest
+        covering cell has no sample exactly at the read point, the parent
+        record that really is at that point is returned.  A cell edge that
+        merely overlaps the read interval at a different sampling position
+        yields ``None``, so the gap stays empty.
+        """
+        matches = [sample for sample in samples
+                   if sample.point.angle(point) <= max_error]
+        if not matches:
+            return None
+        return max(matches, key=lambda sample: sample.cell_id.level())
+
+    @classmethod
+    def match_edge_samples(cls, left, right, max_error=1e-12):
+        """Pair samples of two edges only where their physical points agree.
+
+        Returns ``(left_sample, right_sample)`` pairs in left sample order.
+        Samples that merely share a step index but sit at different spherical
+        positions are not paired.
+        """
+        pairs = []
+        used = set()
+        for index, sample in enumerate(left):
+            best = None
+            for other_index, other in enumerate(right):
+                if other_index in used:
+                    continue
+                error = sample.point.angle(other.point)
+                if error <= max_error and (best is None or
+                                           error < best[0]):
+                    best = (error, other_index)
+            if best is not None:
+                used.add(best[1])
+                pairs.append((sample, right[best[1]]))
+        return pairs
+
+    def read_edge_samples(self, edge, steps, samples, mode=None,
+                          depth_limit=None, max_error=1e-12, reverse=False):
+        """Read samples along one edge from a mixed-level scan table.
+
+        ``samples`` maps a :class:`CellId` (or token/id) to sample records
+        already read for that cell; records may be :class:`EdgeSample` or
+        :class:`EdgeReadSample` values.  For each step along this cell's edge
+        the query looks up the physical read point:
+
+        - when a parent and a child both have a record at the point, the
+          finer record is used;
+        - when the finest covering child has no sample at that point, a parent
+          record that really lies at the point is used;
+        - overlapping coverage whose samples sit at different physical
+          positions leaves the step empty.
+
+        Matching is by spherical position only, never by a linear edge index,
+        so a grid scanner and an arc scanner never masquerade as each other.
+        ``reversed`` in the result says whether the source record was read in
+        the opposite direction to this cell's edge.
+
+        ``reverse=True`` reads this edge from its end back to its start, which
+        is how a reversed cross-face read addresses the same physical points.
+
+        Returns one :class:`EdgeReadSample` per step; ``cell_id`` is ``None``
+        for a gap.
+        """
+        if steps < 1:
+            raise ValueError('steps must be positive')
+        if mode is None:
+            mode = self.__class__.EDGE_SAMPLE_ARC
+        normalized = {}
+        for key, records in samples.items():
+            cell_id = key if isinstance(key, self.__class__) \
+                else self.__class__(key)
+            usable = [record for record in records
+                      if record.cell_id is not None and
+                      (depth_limit is None or
+                       record.cell_id.level() <= depth_limit)]
+            normalized[cell_id] = usable
+        cell = Cell(self)
+        if reverse:
+            start = cell.get_vertex((edge + 1) & 3)
+            end = cell.get_vertex(edge)
+        else:
+            start = cell.get_vertex(edge)
+            end = cell.get_vertex((edge + 1) & 3)
+        points = self._sample_edge(cell.face(), start, end, steps, mode)
+        result = []
+        for index, point in enumerate(points):
+            choice = self._read_point(
+                point, start, end, normalized, max_error)
+            if choice is None:
+                result.append(EdgeReadSample(
+                    None, edge, index, steps, index / float(steps),
+                    None, point, mode, False, self, edge))
+                continue
+            record, source_fraction, reversed_ = choice
+            result.append(EdgeReadSample(
+                record.cell_id, record.edge, index, steps,
+                index / float(steps), source_fraction, point, mode,
+                reversed_, self, edge))
+        return result
+
+    @classmethod
+    def _read_point(cls, point, start, end, samples, max_error):
+        # Match by physical position only.  Records of all supplied cells are
+        # considered, and the finest level wins; a coarse record is used when
+        # the finer cell simply has no sample at this point.
+        match = None
+        for records in samples.values():
+            for record in records:
+                if record.point.angle(point) <= max_error and \
+                        (match is None or
+                         record.cell_id.level() > match.cell_id.level()):
+                    match = record
+        if match is None:
+            return None
+        source = Cell(match.cell_id)
+        source_start = source.get_vertex(match.edge)
+        source_end = source.get_vertex((match.edge + 1) & 3)
+        source_fraction = cls._arc_fraction(source_start, source_end, point)
+        start_fraction = cls._arc_fraction(
+            start, end, source_start)
+        end_fraction = cls._arc_fraction(
+            start, end, source_end)
+        reversed_ = start_fraction > end_fraction
+        return match, source_fraction, reversed_
 
     def get_vertex_neighbors(self, level):
         """Return the neighbors of closest vertex to this cell.

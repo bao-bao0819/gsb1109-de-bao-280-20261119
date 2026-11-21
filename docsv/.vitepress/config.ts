@@ -81,6 +81,7 @@ const DEVELOPMENT: DefaultTheme.NavItemWithLink[] = [
     { text: 'Developing Rules', link: '/development/developing-rules' },
     { text: 'Plugins', link: '/development/plugins' },
     { text: 'Custom Rules', link: '/development/custom-rules' },
+    { text: 'Column Lineage', link: '/development/column-lineage' },
     { text: 'Documentation', link: '/development/documentation' },
     { text: 'Using Git', link: '/development/git' },
 ]

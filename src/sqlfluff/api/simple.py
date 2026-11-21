@@ -1,6 +1,6 @@
 """The simple public API methods."""
 
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, cast
 
 from sqlfluff.core import (
     FluffConfig,
@@ -10,6 +10,7 @@ from sqlfluff.core import (
     dialect_selector,
 )
 from sqlfluff.core.types import ConfigMappingType
+from sqlfluff.utils.analysis.lineage import ColumnLineageTracer
 
 
 def get_simple_config(
@@ -210,3 +211,64 @@ def parse(
     record = root_variant.tree.as_record(show_raw=True)
     assert record
     return record
+
+
+def trace(
+    sql: str,
+    dialect: Optional[str] = None,
+    column_metadata: Optional[Mapping[str, Any]] = None,
+    *,
+    table_columns: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    wildcard_columns: Optional[Mapping[str, Any]] = None,
+    unknown_wildcards: Optional[Mapping[str, Any]] = None,
+    config: Optional[FluffConfig] = None,
+    config_path: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Trace result columns back to their source tables and columns.
+
+    This is the result-column level companion to :func:`parse`.  It uses only
+    the real parse tree of ``sql`` and the ordered column metadata supplied by
+    the caller; it never connects to a database.
+
+    Args:
+        sql (:obj:`str`): The SQL to analyse.
+        dialect (:obj:`Optional[str]`, optional): A reference to the dialect of
+            the SQL. Defaults to `ansi`.
+        column_metadata (:obj:`Optional[Mapping[str, Any]]`, optional): Ordered
+            columns for known physical tables, keyed by table name. Each value
+            may be a list of column names, a list of mappings with a ``name``
+            field, or a mapping with a ``columns`` key.
+        table_columns (:obj:`Optional[Mapping[str, Any]]`, optional): Alias for
+            ``column_metadata``.
+        metadata (:obj:`Optional[Mapping[str, Any]]`, optional): Alias for
+            ``column_metadata``.
+        wildcard_columns (:obj:`Optional[Mapping[str, Any]]`, optional):
+            Complete column order for sources whose wildcard was previously
+            unresolved. Supplying it completes those ranges and re-traces the
+            later outputs by real position.
+        unknown_wildcards (:obj:`Optional[Mapping[str, Any]]`, optional): Alias
+            for ``wildcard_columns``.
+        config (:obj:`Optional[FluffConfig]`, optional): A configuration object
+            to use for the operation. Defaults to None.
+        config_path (:obj:`Optional[str]`, optional): A path to a .sqlfluff
+            config, which is only used if a `config` is not already provided.
+            Defaults to None.
+
+    Returns:
+        :obj:`list[dict[str, Any]]` with one record per actual output position.
+        Duplicate output names remain separate records. A wildcard range which
+        could not be expanded appears as a single unresolved marker record.
+    """
+    if isinstance(dialect, Mapping):
+        # Allow ``trace(sql, {"table": [...]})`` as a convenience.
+        if column_metadata is None:
+            column_metadata = cast(Mapping[str, Any], dialect)
+        dialect = None
+    cfg = config or get_simple_config(dialect=dialect, config_path=config_path)
+    tracer = ColumnLineageTracer.from_config(
+        cfg,
+        column_metadata or table_columns or metadata,
+        wildcard_columns or unknown_wildcards,
+    )
+    return tracer.trace(sql).as_dict()

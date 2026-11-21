@@ -2,12 +2,13 @@
 
 # Expose the simple api
 from sqlfluff.api.info import list_dialects, list_rules
-from sqlfluff.api.simple import APIParsingError, fix, lint, parse
+from sqlfluff.api.simple import APIParsingError, fix, lint, parse, trace
 
 __all__ = (
     "lint",
     "fix",
     "parse",
+    "trace",
     "APIParsingError",
     "list_rules",
     "list_dialects",

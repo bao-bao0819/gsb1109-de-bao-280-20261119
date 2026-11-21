@@ -9,12 +9,13 @@ except ImportError:  # pragma: no cover
     pytest = None  # type: ignore[assignment]
 
 # Expose the public API.
-from sqlfluff.api import fix, lint, list_dialects, list_rules, parse
+from sqlfluff.api import fix, lint, list_dialects, list_rules, parse, trace
 
 __all__ = (
     "lint",
     "fix",
     "parse",
+    "trace",
     "list_rules",
     "list_dialects",
 )

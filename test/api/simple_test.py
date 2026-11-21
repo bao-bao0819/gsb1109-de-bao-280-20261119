@@ -712,3 +712,32 @@ def test__api__parse_exceptions():
     # Templater success but parsing fail
     with pytest.raises(APIParsingError):
         sqlfluff.parse("THIS IS NOT SQL")
+
+
+def test__api__trace_column_lineage():
+    """Test the simple API result-column trace entry point."""
+    sql = (
+        "WITH first AS (SELECT s.id AS k FROM t1 AS s), "
+        "second AS (SELECT s.id AS k FROM t2 AS s) "
+        "SELECT first.k, second.k FROM first JOIN second ON first.k = second.k"
+    )
+    result = sqlfluff.trace(
+        sql,
+        dialect="ansi",
+        column_metadata={"t1": ["id"], "t2": ["id"]},
+    )
+    assert [record["name"] for record in result] == ["k", "k"]
+    assert [record["ordinal"] for record in result] == [1, 2]
+    assert result[0]["sources"][0]["table"] == "t1"
+    assert result[1]["sources"][0]["table"] == "t2"
+    # Records are plain, JSON-serialisable dictionaries.
+    assert json.loads(json.dumps(result))[0]["status"] == "resolved"
+
+
+def test__api__trace_unknown_wildcard():
+    """The simple API reports unknown stars without guessing a table."""
+    result = sqlfluff.trace("SELECT u.* FROM unknown AS u", dialect="ansi")
+    assert len(result) == 1
+    assert result[0]["wildcard_range"] is True
+    assert result[0]["sources"] == []
+    assert result[0]["status"] == "unknown"

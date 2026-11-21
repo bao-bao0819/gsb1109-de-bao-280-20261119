@@ -16,7 +16,8 @@ from .transforms import (
     export_loop, convert,
     to_native, to_primitive,
 )
-from .validate import validate, prepare_validator
+from .validate import validate, prepare_validator, reads, _validate_model, \
+    get_validation_context
 from .types import BaseType
 from .types.serializable import Serializable
 from .undefined import Undefined
@@ -278,6 +279,52 @@ class Model(object):
             self.validate(convert=False)
         return self
 
+    def update(self, raw_data, partial=True, app_data=None, **kwargs):
+        """
+        Applies a partial update to the model and validates it atomically.
+
+        Model level rules that declare their field dependencies with
+        ``reads`` are only executed when the update affects one of the
+        declared fields, comparing the values before and after the update
+        is merged. Rules without a declaration are always executed, as are
+        all field level validations of the affected fields.
+
+        The update is all-or-nothing: if any validation fails, the model
+        is restored to the exact state it had before the call, including
+        any nested models a field setter may have written to, and no
+        pending data is left behind. Retrying with a valid update behaves
+        as if it were applied to the original record in the first place.
+
+        :param raw_data:
+            A mapping with the fields to update.
+        :param bool partial:
+            Allow partial data to validate. Essentially drops the
+            ``required=True`` settings from field definitions. Default: True
+        """
+        snapshot = _snapshot_model(self)
+        try:
+            before = _observe_fields(self)
+            self._data.converted.update(raw_data)
+            data = self._convert(validate=True, partial=partial,
+                validate_model=False, app_data=app_data, **kwargs)
+            self._data.valid = data
+            self._data.converted = {}
+            after = _observe_fields(self)
+            changed_fields = set(name for name, value in iteritems(after)
+                if before[name] != value)
+            context_options = {'partial': partial}
+            if app_data is not None:
+                context_options['app_data'] = app_data
+            context = get_validation_context(**context_options)
+            errors = _validate_model(self._schema, self, data, context,
+                changed_fields=changed_fields)
+            if errors:
+                raise DataError(errors, data)
+        except DataError:
+            _restore_model(self, snapshot)
+            raise
+        return self
+
     def _convert(self, raw_data=None, context=None, **kwargs):
         """
         Converts the instance raw data into richer Python constructs according
@@ -447,3 +494,70 @@ class Model(object):
             <Person: Mr. Pink>
         """
         return None
+
+
+def _observe_fields(model):
+    """
+    Captures the current value of every field on the model, including
+    calculated values, in a form that can be compared by equality later.
+    Nested models are captured as plain data snapshots.
+    """
+    observed = {}
+    for name in model._schema.fields:
+        value = getattr(model, name, Undefined)
+        if isinstance(value, Model):
+            value = value.to_native()
+        observed[name] = value
+    return observed
+
+
+def _snapshot_model(model):
+    """
+    Captures the complete data state of a model, recursing into nested
+    models, so that it can be restored with ``_restore_model``.
+    """
+    return tuple(_snapshot_mapping(mapping) for mapping in
+        (model._data.unsafe, model._data.converted, model._data.valid))
+
+
+def _snapshot_mapping(mapping):
+    return dict((key, _freeze_value(value)) for key, value in mapping.items())
+
+
+def _freeze_value(value):
+    if isinstance(value, Model):
+        return ('model', value, _snapshot_model(value))
+    elif isinstance(value, dict):
+        return ('dict', dict((k, _freeze_value(v)) for k, v in value.items()))
+    elif isinstance(value, (list, tuple)):
+        return ('seq', type(value), [_freeze_value(v) for v in value])
+    else:
+        return ('value', deepcopy(value))
+
+
+def _restore_model(model, snapshot):
+    """
+    Restores a model to a state captured by ``_snapshot_model``. Nested
+    model instances are restored in place so that existing references to
+    them keep pointing at the restored state.
+    """
+    model._data.unsafe = _restore_mapping(snapshot[0])
+    model._data.converted = _restore_mapping(snapshot[1])
+    model._data.valid = _restore_mapping(snapshot[2])
+
+
+def _restore_mapping(snapshot):
+    return dict((key, _thaw_value(value)) for key, value in snapshot.items())
+
+
+def _thaw_value(frozen):
+    kind = frozen[0]
+    if kind == 'model':
+        _restore_model(frozen[1], frozen[2])
+        return frozen[1]
+    elif kind == 'dict':
+        return dict((k, _thaw_value(v)) for k, v in frozen[1].items())
+    elif kind == 'seq':
+        return frozen[1](_thaw_value(v) for v in frozen[2])
+    else:
+        return frozen[1]

@@ -12,11 +12,27 @@ from .transforms import import_loop, validation_converter
 from .undefined import Undefined
 from .iteration import atoms
 
-__all__ = []
+__all__ = ['reads']
+
+
+def reads(*field_names):
+    """
+    Declare which fields a model level validation rule reads.
+
+    Rules decorated with ``reads`` may be skipped by
+    :meth:`schematics.models.Model.update` when none of the declared
+    fields are affected by the update. Rules without a declaration keep
+    the existing behavior and are always called.
+    """
+    def wrap(func):
+        func._reads = frozenset(field_names)
+        return func
+    return wrap
 
 
 def validate(schema, mutable, raw_data=None, trusted_data=None,
-             partial=False, strict=False, convert=True, context=None, **kwargs):
+             partial=False, strict=False, convert=True, context=None,
+             validate_model=True, changed_fields=None, **kwargs):
     """
     Validate some untrusted data using a model. Trusted data can be passed in
     the `trusted_data` parameter.
@@ -41,6 +57,15 @@ def validate(schema, mutable, raw_data=None, trusted_data=None,
         Can be turned off to skip an unnecessary conversion step if all values
         are known to have the right datatypes (e.g., when validating immediately
         after the initial import). Default: True
+    :param validate_model:
+        Controls whether model level validation rules are executed.
+        Default: True
+    :param changed_fields:
+        An optional set of field names that were affected by the validated
+        input. Model level rules that declare their field dependencies with
+        ``reads`` are only executed when one of the declared fields is in
+        this set. Rules without a declaration are always executed.
+        Default: None (execute all rules)
 
     :returns: data
         ``dict`` containing the valid raw_data plus ``trusted_data``.
@@ -61,7 +86,9 @@ def validate(schema, mutable, raw_data=None, trusted_data=None,
         errors = dict(exc.errors)
         data = exc.partial_data
 
-    errors.update(_validate_model(schema, mutable, data, context))
+    if validate_model:
+        errors.update(_validate_model(schema, mutable, data, context,
+            changed_fields=changed_fields))
 
     if errors:
         raise DataError(errors, data)
@@ -69,7 +96,7 @@ def validate(schema, mutable, raw_data=None, trusted_data=None,
     return data
 
 
-def _validate_model(schema, mutable, data, context):
+def _validate_model(schema, mutable, data, context, changed_fields=None):
     """
     Validate data using model level methods.
 
@@ -80,6 +107,11 @@ def _validate_model(schema, mutable, data, context):
         the original data and that can be mutated.
     :param data:
         A dict with data to validate. Invalid items are removed from it.
+    :param changed_fields:
+        An optional set of field names affected by the current input. Rules
+        that declare their field dependencies with ``reads`` are skipped
+        unless one of the declared fields is in this set. Rules without a
+        declaration are always executed.
     :returns:
         Errors of the fields that did not pass validation.
     """
@@ -91,8 +123,14 @@ def _validate_model(schema, mutable, data, context):
         atom.name in schema._validator_functions
     )
     for field_name, field, value in atoms(schema, data, filter=has_validator):
+        validator = schema._validator_functions[field_name]
+        if changed_fields is not None:
+            dependencies = getattr(validator, '_reads', None)
+            if dependencies is not None \
+              and not dependencies.intersection(changed_fields):
+                continue
         try:
-            schema._validator_functions[field_name](mutable, data, value, context)
+            validator(mutable, data, value, context)
         except (FieldError, DataError) as exc:
             serialized_field_name = field.serialized_name or field_name
             errors[serialized_field_name] = exc.errors

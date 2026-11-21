@@ -134,6 +134,53 @@ dependencies:
   ModelValidationError: {'call_me': [u'He prefers email.']}
 
 
+Partial Updates
+---------------
+
+When applying a partial update to an existing model, running every
+model-level rule is often wasteful - or outright wrong, when legacy data
+would not pass rules that only concern the changed fields.
+``Model.update()`` applies an update atomically and only executes the
+rules whose declared field dependencies are actually affected by the
+update. A rule declares the fields it reads with the ``reads``
+decorator:
+
+::
+
+  >>> from schematics.models import Model, reads
+  >>> from schematics.types import StringType, IntType
+  >>> from schematics.exceptions import ValidationError
+  >>>
+  >>> class Quote(Model):
+  ...     supplier_code = StringType(required=True)
+  ...     currency = StringType()
+  ...     amount = IntType()
+  ...
+  ...     @reads('currency', 'amount')
+  ...     def validate_amount(self, data, value):
+  ...         if data['currency'] == u'EUR' and value < 100:
+  ...             raise ValidationError(u'Below the EUR minimum.')
+  ...
+  >>> quote = Quote({'currency': u'EUR', 'amount': 500}, partial=True)
+  >>> quote.update({'amount': 50})
+  Traceback (most recent call last):
+  ...
+  DataError: {'amount': [u'Below the EUR minimum.']}
+  >>> quote.amount
+  500
+
+The update is all-or-nothing: when validation fails, the model is
+restored to the exact state it had before the call, including any
+nested models a field setter may have written to, and no pending data
+is left behind. Retrying with a valid update behaves as if it were
+applied to the original record in the first place.
+
+Rules without a ``reads`` declaration keep the existing calling
+convention and always run. Because the update is partial, missing
+required fields (like ``supplier_code`` above) do not block it, while
+a full ``validate()`` still reports them.
+
+
 More Information
 ================
 

@@ -121,10 +121,12 @@ class Rufus::Scheduler::Job
 
   def trigger(time)
 
+    planned_at = @next_time
+
     @previous_time = @next_time
     set_next_time(time)
 
-    do_trigger(time)
+    do_trigger(time, planned_at)
   end
 
   # Trigger the job right now, off of its schedule.
@@ -134,7 +136,43 @@ class Rufus::Scheduler::Job
   #
   def trigger_off_schedule(time=EoTime.now)
 
-    do_trigger(time)
+    do_trigger(time, nil)
+  end
+
+  #
+  # Confirms that the data of the current (or given) window was delivered.
+  #
+  # This is the explicit delivery confirmation. A worker thread exiting, or
+  # a scheduler join, is not a delivery confirmation.
+  #
+  def confirm_delivery!(window_at=nil, detail=nil)
+
+    @scheduler.confirm_delivery(self, window_at, detail)
+  end
+  alias confirm_handoff! confirm_delivery!
+  alias delivered! confirm_delivery!
+
+  #
+  # Returns the live handoff window matching the given planned time, or the
+  # most recent one for this job.
+  #
+  def handoff_window(window_at=nil)
+
+    if window_at
+      run = @scheduler.handoff_window_for(self, window_at)
+      return run && run.snapshot
+    end
+
+    @scheduler.handoff_windows
+      .select { |w| w.job_id == job_id }
+      .sort_by { |w| w.planned_at ? w.planned_at.to_f : 0 }
+      .last
+  end
+
+  def delivered?
+
+    w = handoff_window
+    !! (w && w.completed?)
   end
 
   def unschedule
@@ -252,7 +290,7 @@ class Rufus::Scheduler::Job
   # exceptions above StandardError do pass through
   end
 
-  def do_trigger(time)
+  def do_trigger(time, planned_at=nil)
 
     return if (
       opts[:overlap] == false &&
@@ -266,18 +304,21 @@ class Rufus::Scheduler::Job
     @count += 1
 
     if opts[:blocking]
-      trigger_now(time)
+      trigger_now(time, planned_at)
     else
-      trigger_queue(time)
+      trigger_queue(time, planned_at)
     end
   end
 
-  def trigger_now(time)
+  def trigger_now(time, planned_at=nil)
 
     ct = Thread.current
 
     t = EoTime.now
       # if there are mutexes, t might be really bigger than time
+
+    run = @scheduler.handoff_register_window(self, planned_at) if planned_at
+    @scheduler.handoff_mark_started(run) if run
 
     ct[:rufus_scheduler_job] = self
     ct[:rufus_scheduler_time] = t
@@ -288,6 +329,8 @@ class Rufus::Scheduler::Job
     do_call(time, true)
 
   ensure
+
+    @scheduler.handoff_mark_finished(run) if run
 
     @last_work_time =
       EoTime.now - ct[:rufus_scheduler_time]
@@ -326,17 +369,24 @@ class Rufus::Scheduler::Job
 
           break if @scheduler.started_at == nil
 
-          job, time = @scheduler.work_queue.pop
+          job, time, run = @scheduler.work_queue.pop
 
           break if job == :shutdown
           break if @scheduler.started_at == nil
 
           next if job.unscheduled_at
 
+          if run && ! run.queued?
+            # the window was already closed (not started) by a handoff
+            next
+          end
+
           begin
 
+            @scheduler.handoff_mark_started(run) if run
+
             (job.opts[:mutex] || []).reduce(
-              lambda { job.trigger_now(time) }
+              lambda { job.trigger_now(time, run && run.planned_at) }
             ) do |b, m|
               lambda { mutex(m).synchronize { b.call } }
             end.call
@@ -359,7 +409,7 @@ class Rufus::Scheduler::Job
     thread
   end
 
-  def trigger_queue(time)
+  def trigger_queue(time, planned_at=nil)
 
     threads = @scheduler.work_threads
 
@@ -371,7 +421,9 @@ class Rufus::Scheduler::Job
 
     start_work_thread if vac - que < 1 && cur < max
 
-    @scheduler.work_queue << [ self, time ]
+    run = @scheduler.handoff_register_window(self, planned_at) if planned_at
+
+    @scheduler.work_queue << [ self, time, run ]
   end
 
   # Scheduler level < Job level < this resume()'s level

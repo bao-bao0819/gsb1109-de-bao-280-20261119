@@ -1105,6 +1105,88 @@ Shuts down the scheduler, waits (blocks) at most n seconds until all the jobs ce
 
 Kills all the job (threads) and then shuts the scheduler down. Radical.
 
+### Scheduler#shutdown(:handoff)
+
+Shuts the scheduler down like `#shutdown(:wait)`, but returns a handoff
+receipt instead of nil:
+
+```ruby
+receipt = scheduler.shutdown(:handoff, wait: 5)
+```
+
+A handoff receipt lists the windows that were due at the shutdown boundary,
+split into three classes:
+
+* `completed`: the job explicitly confirmed the data was delivered
+* `not_started`: the window was due but no worker started it (it may be
+  reassigned)
+* `needs_review`: a worker started the window but there is no delivery
+  confirmation; it must not be blindly treated as delivered or as
+  unconditionally re-runnable
+
+```ruby
+receipt.windows          # all the due windows (frozen HandoffWindow values)
+receipt.completed        # delivery-confirmed windows
+receipt.not_started      # windows that never started
+receipt.needs_review     # started but not confirmed
+receipt.reassignable     # the not_started windows
+receipt.pending          # not_started + needs_review
+receipt.counts           # { completed: 1, not_started: 1, needs_review: 1, total: 3 }
+receipt.to_h             # plain Hash, ready for JSON
+receipt.to_json
+receipt.digest           # SHA256 of the canonical JSON
+receipt.write('/tmp/handoff.json')
+```
+
+Windows planned after the shutdown boundary are not part of the receipt.
+
+A worker thread finishing (or the scheduler joining its threads) is **not**
+a delivery confirmation. Jobs confirm explicitly:
+
+```ruby
+scheduler.every '5m', tag: 'billing' do |job|
+  deliver_batch(job)
+  job.confirm_delivery!('warehouse://batches/2026-11-21')
+end
+```
+
+`confirm_delivery!` accepts an optional planned time and an optional
+confirmation payload:
+
+```ruby
+job.confirm_delivery!(window_at, 'warehouse://...')
+scheduler.confirm_delivery(job, window_at, 'warehouse://...')
+```
+
+The `wait:` option has the same meaning as for `#shutdown(wait: n)`:
+
+* `wait: n`: wait at most n seconds for started windows to confirm
+* `wait: true`: wait until every started window confirms or finishes
+* no `wait`: take the snapshot right away
+
+The receipt is an immutable snapshot of the shutdown and confirmation
+boundary. A confirmation that arrives after the receipt was returned is
+visible through `scheduler.handoff_windows` (live view) and
+`scheduler.late_handoff_confirmations`, but it does not change the receipt
+that was already returned. Reading `scheduler.handoff_receipt` twice thus
+yields the same classification, and two readers of the same file can
+reconcile their views.
+
+`shutdown(:handoff, tag: 'billing')` restricts the receipt to the windows
+of jobs matching that tag. `shutdown(:handoff, handoff_path: path)` also
+writes the receipt as JSON at `path`, ready for a replacement scheduler:
+
+```ruby
+receipt = scheduler.shutdown(:handoff, wait: 5, handoff_path: 'handoff.json')
+
+copy = Rufus::Scheduler::Handoff::Receipt.load('handoff.json')
+copy.counts         # same classification as the original receipt
+copy.digest == receipt.digest
+```
+
+The plain `#shutdown`, `#shutdown(:wait)`, `#shutdown(wait: n)` and
+`#shutdown(:kill)` keep their previous behaviour and return nil.
+
 ### Scheduler#down?
 
 Returns true if the scheduler has been shut down.

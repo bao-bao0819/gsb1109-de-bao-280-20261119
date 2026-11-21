@@ -19,6 +19,7 @@ class Rufus::Scheduler
   require 'rufus/scheduler/jobs_repeat'
   require 'rufus/scheduler/job_array'
   require 'rufus/scheduler/locks'
+  require 'rufus/scheduler/handoff'
 
   #
   # A common error class for rufus-scheduler
@@ -47,6 +48,7 @@ class Rufus::Scheduler
   attr_reader :thread
   attr_reader :thread_key
   attr_reader :mutexes
+  attr_reader :last_handoff_receipt
 
   #attr_accessor :min_work_threads
   attr_accessor :max_work_threads
@@ -71,6 +73,18 @@ class Rufus::Scheduler
 
     @work_queue = Queue.new
     @join_queue = Queue.new
+
+    @handoff_mutex = Mutex.new
+    @trigger_mutex = Mutex.new
+    @handoff_windows = []
+    @handoff_records = {}
+    @handoff_sequence = 0
+    @handoff_shutting_down = false
+    @handoff_started_at = nil
+    @handoff_cutoff_at = nil
+    @handoff_deadline_at = nil
+    @handoff_late_confirmations = []
+    @last_handoff_receipt = nil
 
     #@min_work_threads =
     #  opts[:min_work_threads] || opts[:min_worker_threads] ||
@@ -511,34 +525,466 @@ class Rufus::Scheduler
     stderr.flush
   end
 
-  def shutdown(opt=nil)
+  def shutdown(opt=nil, *args)
 
     opts =
       case opt
       when Symbol then { opt => true }
-      when Hash then opt
-      else {}
+      when Hash then opt.dup
+      when nil then {}
+      else opt.respond_to?(:to_hash) ? opt.to_hash.dup : { opt => true }
       end
 
-    @jobs.unschedule_all
+    args.each { |a| opts.merge!(a) if a.is_a?(Hash) }
 
-    if opts[:wait] || opts[:join]
-      join_shutdown(opts)
-    elsif opts[:kill]
-      kill_shutdown(opts)
-    else
-      regular_shutdown(opts)
+    handoff_receipt =
+      if opts[:handoff] || opts[:receipt] || opts[:drain]
+        opts[:handoff] ||= true if opts[:drain]
+        handoff_shutdown(opts)
+      end
+
+    unless handoff_receipt
+
+      @jobs.unschedule_all
+
+      if opts[:wait] || opts[:join]
+        join_shutdown(opts)
+      elsif opts[:kill]
+        kill_shutdown(opts)
+      else
+        regular_shutdown(opts)
+      end
+
+      @work_queue.clear
+
+      unlock
+
+      @thread.join unless @thread == Thread.current
     end
 
-    @work_queue.clear
-
-    unlock
-
-    @thread.join unless @thread == Thread.current
+    handoff_receipt
   end
   alias stop shutdown
 
+  #
+  # Shuts the scheduler down and returns the handoff receipt.
+  #
+  def handoff(opts=nil)
+
+    opts = {} if opts.nil?
+    opts = { :wait => opts } if opts.is_a?(Numeric) || opts.is_a?(String)
+
+    shutdown(opts.merge(:handoff => true))
+  end
+  alias drain handoff
+  alias handoff_shutdown! handoff
+
+  #
+  # Returns the receipt of the last handoff shutdown, or nil.
+  #
+  # The receipt is a frozen snapshot, reading it twice yields the same
+  # classification even if a job confirms its delivery late.
+  #
+  def handoff_receipt
+
+    @last_handoff_receipt
+  end
+  alias last_handoff_receipt handoff_receipt
+  alias handoff_manifest handoff_receipt
+
+  #
+  # Returns the latest internal view of the windows known to this scheduler.
+  #
+  # Unlike #handoff_receipt, this view is live: a late delivery confirmation
+  # is reflected here. Receipts already returned are not modified.
+  #
+  def handoff_windows
+
+    @handoff_mutex.synchronize {
+      @handoff_windows.map { |run| run.snapshot(@handoff_deadline_at) }
+    }
+  end
+
+  #
+  # Returns the windows of the last receipt that got confirmed after that
+  # receipt was returned.
+  #
+  def late_handoff_confirmations
+
+    @handoff_mutex.synchronize { @handoff_late_confirmations.dup }
+  end
+
+  #
+  # True while a handoff shutdown is in progress.
+  #
+  def handoff_draining?
+
+    @handoff_shutting_down
+  end
+
+  #
+  # Confirms that the data for a window was delivered.
+  #
+  # job_or_job_id:: the job (or its id)
+  # window_at::     the planned time of the window (optional)
+  # detail::        an optional payload describing the delivery
+  #
+  # Returns the confirmed HandoffWindow snapshot, or nil if no open window
+  # matched.
+  #
+  def confirm_delivery(job_or_job_id, window_at=nil, detail=nil)
+
+    if detail.nil? && window_at.is_a?(Hash)
+      detail = window_at
+      window_at = nil
+    elsif detail.nil? && window_at.is_a?(String)
+      parsed = Handoff.parse_time(window_at)
+      if parsed
+        window_at = parsed
+      else
+        detail = window_at
+        window_at = nil
+      end
+    end
+
+    job, job_id = fetch(job_or_job_id)
+    job_id = job_id.to_s
+
+    run = nil
+
+    @handoff_mutex.synchronize do
+
+      candidates = @handoff_windows.select { |w|
+        w.job_id == job_id && w.open?
+      }
+
+      if window_at
+        wanted = Handoff.eo_time(window_at)
+        candidates = candidates.select { |w|
+          w.planned_at && wanted &&
+          (w.planned_at.to_f - wanted.to_f).abs < 0.000001
+        }
+      end
+
+      run = candidates.last
+
+      run.confirm!(detail) if run
+    end
+
+    return nil unless run
+
+    snapshot = run.snapshot
+
+    if @last_handoff_receipt
+      reported = @last_handoff_receipt.windows.find { |w| w.id == snapshot.id }
+      if reported && !reported.completed?
+        @handoff_mutex.synchronize {
+          @handoff_late_confirmations << snapshot
+        }
+      end
+    end
+
+    snapshot
+  end
+  alias confirm_handoff confirm_delivery
+
+  #
+  # Registers a window about to be handed to a worker. Called by Job.
+  #
+  def handoff_register_window(job, planned_at)
+
+    planned_at = Handoff.eo_time(planned_at)
+    return nil unless planned_at
+
+    @handoff_mutex.synchronize do
+
+      key = handoff_window_key(job.job_id, planned_at)
+
+      run = @handoff_records[key]
+      return run if run
+
+      run = Handoff::WindowRun.new(
+        self, job, planned_at, @handoff_sequence = (@handoff_sequence || 0) + 1,
+        :queued)
+
+      @handoff_records[key] = run
+      @handoff_windows << run
+
+      handoff_prune_windows
+
+      run
+    end
+  end
+
+  def handoff_mark_started(run)
+
+    return nil unless run
+
+    @handoff_mutex.synchronize { run.start! }
+
+    run
+  end
+
+  def handoff_mark_finished(run, error=nil)
+
+    return nil unless run
+
+    @handoff_mutex.synchronize { run.finish!(error) }
+
+    run
+  end
+
+  def handoff_mark_not_started(run, reason=:not_started)
+
+    return nil unless run
+
+    @handoff_mutex.synchronize { run.not_started!(reason) }
+
+    run
+  end
+
+  def handoff_window_for(job, planned_at)
+
+    planned_at = Handoff.eo_time(planned_at)
+    return nil unless planned_at
+
+    @handoff_mutex.synchronize {
+      @handoff_records[handoff_window_key(job.job_id, planned_at)]
+    }
+  end
+
   protected
+
+  def handoff_shutdown(opts)
+
+    wait = opts[:wait] || opts[:join] || opts[:deadline]
+    wait = true if wait.nil? && opts.key?(:wait)
+    wait = opts.has_key?(:wait) ? opts[:wait] : wait
+    wait = Handoff.parse_wait(wait)
+
+    tags = Array(opts[:tag] || opts[:tags]).map(&:to_s)
+
+    started_at = EoTime.now
+    cutoff_at = started_at
+    indefinite = (wait == :indefinite)
+    wait_s = indefinite ? nil : wait
+    deadline_at = wait_s.nil? ? nil : started_at + wait_s
+
+    @handoff_mutex.synchronize do
+      @handoff_shutting_down = true
+      @handoff_started_at = started_at
+      @handoff_cutoff_at = cutoff_at
+      @handoff_deadline_at = deadline_at
+      @handoff_late_confirmations = []
+    end
+
+    # Let the scheduler thread finish the round it may be in, then rely on
+    # @handoff_shutting_down to keep it from triggering further windows.
+    @trigger_mutex.synchronize { }
+
+    unless opts[:keep_running]
+      @paused_at = started_at
+    end
+
+    handoff_register_due_windows(cutoff_at, tags)
+
+    unless opts[:keep_running]
+      handoff_drain_work_queue
+    end
+
+    deadline = indefinite ? nil : monow + wait_s
+
+    handoff_wait_for_confirmations(deadline, cutoff_at, tags, indefinite)
+
+    handoff_mark_queued_not_started(cutoff_at, tags)
+
+    returned_at = EoTime.now
+
+    receipt = handoff_build_receipt(
+      started_at, cutoff_at, returned_at, deadline_at, wait_s, tags)
+
+    @handoff_mutex.synchronize do
+      @last_handoff_receipt = receipt
+      @handoff_shutting_down = false
+    end
+
+    receipt.write(opts[:handoff_path] || opts[:receipt_path]) \
+      if opts[:handoff_path] || opts[:receipt_path]
+
+    if opts[:keep_running]
+      @paused_at = nil
+      return receipt
+    end
+
+    @started_at = nil
+    (work_threads.size * 2 + 1).times { @work_queue << :shutdown }
+
+    work_threads.each(&:kill) if opts[:kill]
+
+    @thread.join unless @thread == Thread.current
+
+    unlock
+
+    receipt
+  end
+
+  def handoff_register_due_windows(cutoff_at, tags)
+
+    @jobs.to_a.each do |job|
+
+      next if job.unscheduled_at || ! handoff_tag_match?(job, tags)
+
+      planned_at = Handoff.eo_time(job.next_time)
+
+      next unless planned_at
+      next if planned_at > cutoff_at
+
+      run = handoff_register_window(job, planned_at)
+      handoff_mark_not_started(run, :due_but_not_started) if run && run.queued?
+    end
+  end
+
+  def handoff_drain_work_queue
+
+    loop do
+
+      item =
+        begin
+          @work_queue.pop(true)
+        rescue ThreadError
+          nil
+        end
+
+      break unless item
+
+      next if item == :shutdown
+
+      job, time, run = item
+      run ||= handoff_window_for(job, time)
+
+      handoff_mark_not_started(run, :queued_but_not_started)
+    end
+  end
+
+  def handoff_mark_queued_not_started(cutoff_at, tags)
+
+    @handoff_mutex.synchronize do
+      @handoff_windows.each do |run|
+        next unless run.queued?
+        next unless handoff_tag_match?(run.job, tags)
+        next if run.planned_at && run.planned_at > cutoff_at
+
+        run.not_started!(run.reason || :queued_but_not_started)
+      end
+    end
+  end
+
+  def handoff_wait_for_confirmations(deadline, cutoff_at, tags, indefinite=false)
+
+    loop do
+
+      pending = handoff_confirmation_pending?(cutoff_at, tags)
+
+      break unless pending
+      break if deadline && monow >= deadline
+
+      sleep([ 0.01, deadline ? [ deadline - monow, 0 ].max : 0.01 ].min)
+    end
+
+    @handoff_mutex.synchronize { handoff_quiesce_windows(cutoff_at, tags) }
+  end
+
+  #
+  # Freezes the classification of the windows in the cutoff. Runs inside
+  # @handoff_mutex, so a confirmation either lands before or after the
+  # freeze, never silently between "pending" and "reported".
+  #
+  def handoff_quiesce_windows(cutoff_at, tags)
+
+    @handoff_windows.each do |run|
+      next if run.completed?
+      next unless handoff_tag_match?(run.job, tags)
+      next if run.planned_at && run.planned_at > cutoff_at
+
+      if run.started_at
+        run.quiesce!
+      else
+        run.not_started!(run.reason || :queued_but_not_started)
+      end
+    end
+  end
+
+  def handoff_confirmation_pending?(cutoff_at, tags)
+
+    @handoff_mutex.synchronize do
+
+      @handoff_windows.any? do |run|
+        next false if run.completed?
+        next false unless handoff_tag_match?(run.job, tags)
+        next false if run.planned_at && run.planned_at > cutoff_at
+
+        run.running?
+      end
+    end
+  end
+
+  def handoff_build_receipt(started_at, cutoff_at, returned_at, deadline_at, wait, tags)
+
+    windows = []
+
+    @handoff_mutex.synchronize do
+
+      @handoff_windows.each do |run|
+        next unless handoff_tag_match?(run.job, tags)
+
+        snapshot = run.snapshot(deadline_at)
+        next if snapshot.planned_at && snapshot.planned_at > cutoff_at
+
+        windows << snapshot
+      end
+    end
+
+    windows.sort_by! { |w| [ w.planned_at ? w.planned_at.to_f : 0, w.job_id, w.round ] }
+
+    Handoff::Receipt.new(
+      {
+        :version => 1,
+        :scheduler_object_id => object_id,
+        :shutdown_started_at => started_at,
+        :cutoff_at => cutoff_at,
+        :returned_at => returned_at,
+        :deadline_at => deadline_at,
+        :shutdown_started_epoch => started_at.to_f,
+        :cutoff_epoch => cutoff_at.to_f,
+        :returned_epoch => returned_at.to_f,
+        :deadline_epoch => deadline_at && deadline_at.to_f,
+        :wait => wait,
+        :tags => tags
+      },
+      windows)
+  end
+
+  def handoff_tag_match?(job, tags)
+
+    return true if tags.empty?
+
+    tags.all? { |tag| job.tags.include?(tag) }
+  end
+
+  def handoff_window_key(job_id, planned_at)
+
+    "#{job_id}@#{planned_at.to_f}"
+  end
+
+  def handoff_prune_windows
+
+    return if @handoff_windows.size <= 10_000
+
+    excess = @handoff_windows.size - 10_000
+    removed = @handoff_windows.shift(excess)
+
+    removed.each { |run| @handoff_records.delete(handoff_window_key(run.job_id, run.planned_at)) }
+  end
 
   def join_shutdown(opts)
 
@@ -667,9 +1113,12 @@ class Rufus::Scheduler
 
     now = EoTime.now
 
-    @jobs.each(now) do |job|
+    @trigger_mutex.synchronize do
+      return if @handoff_shutting_down
 
-      job.trigger(now)
+      @jobs.each(now) do |job|
+        job.trigger(now)
+      end
     end
   end
 

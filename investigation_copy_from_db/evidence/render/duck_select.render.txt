@@ -1,0 +1,11 @@
+SQLFluff rendered 2 variants of this file
+Variant 1:
+
+
+select  a from t
+
+Variant 2:
+
+
+select  a from t
+

@@ -1,0 +1,18 @@
+SQLFluff rendered 3 variants of this file
+Variant 1:
+
+
+COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;
+COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;
+
+Variant 2:
+
+
+select  a from t
+
+Variant 3:
+
+
+COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;
+COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;
+

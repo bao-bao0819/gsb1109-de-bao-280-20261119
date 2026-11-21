@@ -1,0 +1,8 @@
+[sqlfluff]
+dialect = postgres
+templater = jinja
+rules = LT01,CP01
+
+[sqlfluff:templater:jinja:context]
+load_branch = true
+params = pgdb

@@ -1,0 +1,2 @@
+path,source_chars,templated_chars,segments,raw_segments,templating,lexing,parsing,linting,AM04,LT01
+/Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/template/load_copies.sql,699,156,97,83,0.007972166989929974,0.0018776659853756428,0.006136666983366013,0.0022934589069336653,1.5874975360929966e-05,0.0008898749947547913

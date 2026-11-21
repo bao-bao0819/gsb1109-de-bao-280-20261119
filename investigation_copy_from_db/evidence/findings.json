@@ -1,0 +1,993 @@
+[
+  {
+    "dialect": "duckdb",
+    "label": "normal",
+    "context": {
+      "load_branch": true,
+      "params": "pgdb"
+    },
+    "enabled_rules": [
+      "AM04",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "56aac84d7c83e224",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "56aac84d7c83e224",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [],
+    "final_violations": [
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "AM04",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "duckdb",
+    "label": "empty",
+    "context": {
+      "load_branch": true,
+      "params": ""
+    },
+    "enabled_rules": [
+      "AM04",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "11fc4eea500e73c8",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "11fc4eea500e73c8",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;",
+          "raw_len": 33,
+          "tpl_start": [
+            3,
+            42
+          ],
+          "tpl_end": [
+            3,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;",
+          "raw_len": 33,
+          "tpl_start": [
+            3,
+            42
+          ],
+          "tpl_end": [
+            3,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "AM04",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "duckdb",
+    "label": "missing",
+    "context": {
+      "load_branch": true
+    },
+    "enabled_rules": [
+      "AM04",
+      "LT01"
+    ],
+    "variant_count": 2,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "11fc4eea500e73c8",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      }
+    ],
+    "templater_violations": [
+      {
+        "code": "TMP",
+        "src_line": 11,
+        "src_pos": 21,
+        "desc": "Undefined jinja template variable: 'params'"
+      },
+      {
+        "code": "TMP",
+        "src_line": 11,
+        "src_pos": 21,
+        "desc": "Undefined jinja template variable: 'params'"
+      }
+    ],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;",
+          "raw_len": 33,
+          "tpl_start": [
+            3,
+            42
+          ],
+          "tpl_end": [
+            3,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "TMP",
+        "src_line": 11,
+        "src_pos": 21,
+        "desc": "Undefined jinja template variable: 'params'"
+      },
+      {
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "AM04",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "duckdb",
+    "label": "select",
+    "context": {
+      "load_branch": false,
+      "params": "pgdb"
+    },
+    "enabled_rules": [
+      "AM04",
+      "LT01"
+    ],
+    "variant_count": 2,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [],
+    "final_violations": [
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "AM04",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "duckdb",
+    "label": "rev_empty_first",
+    "context": {
+      "load_branch": true,
+      "params": ",pgdb"
+    },
+    "enabled_rules": [
+      "AM04",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "a5639b8d257f90e5",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "a5639b8d257f90e5",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;\\nCOPY FROM DATABASE pg_meta TO analytics; COPY ...'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;",
+          "raw_len": 112,
+          "tpl_start": [
+            3,
+            42
+          ],
+          "tpl_end": [
+            4,
+            79
+          ],
+          "src_pos": [
+            11,
+            42
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;\\nCOPY FROM DATABASE pg_meta TO analytics; COPY ...'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;",
+          "raw_len": 112,
+          "tpl_start": [
+            3,
+            42
+          ],
+          "tpl_end": [
+            4,
+            79
+          ],
+          "src_pos": [
+            11,
+            42
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;\\nCOPY FROM DATABASE pg_meta TO analytics; COPY ...'. Expected: Nothing else in FileSegment."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "AM04",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "duckdb",
+    "label": "rev_empty_last",
+    "context": {
+      "load_branch": true,
+      "params": "pgdb,"
+    },
+    "enabled_rules": [
+      "AM04",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "8cc29a3327a72a47",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "8cc29a3327a72a47",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 4, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;",
+          "raw_len": 33,
+          "tpl_start": [
+            4,
+            42
+          ],
+          "tpl_end": [
+            4,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 4, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment.",
+        "range": {
+          "raw": "COPY FROM DATABASE  TO analytics;",
+          "raw_len": 33,
+          "tpl_start": [
+            4,
+            42
+          ],
+          "tpl_end": [
+            4,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 4, Position 42: Found unparsable section: 'COPY FROM DATABASE  TO analytics;'. Expected: Nothing else in FileSegment."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "AM04",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "postgres",
+    "label": "normal",
+    "context": {
+      "load_branch": true,
+      "params": "pgdb"
+    },
+    "enabled_rules": [
+      "CP01",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "56aac84d7c83e224",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "56aac84d7c83e224",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;",
+          "raw_len": 78,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            3,
+            79
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;",
+          "raw_len": 78,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            3,
+            79
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC..."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "CP01",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "postgres",
+    "label": "empty",
+    "context": {
+      "load_branch": true,
+      "params": ""
+    },
+    "enabled_rules": [
+      "CP01",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "11fc4eea500e73c8",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "11fc4eea500e73c8",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;",
+          "raw_len": 74,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            3,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;",
+          "raw_len": 74,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            3,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC..."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "CP01",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "postgres",
+    "label": "missing",
+    "context": {
+      "load_branch": true
+    },
+    "enabled_rules": [
+      "CP01",
+      "LT01"
+    ],
+    "variant_count": 2,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "11fc4eea500e73c8",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      }
+    ],
+    "templater_violations": [
+      {
+        "code": "TMP",
+        "src_line": 11,
+        "src_pos": 21,
+        "desc": "Undefined jinja template variable: 'params'"
+      },
+      {
+        "code": "TMP",
+        "src_line": 11,
+        "src_pos": 21,
+        "desc": "Undefined jinja template variable: 'params'"
+      }
+    ],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;",
+          "raw_len": 74,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            3,
+            75
+          ],
+          "src_pos": [
+            12,
+            1
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "TMP",
+        "src_line": 11,
+        "src_pos": 21,
+        "desc": "Undefined jinja template variable: 'params'"
+      },
+      {
+        "code": "PRS",
+        "src_line": 12,
+        "src_pos": 1,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC..."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "CP01",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "postgres",
+    "label": "select",
+    "context": {
+      "load_branch": false,
+      "params": "pgdb"
+    },
+    "enabled_rules": [
+      "CP01",
+      "LT01"
+    ],
+    "variant_count": 2,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [],
+    "final_violations": [
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "CP01",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "postgres",
+    "label": "rev_empty_first",
+    "context": {
+      "load_branch": true,
+      "params": ",pgdb"
+    },
+    "enabled_rules": [
+      "CP01",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "a5639b8d257f90e5",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "a5639b8d257f90e5",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\\nCOPY ...'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;",
+          "raw_len": 153,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            4,
+            79
+          ],
+          "src_pos": [
+            11,
+            42
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\\nCOPY ...'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;",
+          "raw_len": 153,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            4,
+            79
+          ],
+          "src_pos": [
+            11,
+            42
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\\nCOPY ...'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC..."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "CP01",
+      "LT01"
+    ]
+  },
+  {
+    "dialect": "postgres",
+    "label": "rev_empty_last",
+    "context": {
+      "load_branch": true,
+      "params": "pgdb,"
+    },
+    "enabled_rules": [
+      "CP01",
+      "LT01"
+    ],
+    "variant_count": 3,
+    "variants": [
+      {
+        "idx": 0,
+        "sha": "8cc29a3327a72a47",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      },
+      {
+        "idx": 1,
+        "sha": "1e52ade487563ddb",
+        "sql": "\n\nselect  a from t\n"
+      },
+      {
+        "idx": 2,
+        "sha": "8cc29a3327a72a47",
+        "sql": "\n\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;\n"
+      }
+    ],
+    "templater_violations": [],
+    "parse_findings": [
+      {
+        "variant": 0,
+        "is_root_variant": true,
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\\nC...'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;",
+          "raw_len": 153,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            4,
+            75
+          ],
+          "src_pos": [
+            11,
+            42
+          ]
+        }
+      },
+      {
+        "variant": 2,
+        "is_root_variant": false,
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\\nC...'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC...",
+        "range": {
+          "raw": "COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\nCOPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE  TO analytics;",
+          "raw_len": 153,
+          "tpl_start": [
+            3,
+            1
+          ],
+          "tpl_end": [
+            4,
+            75
+          ],
+          "src_pos": [
+            11,
+            42
+          ]
+        }
+      }
+    ],
+    "final_violations": [
+      {
+        "code": "PRS",
+        "src_line": 11,
+        "src_pos": 42,
+        "desc": "Line 3, Position 1: Found unparsable section: 'COPY FROM DATABASE pg_meta TO analytics; COPY FROM DATABASE pgdb TO analytics;\\nC...'. Expected: <AnyNumberOf: [<Ref: 'PostgresCopyStdinDataStatementSeg..., <Ref: 'PsqlCopyMetaC..."
+      },
+      {
+        "code": "LT01",
+        "src_line": 15,
+        "src_pos": 7,
+        "desc": "Expected only single space before naked identifier. Found '  '."
+      }
+    ],
+    "rules_that_ran": [
+      "CP01",
+      "LT01"
+    ]
+  }
+]

@@ -1,0 +1,35 @@
+== fixed versions ==
+sqlfluff, version 4.5.0
+jinja2 3.1.6
+linted duck_empty -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/duck_empty.json
+linted duck_missing -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/duck_missing.json
+linted duck_normal -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/duck_normal.json
+linted duck_rev_empty_first -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/duck_rev_empty_first.json
+linted duck_rev_empty_last -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/duck_rev_empty_last.json
+linted duck_select -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/duck_select.json
+linted pg_empty -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/pg_empty.json
+linted pg_missing -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/pg_missing.json
+linted pg_normal -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/pg_normal.json
+linted pg_rev_empty_first -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/pg_rev_empty_first.json
+linted pg_rev_empty_last -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/pg_rev_empty_last.json
+linted pg_select -> /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/evidence/cli/pg_select.json
+BYTE-IDENTICAL main render: duck_missing_v0 == duck_empty_v0
+11fc4eea500e73c88aea0f842e5558468f20bc6ba229df536ffbaf297f2d8b72  /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/rendered/duck_missing_v0.sql
+11fc4eea500e73c88aea0f842e5558468f20bc6ba229df536ffbaf297f2d8b72  /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/rendered/duck_empty_v0.sql
+
+== template-OFF single-dimension controls ==
+baseline/empty  duck         [('PRS', 3)] rules_ran=['AM04', 'LT01']
+only-add-param  duck         CLEAN rules_ran=['AM04', 'LT01']
+only-dialect    pg           [('PRS', 3)] rules_ran=['CP01', 'LT01']
+only-branch     duck         [('LT01', 3)] rules_ran=['AM04', 'LT01']
+only-branch     pg           [('LT01', 3)] rules_ran=['CP01', 'LT01']
+
+== isolated single-statement controls (raw) ==
+copy_fixed_only/duckdb       CLEAN rules_ran=['AM04', 'CP01', 'LT01']
+copy_fixed_only/postgres     [('PRS', 1)] rules_ran=['AM04', 'CP01', 'LT01']
+copy_param_complete/duckdb   CLEAN rules_ran=['AM04', 'CP01', 'LT01']
+copy_param_complete/postgres [('PRS', 1)] rules_ran=['AM04', 'CP01', 'LT01']
+copy_param_empty/duckdb      [('PRS', 1)] rules_ran=['AM04', 'CP01', 'LT01']
+copy_param_empty/postgres    [('PRS', 1)] rules_ran=['AM04', 'CP01', 'LT01']
+select_control/duckdb        [('LT01', 1)] rules_ran=['AM04', 'CP01', 'LT01']
+select_control/postgres      [('LT01', 1)] rules_ran=['AM04', 'CP01', 'LT01']

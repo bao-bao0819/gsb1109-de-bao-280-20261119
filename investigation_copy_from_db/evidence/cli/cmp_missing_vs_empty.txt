@@ -1,0 +1,3 @@
+BYTE-IDENTICAL main render: duck_missing_v0 == duck_empty_v0
+11fc4eea500e73c88aea0f842e5558468f20bc6ba229df536ffbaf297f2d8b72  /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/rendered/duck_missing_v0.sql
+11fc4eea500e73c88aea0f842e5558468f20bc6ba229df536ffbaf297f2d8b72  /Users/guo/Documents/GSB/1109/batches/bao-2583-2612-20261121/control/questions/GSB1109-20261119-BAO-DE-245/workspace/investigation_copy_from_db/rendered/duck_empty_v0.sql

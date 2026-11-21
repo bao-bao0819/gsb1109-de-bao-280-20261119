@@ -1,0 +1,8 @@
+[sqlfluff]
+dialect = duckdb
+templater = jinja
+rules = LT01,AM04
+
+[sqlfluff:templater:jinja:context]
+load_branch = true
+params = pgdb,

@@ -1,0 +1,1 @@
+COPY FROM DATABASE  TO analytics;

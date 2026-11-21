@@ -2719,6 +2719,40 @@ class CellUnion(object):
             for child in cell_id.children():
                 cls.__get_difference(child, y, cell_ids)
 
+    def exact_area(self):
+        """Area of this cell union in steradians.
+
+        The cells are assumed to be disjoint (i.e. this union has been
+        normalized).  The result is the sum of :meth:`Cell.exact_area` for
+        every cell, which is accurate to about six significant digits even
+        for leaf cells.
+        """
+        return math.fsum(Cell(cell_id).exact_area()
+                         for cell_id in self.__cell_ids)
+
+    def approx_area(self):
+        """Approximate area of this cell union in steradians.
+
+        This is the sum of :meth:`Cell.approx_area` for every cell and is
+        accurate to within 3% (0.1% for cells at level 5 or higher).
+        """
+        return math.fsum(Cell(cell_id).approx_area()
+                         for cell_id in self.__cell_ids)
+
+    def average_area(self):
+        """Average-based area of this cell union in steradians.
+
+        This is the sum of :meth:`Cell.average_area` for every cell.  It is
+        fast but can be off by up to a factor of 1.7 for highly distorted
+        cells; use :meth:`exact_area` when an actual area is needed.
+        """
+        return math.fsum(Cell(cell_id).average_area()
+                         for cell_id in self.__cell_ids)
+
+    def area(self):
+        """Alias for :meth:`exact_area`."""
+        return self.exact_area()
+
     def num_cells(self):
         return len(self.__cell_ids)
 

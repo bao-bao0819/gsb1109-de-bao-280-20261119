@@ -66,6 +66,22 @@ API
    :members:
    :undoc-members:
 
+.. autoclass:: s2sphere.ReadPlan
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.ReadPlanComparison
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.CacheReconfirmation
+   :members:
+   :undoc-members:
+
+.. autoclass:: s2sphere.SurveyResult
+   :members:
+   :undoc-members:
+
 .. autoclass:: s2sphere.SphereInterval
    :members:
    :undoc-members:
@@ -75,6 +91,7 @@ Utilities
 ---------
 
 .. autofunction:: s2sphere.area
+.. autofunction:: s2sphere.compare_read_plans
 .. autofunction:: s2sphere.drem
 .. autofunction:: s2sphere.face_uv_to_xyz
 .. autofunction:: s2sphere.face_xyz_to_uv
@@ -87,8 +104,12 @@ Utilities
 .. autofunction:: s2sphere.is_unit_length
 .. autofunction:: s2sphere.origin
 .. autofunction:: s2sphere.ortho
+.. autofunction:: s2sphere.reconfirm_cached_cells
 .. autofunction:: s2sphere.robust_cross_prod
 .. autofunction:: s2sphere.simple_ccw
 .. autofunction:: s2sphere.simple_crossing
+.. autofunction:: s2sphere.solve_survey_bounds
+.. autofunction:: s2sphere.survey_from_comparison
+.. autofunction:: s2sphere.tighten_xyz_read_difference
 .. autofunction:: s2sphere.valid_face_xyz_to_uv
 .. autofunction:: s2sphere.xyz_to_face_uv
